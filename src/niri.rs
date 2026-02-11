@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -34,8 +34,10 @@ enum NiriMessage {
 #[derive(Debug, Clone, Deserialize)]
 struct Project {
     #[allow(dead_code)]
-    key: String,
-    name: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     dir: String,
     #[serde(default)]
     static_workspace: bool,
@@ -71,6 +73,7 @@ struct AppState {
     pending_key: Option<char>,
     agent_sessions: HashMap<u64, AgentSession>,
     codex_sessions: HashMap<String, CodexSession>,
+    last_config_error: Option<String>,
 }
 
 fn config_path() -> PathBuf {
@@ -79,13 +82,27 @@ fn config_path() -> PathBuf {
         .join("projects.toml")
 }
 
-fn load_config() -> Config {
-    if let Ok(content) = std::fs::read_to_string(config_path())
-        && let Ok(config) = toml::from_str::<Config>(&content)
-    {
-        return config;
-    }
-    Config::default()
+fn load_config() -> Result<Config, String> {
+    let path = config_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default());
+        }
+        Err(err) => {
+            return Err(format!("Failed to read {}: {}", path.display(), err));
+        }
+    };
+
+    toml::from_str::<Config>(&content)
+        .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))
+}
+
+fn notify_config_error(message: &str) {
+    log::warn!("{}", message);
+    let _ = Command::new("notify-send")
+        .args(["agent-switch: projects.toml error", message])
+        .status();
 }
 
 fn load_agent_sessions() -> HashMap<u64, AgentSession> {
@@ -178,6 +195,22 @@ fn simplify_label(title: &str, app_id: &str) -> String {
     }
 }
 
+fn project_workspace_name(project: &Project) -> String {
+    if let Some(name) = project.name.as_deref().map(str::trim)
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
+
+    let expanded_dir = shellexpand::tilde(&project.dir).to_string();
+    Path::new(&expanded_dir)
+        .file_name()
+        .and_then(|v| v.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| project.dir.clone())
+}
+
 fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
@@ -267,20 +300,22 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
         if key_idx >= KEYS.len() {
             break;
         }
-        seen_workspaces.insert(project.name.clone());
+
+        let project_name = project_workspace_name(project);
+        seen_workspaces.insert(project_name.clone());
         let workspace_key = KEYS[key_idx];
 
         let ws_id = workspaces
             .iter()
-            .find(|ws| ws.name.as_deref() == Some(&project.name))
+            .find(|ws| ws.name.as_deref() == Some(project_name.as_str()))
             .map(|ws| ws.id);
 
         if let Some(ws_id) = ws_id {
             add_workspace_entries(
                 &mut entries,
                 ws_id,
-                &project.name,
-                WorkspaceReferenceArg::Name(project.name.clone()),
+                &project_name,
+                WorkspaceReferenceArg::Name(project_name.clone()),
                 workspace_key,
                 Some(project.dir.clone()),
                 project.static_workspace,
@@ -288,8 +323,8 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
             );
         } else {
             entries.push(WorkspaceColumn {
-                workspace_name: project.name.clone(),
-                workspace_ref: WorkspaceReferenceArg::Name(project.name.clone()),
+                workspace_name: project_name.clone(),
+                workspace_ref: WorkspaceReferenceArg::Name(project_name),
                 workspace_key,
                 column_index: 2,
                 column_key: KEYS[0],
@@ -544,7 +579,13 @@ fn build_ui(
     window.set_anchor(Edge::Left, false);
     window.set_anchor(Edge::Right, false);
 
-    let config = load_config();
+    let (config, last_config_error) = match load_config() {
+        Ok(config) => (config, None),
+        Err(err) => {
+            notify_config_error(&err);
+            (Config::default(), Some(err))
+        }
+    };
     let entries = get_workspace_columns(&config);
     let agent_sessions = load_agent_sessions();
     let codex_sessions = {
@@ -558,6 +599,7 @@ fn build_ui(
         pending_key: None,
         agent_sessions,
         codex_sessions,
+        last_config_error,
     }));
 
     let outer_box = GtkBox::new(Orientation::Vertical, 0);
@@ -754,9 +796,25 @@ fn build_ui(
                 }
                 NiriMessage::ReloadConfig => {
                     let mut state = state_for_poll.borrow_mut();
-                    state.config = load_config();
-                    state.entries = get_workspace_columns(&state.config);
-                    if window_for_poll.is_visible() {
+                    let reloaded = match load_config() {
+                        Ok(config) => {
+                            state.config = config;
+                            state.entries = get_workspace_columns(&state.config);
+                            state.last_config_error = None;
+                            true
+                        }
+                        Err(err) => {
+                            let should_notify =
+                                state.last_config_error.as_deref() != Some(err.as_str());
+                            if should_notify {
+                                notify_config_error(&err);
+                            }
+                            state.last_config_error = Some(err);
+                            false
+                        }
+                    };
+
+                    if reloaded && window_for_poll.is_visible() {
                         let entries = state.entries.clone();
                         let pending = state.pending_key;
                         let agent_sessions = state.agent_sessions.clone();
