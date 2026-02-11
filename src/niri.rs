@@ -43,14 +43,33 @@ struct Project {
     static_workspace: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 struct Config {
     #[serde(default)]
     project: Vec<Project>,
     #[serde(default)]
     ignore: Vec<String>,
-    #[serde(default)]
-    ignore_unnamed: bool,
+    #[serde(
+        default = "default_ignore_unnamed_workspaces",
+        alias = "ignoreUnnamedWorkspaces",
+        alias = "ignore_unnamed",
+        alias = "ignore_unnamed_workspaces"
+    )]
+    ignore_unnamed_workspaces: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            project: Vec::new(),
+            ignore: Vec::new(),
+            ignore_unnamed_workspaces: default_ignore_unnamed_workspaces(),
+        }
+    }
+}
+
+fn default_ignore_unnamed_workspaces() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -346,7 +365,7 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
             let name_opt = ws.name.as_deref();
             let idx = ws.idx;
 
-            if name_opt.is_none() && config.ignore_unnamed {
+            if name_opt.is_none() && config.ignore_unnamed_workspaces {
                 return None;
             }
 
