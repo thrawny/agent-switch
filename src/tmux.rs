@@ -281,6 +281,10 @@ fn is_numeric_name(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
+fn parse_projects_config(content: &str) -> ProjectsConfig {
+    toml::from_str(content).unwrap_or_default()
+}
+
 fn load_projects_config() -> ProjectsConfig {
     let path = projects_config_path();
     let content = match fs::read_to_string(&path) {
@@ -288,7 +292,7 @@ fn load_projects_config() -> ProjectsConfig {
         Err(_) => return ProjectsConfig::default(),
     };
 
-    toml::from_str(&content).unwrap_or_default()
+    parse_projects_config(&content)
 }
 
 fn load_session_order(config: &ProjectsConfig) -> Vec<String> {
@@ -727,4 +731,170 @@ pub fn run_fzf_only() {
     }
 
     run_fzf_search(&windows);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(session_name: &str, window_id: &str) -> TmuxWindow {
+        TmuxWindow {
+            session_name: session_name.to_string(),
+            session_index: format!("{}:1", session_name),
+            window_id: window_id.to_string(),
+            window_name: "shell".to_string(),
+            pane_path: None,
+            pane_command: None,
+        }
+    }
+
+    #[test]
+    fn projects_toml_drives_tmux_order_and_filtering() {
+        let config: ProjectsConfig = toml::from_str(
+            r#"
+ignore = ["web"]
+ignoreNumericSessions = true
+
+[[project]]
+dir = "~/code/agent-switch"
+
+[[project]]
+name = "company"
+dir = "~/code/the-company-private"
+"#,
+        )
+        .expect("projects.toml should parse");
+
+        let windows = vec![
+            window("company", "@1"),
+            window("1", "@2"),
+            window("misc", "@3"),
+            window("agent-switch", "@4"),
+            window("web", "@5"),
+            window("company", "@6"),
+        ];
+
+        let filtered = filter_windows_by_config(windows, &config);
+        let order = load_session_order(&config);
+        let sessions = sorted_sessions(&filtered, &order);
+
+        assert_eq!(order, vec!["agent-switch", "company"]);
+        assert_eq!(sessions, vec!["agent-switch", "company", "misc"]);
+    }
+
+    #[test]
+    fn numeric_tmux_sessions_are_kept_when_not_ignored() {
+        let config: ProjectsConfig = toml::from_str(
+            r#"
+ignoreNumericSessions = false
+"#,
+        )
+        .expect("projects.toml should parse");
+
+        let sessions = sorted_sessions(
+            &filter_windows_by_config(vec![window("1", "@1"), window("dev", "@2")], &config),
+            &load_session_order(&config),
+        );
+
+        assert_eq!(sessions, vec!["1", "dev"]);
+    }
+
+    #[test]
+    fn ignore_list_wins_even_for_prioritized_projects() {
+        let config: ProjectsConfig = toml::from_str(
+            r#"
+ignore = ["company"]
+
+[[project]]
+name = "company"
+dir = "~/code/the-company-private"
+
+[[project]]
+name = "agent-switch"
+dir = "~/code/agent-switch"
+"#,
+        )
+        .expect("projects.toml should parse");
+
+        let sessions = sorted_sessions(
+            &filter_windows_by_config(
+                vec![
+                    window("company", "@1"),
+                    window("misc", "@2"),
+                    window("agent-switch", "@3"),
+                ],
+                &config,
+            ),
+            &load_session_order(&config),
+        );
+
+        assert_eq!(sessions, vec!["agent-switch", "misc"]);
+    }
+
+    #[test]
+    fn duplicate_project_names_are_deduplicated_in_order() {
+        let config: ProjectsConfig = toml::from_str(
+            r#"
+[[project]]
+dir = "~/code/agent-switch"
+
+[[project]]
+name = "agent-switch"
+dir = "~/work/agent-switch"
+"#,
+        )
+        .expect("projects.toml should parse");
+
+        let order = load_session_order(&config);
+        let sessions = sorted_sessions(
+            &filter_windows_by_config(
+                vec![window("misc", "@1"), window("agent-switch", "@2")],
+                &config,
+            ),
+            &order,
+        );
+
+        assert_eq!(order, vec!["agent-switch"]);
+        assert_eq!(sessions, vec!["agent-switch", "misc"]);
+    }
+
+    #[test]
+    fn non_project_sessions_keep_first_seen_order_after_prioritized_sessions() {
+        let config: ProjectsConfig = toml::from_str(
+            r#"
+[[project]]
+name = "company"
+dir = "~/code/the-company-private"
+"#,
+        )
+        .expect("projects.toml should parse");
+
+        let sessions = sorted_sessions(
+            &filter_windows_by_config(
+                vec![
+                    window("misc", "@1"),
+                    window("zeta", "@2"),
+                    window("company", "@3"),
+                    window("alpha", "@4"),
+                ],
+                &config,
+            ),
+            &load_session_order(&config),
+        );
+
+        assert_eq!(sessions, vec!["company", "misc", "zeta", "alpha"]);
+    }
+
+    #[test]
+    fn invalid_projects_toml_falls_back_to_default_behavior() {
+        let config = parse_projects_config("ignoreNumericSessions = not-a-bool");
+
+        let sessions = sorted_sessions(
+            &filter_windows_by_config(vec![window("1", "@1"), window("web", "@2")], &config),
+            &load_session_order(&config),
+        );
+
+        // Default config: no explicit ordering, no ignore list, numeric sessions allowed.
+        assert_eq!(sessions, vec!["1", "web"]);
+    }
 }
