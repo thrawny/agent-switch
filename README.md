@@ -58,6 +58,16 @@ Optional binding:
 bind-key -n C-` display-popup -E -w 60% -h 60% "agent-switch tmux"
 ```
 
+### Session order source
+
+tmux session ordering is read from `~/.config/projects.toml` using the `[[project]]` list order
+(the same file used by niri). If `name` is omitted, the project name is inferred from the
+last folder segment of `dir`.
+
+tmux also respects:
+- `ignore = ["..."]` to hide matching session names
+- `ignoreNumericSessions = true` to hide numeric-only session names (e.g. `1`, `2`)
+
 ---
 
 ## niri usage (Linux)
@@ -101,6 +111,7 @@ Example:
 ```toml
 ignore = ["games", "web"]
 ignoreUnnamedWorkspaces = true
+ignoreNumericSessions = true
 
 [[project]]
 dir = "~/dotfiles"
@@ -115,7 +126,9 @@ dir = "~/code/agent-switch" # name inferred from folder if omitted
 ```
 
 Notes:
-- `ignoreUnnamedWorkspaces` defaults to `true`
+- `ignoreUnnamedWorkspaces` defaults to `true` (niri)
+- `ignoreNumericSessions` defaults to `false` and works for both niri + tmux
+- `ignore` works for discovered niri workspaces and tmux sessions
 - if `project.name` is omitted, name is inferred from `dir` basename
 - `static_workspace = true` means “focus existing workspace, don’t auto-create”
 

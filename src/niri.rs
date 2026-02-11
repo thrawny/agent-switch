@@ -56,6 +56,12 @@ struct Config {
         alias = "ignore_unnamed_workspaces"
     )]
     ignore_unnamed_workspaces: bool,
+    #[serde(
+        default = "default_ignore_numeric_sessions",
+        alias = "ignoreNumericSessions",
+        alias = "ignore_numeric_sessions"
+    )]
+    ignore_numeric_sessions: bool,
 }
 
 impl Default for Config {
@@ -64,12 +70,17 @@ impl Default for Config {
             project: Vec::new(),
             ignore: Vec::new(),
             ignore_unnamed_workspaces: default_ignore_unnamed_workspaces(),
+            ignore_numeric_sessions: default_ignore_numeric_sessions(),
         }
     }
 }
 
 fn default_ignore_unnamed_workspaces() -> bool {
     true
+}
+
+fn default_ignore_numeric_sessions() -> bool {
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +241,10 @@ fn project_workspace_name(project: &Project) -> String {
         .unwrap_or_else(|| project.dir.clone())
 }
 
+fn is_numeric_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
 fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
@@ -374,6 +389,9 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
                 None => idx.to_string(),
             };
 
+            if config.ignore_numeric_sessions && is_numeric_name(&display_name) {
+                return None;
+            }
             if seen_workspaces.contains(&display_name) {
                 return None;
             }

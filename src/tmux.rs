@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -217,63 +217,104 @@ fn list_tmux_windows() -> Vec<TmuxWindow> {
     windows
 }
 
-fn session_order_path() -> PathBuf {
+#[derive(Debug, serde::Deserialize)]
+struct ProjectsConfig {
+    #[serde(default)]
+    project: Vec<ProjectConfigEntry>,
+    #[serde(default)]
+    ignore: Vec<String>,
+    #[serde(
+        default = "default_ignore_numeric_sessions",
+        alias = "ignoreNumericSessions",
+        alias = "ignore_numeric_sessions"
+    )]
+    ignore_numeric_sessions: bool,
+}
+
+impl Default for ProjectsConfig {
+    fn default() -> Self {
+        Self {
+            project: Vec::new(),
+            ignore: Vec::new(),
+            ignore_numeric_sessions: default_ignore_numeric_sessions(),
+        }
+    }
+}
+
+fn default_ignore_numeric_sessions() -> bool {
+    false
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProjectConfigEntry {
+    #[serde(default)]
+    name: Option<String>,
+    dir: String,
+}
+
+fn projects_config_path() -> PathBuf {
     if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home)
-            .join("tmux")
-            .join("session-order.conf");
+        return PathBuf::from(config_home).join("projects.toml");
     }
     dirs::home_dir()
         .unwrap_or_default()
         .join(".config")
-        .join("tmux")
-        .join("session-order.conf")
+        .join("projects.toml")
 }
 
-fn load_session_order() -> Vec<String> {
-    let path = session_order_path();
+fn project_name(entry: &ProjectConfigEntry) -> String {
+    if let Some(name) = entry.name.as_deref().map(str::trim)
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
+
+    Path::new(&entry.dir)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| entry.dir.clone())
+}
+
+fn is_numeric_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn load_projects_config() -> ProjectsConfig {
+    let path = projects_config_path();
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(_) => return Vec::new(),
+        Err(_) => return ProjectsConfig::default(),
     };
 
-    let mut in_block = false;
-    let mut items = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !in_block {
-            if trimmed.starts_with("SESSION_ORDER") && trimmed.contains('(') {
-                in_block = true;
-            } else {
-                continue;
-            }
-        } else if trimmed == ")" {
-            break;
-        }
+    toml::from_str(&content).unwrap_or_default()
+}
 
-        if !in_block {
-            continue;
-        }
+fn load_session_order(config: &ProjectsConfig) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
 
-        let cleaned = trimmed
-            .trim_end_matches(')')
-            .trim_matches('(')
-            .trim()
-            .strip_prefix("SESSION_ORDER=")
-            .unwrap_or(trimmed)
-            .trim();
-        if cleaned.is_empty() || cleaned.starts_with('#') {
-            continue;
-        }
-        for token in cleaned.split_whitespace() {
-            let value = token.trim_matches('"').trim_matches('\'');
-            if !value.is_empty() && value != "\\" && value != "SESSION_ORDER=" {
-                items.push(value.to_string());
-            }
+    for entry in &config.project {
+        let name = project_name(entry);
+        if seen.insert(name.clone()) {
+            order.push(name);
         }
     }
 
-    items
+    order
+}
+
+fn should_ignore_session(session_name: &str, config: &ProjectsConfig) -> bool {
+    config.ignore.iter().any(|name| name == session_name)
+        || (config.ignore_numeric_sessions && is_numeric_name(session_name))
+}
+
+fn filter_windows_by_config(windows: Vec<TmuxWindow>, config: &ProjectsConfig) -> Vec<TmuxWindow> {
+    windows
+        .into_iter()
+        .filter(|window| !should_ignore_session(&window.session_name, config))
+        .collect()
 }
 
 fn sorted_sessions(windows: &[TmuxWindow], order: &[String]) -> Vec<String> {
@@ -520,13 +561,14 @@ pub fn run() {
     state::cleanup_stale(&mut store);
     state::save(&store);
 
-    let windows = list_tmux_windows();
+    let config = load_projects_config();
+    let windows = filter_windows_by_config(list_tmux_windows(), &config);
     if windows.is_empty() {
         eprintln!("No tmux windows found");
         return;
     }
 
-    let session_order = load_session_order();
+    let session_order = load_session_order(&config);
     let sessions = sorted_sessions(&windows, &session_order);
 
     // Build lookup by tmux_id for agent status
@@ -677,7 +719,8 @@ pub fn run_fzf_only() {
         return;
     }
 
-    let windows = list_tmux_windows();
+    let config = load_projects_config();
+    let windows = filter_windows_by_config(list_tmux_windows(), &config);
     if windows.is_empty() {
         eprintln!("No tmux windows found");
         return;
