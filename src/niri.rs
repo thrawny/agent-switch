@@ -245,6 +245,18 @@ fn is_numeric_name(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
+fn should_skip_discovered_workspace(
+    name_opt: Option<&str>,
+    display_name: &str,
+    config: &Config,
+    seen_workspaces: &std::collections::HashSet<String>,
+) -> bool {
+    (name_opt.is_none() && config.ignore_unnamed_workspaces)
+        || (config.ignore_numeric_sessions && is_numeric_name(display_name))
+        || seen_workspaces.contains(display_name)
+        || config.ignore.iter().any(|ignored| ignored == display_name)
+}
+
 fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
@@ -380,22 +392,12 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
             let name_opt = ws.name.as_deref();
             let idx = ws.idx;
 
-            if name_opt.is_none() && config.ignore_unnamed_workspaces {
-                return None;
-            }
-
             let display_name: String = match name_opt {
                 Some(n) => n.to_string(),
                 None => idx.to_string(),
             };
 
-            if config.ignore_numeric_sessions && is_numeric_name(&display_name) {
-                return None;
-            }
-            if seen_workspaces.contains(&display_name) {
-                return None;
-            }
-            if config.ignore.iter().any(|i| i == &display_name) {
+            if should_skip_discovered_workspace(name_opt, &display_name, config, &seen_workspaces) {
                 return None;
             }
 
@@ -1203,4 +1205,92 @@ pub fn run(toggle: bool) -> glib::ExitCode {
 
     // Legacy mode: run standalone with its own socket listener
     run_with_daemon()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn project_name_is_inferred_from_dir_when_missing() {
+        let project = Project {
+            key: None,
+            name: None,
+            dir: "~/code/agent-switch".to_string(),
+            static_workspace: false,
+        };
+
+        assert_eq!(project_workspace_name(&project), "agent-switch");
+    }
+
+    #[test]
+    fn unnamed_workspaces_are_ignored_by_default() {
+        let config: Config = toml::from_str("").expect("default config should parse");
+        let seen = HashSet::new();
+
+        assert!(should_skip_discovered_workspace(
+            None, // unnamed workspace
+            "3",  // fallback display name from index
+            &config, &seen,
+        ));
+    }
+
+    #[test]
+    fn ignore_numeric_sessions_hides_numeric_named_workspaces() {
+        let config: Config = toml::from_str(
+            r#"
+ignoreUnnamedWorkspaces = false
+ignoreNumericSessions = true
+"#,
+        )
+        .expect("config should parse");
+        let seen = HashSet::new();
+
+        assert!(should_skip_discovered_workspace(
+            Some("12"),
+            "12",
+            &config,
+            &seen,
+        ));
+        assert!(!should_skip_discovered_workspace(
+            Some("web"),
+            "web",
+            &config,
+            &seen,
+        ));
+    }
+
+    #[test]
+    fn ignore_list_and_seen_workspace_names_are_filtered() {
+        let config: Config = toml::from_str(
+            r#"
+ignoreUnnamedWorkspaces = false
+ignore = ["web"]
+"#,
+        )
+        .expect("config should parse");
+
+        let mut seen = HashSet::new();
+        seen.insert("company".to_string());
+
+        assert!(should_skip_discovered_workspace(
+            Some("web"),
+            "web",
+            &config,
+            &seen,
+        ));
+        assert!(should_skip_discovered_workspace(
+            Some("company"),
+            "company",
+            &config,
+            &seen,
+        ));
+        assert!(!should_skip_discovered_workspace(
+            Some("agent-switch"),
+            "agent-switch",
+            &config,
+            &seen,
+        ));
+    }
 }
