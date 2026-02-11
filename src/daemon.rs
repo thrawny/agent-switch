@@ -2,7 +2,7 @@ use crate::state::{self, SessionStore};
 use log::{debug, error, info, warn};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
@@ -401,8 +401,7 @@ pub fn start_tmux_monitor(tx: mpsc::Sender<DaemonMessage>) {
     thread::spawn(move || {
         loop {
             thread::sleep(std::time::Duration::from_secs(5));
-            let sockets = find_tmux_sockets();
-            if sockets.is_empty() {
+            if !tmux_server_running() {
                 info!("No tmux sockets found, shutting down daemon");
                 let _ = tx.send(DaemonMessage::Shutdown);
                 return;
@@ -411,19 +410,77 @@ pub fn start_tmux_monitor(tx: mpsc::Sender<DaemonMessage>) {
     });
 }
 
+fn tmux_server_running() -> bool {
+    let sockets = find_tmux_sockets();
+    if !sockets.is_empty() {
+        return true;
+    }
+
+    // Fallback to tmux's default lookup in case the socket lives in a custom dir
+    std::process::Command::new("tmux")
+        .arg("list-sessions")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn find_tmux_sockets() -> Vec<PathBuf> {
     let uid = unsafe { libc::getuid() };
-    let base = if cfg!(target_os = "macos") {
-        "/private/tmp"
-    } else {
-        "/tmp"
-    };
-    let dir = PathBuf::from(format!("{}/tmux-{}", base, uid));
-    fs::read_dir(&dir)
+    let mut sockets: HashSet<PathBuf> = HashSet::new();
+
+    if let Some(path) = tmux_socket_from_env() {
+        sockets.insert(path);
+    }
+
+    for dir in tmux_socket_dirs(uid) {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                sockets.insert(entry.path());
+            }
+        }
+    }
+
+    sockets.into_iter().collect()
+}
+
+fn tmux_socket_from_env() -> Option<PathBuf> {
+    let value = std::env::var("TMUX").ok()?;
+    let socket_path = value.split(',').next()?.trim();
+    if socket_path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(socket_path))
+}
+
+fn tmux_socket_dirs(uid: u32) -> Vec<PathBuf> {
+    let mut bases: HashSet<PathBuf> = HashSet::new();
+
+    // tmux defaults
+    bases.insert(PathBuf::from("/tmp"));
+    if cfg!(target_os = "macos") {
+        bases.insert(PathBuf::from("/private/tmp"));
+    }
+
+    // common overrides
+    if let Ok(tmpdir) = std::env::var("TMUX_TMPDIR")
+        && !tmpdir.is_empty()
+    {
+        bases.insert(PathBuf::from(tmpdir));
+    }
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
+        && !runtime_dir.is_empty()
+    {
+        bases.insert(PathBuf::from(runtime_dir));
+    }
+
+    // Linux systems typically place tmux sockets under /run/user/<uid>
+    if cfg!(target_os = "linux") {
+        bases.insert(PathBuf::from(format!("/run/user/{}", uid)));
+    }
+
+    bases
         .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
+        .map(|base| base.join(format!("tmux-{}", uid)))
         .collect()
 }
 
