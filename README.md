@@ -1,8 +1,17 @@
 # agent-switch
 
-Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) across **tmux** and **niri**.
+Track and switch between AI coding agent sessions (Claude, Codex) across **tmux** and **niri**.
 
-## Build / install
+## What it does
+
+- Tracks agent session state (`waiting`, `working`, `idle`) from hook events
+- Lets you quickly switch tmux windows with a compact picker
+- Shows a niri overlay switcher (GTK, Linux) with workspace/column shortcuts
+- Merges Claude + Codex state into one view
+
+---
+
+## Install
 
 ```bash
 just build
@@ -13,25 +22,29 @@ This installs `agent-switch` to `~/.cargo/bin/agent-switch`.
 
 ---
 
-## Run in tmux
+## tmux usage
 
-### 1) Start the daemon
+### Start daemon
 
 ```bash
 agent-switch serve
 ```
 
-(Usually run this in the background from tmux startup.)
+Example tmux autostart:
 
-### 2) Open the tmux picker
+```tmux
+run-shell -b 'pgrep -f "agent-switch serve" >/dev/null 2>&1 || agent-switch serve &'
+```
+
+### Open picker
 
 ```bash
 agent-switch tmux
 ```
 
-- 2-key mode: first key picks session, second key picks window
-- `/` switches to fzf search
-- `q` or `Esc` cancels
+- 2-key mode: first key picks session, second picks window
+- `/` enters fzf search
+- `q` / `Esc` cancels
 
 Direct fzf mode:
 
@@ -39,7 +52,7 @@ Direct fzf mode:
 agent-switch tmux --fzf
 ```
 
-### Optional tmux keybinding
+Optional binding:
 
 ```tmux
 bind-key -n C-` display-popup -E -w 60% -h 60% "agent-switch tmux"
@@ -47,62 +60,128 @@ bind-key -n C-` display-popup -E -w 60% -h 60% "agent-switch tmux"
 
 ---
 
-## Run in niri (Linux)
+## niri usage (Linux)
 
-The niri overlay needs the `niri` Cargo feature.
+`niri` overlay requires the Cargo `niri` feature.
 
-### 1) Start daemon + GTK overlay service
+### Start daemon + overlay
 
 ```bash
 agent-switch serve --niri
 ```
 
-If running from source:
+From source:
 
 ```bash
 cargo run --features niri -- serve --niri
 ```
 
-### 2) Toggle the overlay
+### Toggle overlay
 
 ```bash
 agent-switch niri --toggle
 ```
 
-(Recommended to bind this in niri config.)
-
-### Optional niri keybinding
+Optional niri bind:
 
 ```kdl
 Mod+S { spawn "agent-switch" "niri" "--toggle"; }
 ```
 
-### Optional startup entry
+Optional startup entry:
 
 ```kdl
 spawn-at-startup "agent-switch" "serve" "--niri"
 ```
 
+### niri project config (`~/.config/projects.toml`)
+
+Example:
+
+```toml
+ignore = ["games", "web"]
+ignoreUnnamedWorkspaces = true
+
+[[project]]
+dir = "~/dotfiles"
+static_workspace = true
+
+[[project]]
+name = "company"
+dir = "~/code/the-company-private"
+
+[[project]]
+dir = "~/code/agent-switch" # name inferred from folder if omitted
+```
+
+Notes:
+- `ignoreUnnamedWorkspaces` defaults to `true`
+- if `project.name` is omitted, name is inferred from `dir` basename
+- `static_workspace = true` means “focus existing workspace, don’t auto-create”
+
 ---
 
-## Agent hook integration (for live state)
+## Claude Code hook setup (important)
 
-To populate session state (waiting/working/idle), configure your agent hooks to call:
+Without hooks, switching still works, but live state labels will be incomplete.
 
-- `agent-switch track session-start`
-- `agent-switch track prompt-submit`
-- `agent-switch track stop`
-- `agent-switch track notification`
-- `agent-switch track session-end`
+Configure hooks in **`~/.claude/settings.json`**:
 
-Without hooks, window switching still works, but status labels will be limited.
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "agent-switch track stop" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "agent-switch track prompt-submit" }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          { "type": "command", "command": "agent-switch track notification" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "agent-switch track session-start" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "agent-switch track session-end" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Hook requirements
+
+- `agent-switch` must be on `PATH` for Claude
+- daemon should be running (`agent-switch serve` or `agent-switch serve --niri`)
+- run Claude inside tmux if you want tmux window IDs captured
 
 ---
 
 ## Useful commands
 
 ```bash
-agent-switch list      # print sessions as JSON
+agent-switch list      # dump tracked sessions as JSON
 agent-switch cleanup   # remove stale sessions
 ```
 
