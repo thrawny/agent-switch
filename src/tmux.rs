@@ -336,11 +336,12 @@ fn sorted_sessions(windows: &[TmuxWindow], order: &[String]) -> Vec<String> {
             sorted.push(preferred.clone());
         }
     }
-    for session in sessions {
-        if !sorted.iter().any(|name| name == &session) {
-            sorted.push(session);
-        }
-    }
+    let mut rest: Vec<String> = sessions
+        .into_iter()
+        .filter(|name| !sorted.contains(name))
+        .collect();
+    rest.sort();
+    sorted.extend(rest);
     sorted
 }
 
@@ -378,25 +379,94 @@ fn status_for_window(
     None
 }
 
-fn terminal_lines() -> usize {
-    if env::var("TMUX").is_ok()
-        && let Ok(output) = Command::new("tmux")
-            .args(["display-message", "-p", "#{pane_height}"])
+/// Query actual terminal dimensions via stty on /dev/tty.
+/// Works correctly in tmux popups (unlike tmux display-message which returns the parent pane size).
+fn terminal_size() -> (usize, usize) {
+    // Try stty size on /dev/tty — works in tmux popups
+    for flag in ["-f", "-F"] {
+        if let Ok(output) = Command::new("stty")
+            .args([flag, "/dev/tty", "size"])
             .output()
-        && output.status.success()
-        && let Ok(value) = String::from_utf8(output.stdout)
-        && let Ok(lines) = value.trim().parse::<usize>()
-    {
-        return lines;
+            && output.status.success()
+            && let Ok(out) = String::from_utf8(output.stdout)
+        {
+            let parts: Vec<&str> = out.split_whitespace().collect();
+            if let [rows, cols] = parts.as_slice() {
+                let rows = rows.parse().unwrap_or(24);
+                let cols = cols.parse().unwrap_or(80);
+                return (rows, cols);
+            }
+        }
     }
+    (24, 80)
+}
 
-    if let Ok(output) = Command::new("tput").arg("lines").output()
-        && output.status.success()
-        && let Ok(value) = String::from_utf8(output.stdout)
-    {
-        return value.trim().parse::<usize>().unwrap_or(24);
+fn visible_len(s: &str) -> usize {
+    let mut len = 0;
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+        } else {
+            len += 1;
+        }
     }
-    24
+    len
+}
+
+/// Truncate a string with ANSI escapes to `width` visible characters, appending a reset code.
+fn truncate_visible(s: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut vis = 0;
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            result.push(ch);
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+            result.push(ch);
+        } else {
+            if vis >= width {
+                break;
+            }
+            result.push(ch);
+            vis += 1;
+        }
+    }
+    result.push_str("\x1b[0m");
+    result
+}
+
+fn pad_visible(s: &str, width: usize) -> String {
+    let vis = visible_len(s);
+    if vis >= width {
+        truncate_visible(s, width)
+    } else {
+        format!("{}{}", s, " ".repeat(width - vis))
+    }
+}
+
+fn tty_print(tty: &mut Option<Tty>, text: &str) {
+    if let Some(tty) = tty.as_mut() {
+        tty.write_all(text);
+    } else {
+        print!("{text}");
+    }
+}
+
+fn tty_flush(tty: &mut Option<Tty>) {
+    if let Some(tty) = tty.as_mut() {
+        tty.flush();
+    } else {
+        let _ = io::stdout().flush();
+    }
 }
 
 fn print_clear(tty: &mut Option<Tty>) {
@@ -409,6 +479,23 @@ fn print_clear(tty: &mut Option<Tty>) {
     let _ = io::stdout().flush();
 }
 
+/// Compute the row count of an interleaved two-column layout.
+/// Even groups go left, odd groups go right, with one separator between groups per column.
+/// `cap` limits how many lines each group contributes.
+fn interleaved_height(group_sizes: &[usize], cap: usize) -> usize {
+    let mut left = 0usize;
+    let mut right = 0usize;
+    for (gi, &size) in group_sizes.iter().enumerate() {
+        let size = size.min(cap);
+        let col = if gi % 2 == 0 { &mut left } else { &mut right };
+        if *col > 0 {
+            *col += 1; // separator line
+        }
+        *col += size;
+    }
+    left.max(right)
+}
+
 fn render_sessions_screen(
     tty: &mut Option<Tty>,
     sessions: &[String],
@@ -418,45 +505,85 @@ fn render_sessions_screen(
 ) {
     print_clear(tty);
     let header = "h/j/k/l = select session | / = search | q/Esc = cancel\n\n";
-    if let Some(tty) = tty.as_mut() {
-        tty.write_all(header);
-    } else {
-        print!("{header}");
-    }
+    tty_print(tty, header);
 
-    let max_lines = terminal_lines().saturating_sub(3);
-    let mut line_count = 0usize;
+    let (term_rows, term_cols) = terminal_size();
+    let max_lines = term_rows.saturating_sub(3);
 
+    // Collect lines grouped by session so we never split a session across columns.
+    let mut groups: Vec<Vec<String>> = Vec::new();
     for (sidx, session) in sessions.iter().enumerate() {
         let skey = if sidx < KEYS.len() { KEYS[sidx] } else { '?' };
+        let mut group = Vec::new();
         for (widx, window) in windows
             .iter()
             .filter(|w| &w.session_name == session)
             .enumerate()
         {
-            if line_count >= max_lines {
-                break;
-            }
             let wkey = if widx < KEYS.len() { KEYS[widx] } else { '?' };
             let status = status_for_window(window, status_by_tmux_id, codex_by_cwd);
-            let line = if let Some(status) = status {
+            let content = if let Some(status) = status {
                 format!("{} {} {}", window.session_index, status, window.window_name)
             } else {
                 format!("{} {}", window.session_index, window.window_name)
             };
-            if let Some(tty) = tty.as_mut() {
-                tty.write_all(&format!("\x1b[33m[{skey}{wkey}]\x1b[0m {line}\n"));
+            group.push(format!("\x1b[33m[{skey}{wkey}]\x1b[0m {content}"));
+        }
+        groups.push(group);
+    }
+
+    let total_lines: usize = groups.iter().map(|g| g.len()).sum();
+
+    if total_lines > max_lines / 2 {
+        // Interleaved two-column layout: even sessions left, odd sessions right.
+        // Both columns pack tightly with a blank line between sessions.
+        let col_width = term_cols / 2;
+
+        // If two columns still won't fit, cap each session at 3 windows.
+        let group_sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        let cap = if interleaved_height(&group_sizes, usize::MAX) > max_lines {
+            3
+        } else {
+            usize::MAX
+        };
+
+        let mut left_lines: Vec<String> = Vec::new();
+        let mut right_lines: Vec<String> = Vec::new();
+        for (gi, group) in groups.iter().enumerate() {
+            let col = if gi % 2 == 0 {
+                &mut left_lines
             } else {
-                println!("\x1b[33m[{skey}{wkey}]\x1b[0m {line}");
+                &mut right_lines
+            };
+            if !col.is_empty() {
+                col.push(String::new());
             }
-            line_count += 1;
+            col.extend(group.iter().take(cap).cloned());
+        }
+        let rows = left_lines.len().max(right_lines.len());
+        let pad = " ".repeat(col_width);
+        for i in 0..rows.min(max_lines) {
+            let left = left_lines
+                .get(i)
+                .filter(|s| !s.is_empty())
+                .map(|s| pad_visible(s, col_width))
+                .unwrap_or_else(|| pad.clone());
+            let right = right_lines
+                .get(i)
+                .filter(|s| !s.is_empty())
+                .map(|s| truncate_visible(s, col_width))
+                .unwrap_or_default();
+            tty_print(tty, &format!("{left}{right}\n"));
+        }
+    } else {
+        for group in &groups {
+            for line in group {
+                tty_print(tty, &format!("{line}\n"));
+            }
         }
     }
-    if let Some(tty) = tty.as_mut() {
-        tty.flush();
-    } else {
-        let _ = io::stdout().flush();
-    }
+
+    tty_flush(tty);
 }
 
 fn render_windows_screen(
@@ -467,15 +594,11 @@ fn render_windows_screen(
     codex_by_cwd: &HashMap<String, CodexSession>,
 ) -> Vec<TmuxWindow> {
     print_clear(tty);
-    if let Some(tty) = tty.as_mut() {
-        tty.write_all("h/j/k/l = select window | q/Esc = cancel\n\n");
-        tty.write_all(&format!("\x1b[36mSession: {target_session}\x1b[0m\n\n"));
-    } else {
-        println!("h/j/k/l = select window | q/Esc = cancel");
-        println!();
-        println!("\x1b[36mSession: {target_session}\x1b[0m");
-        println!();
-    }
+    tty_print(tty, "h/j/k/l = select window | q/Esc = cancel\n\n");
+    tty_print(
+        tty,
+        &format!("\x1b[36mSession: {target_session}\x1b[0m\n\n"),
+    );
 
     let mut session_windows = Vec::new();
     for (widx, window) in windows
@@ -486,22 +609,14 @@ fn render_windows_screen(
         session_windows.push(window.clone());
         let wkey = if widx < KEYS.len() { KEYS[widx] } else { '?' };
         let status = status_for_window(window, status_by_tmux_id, codex_by_cwd);
-        let line = if let Some(status) = status {
+        let content = if let Some(status) = status {
             format!("{} {} {}", window.session_index, status, window.window_name)
         } else {
             format!("{} {}", window.session_index, window.window_name)
         };
-        if let Some(tty) = tty.as_mut() {
-            tty.write_all(&format!("\x1b[33m[{wkey}]\x1b[0m {line}\n"));
-        } else {
-            println!("\x1b[33m[{wkey}]\x1b[0m {line}");
-        }
+        tty_print(tty, &format!("\x1b[33m[{wkey}]\x1b[0m {content}\n"));
     }
-    if let Some(tty) = tty.as_mut() {
-        tty.flush();
-    } else {
-        let _ = io::stdout().flush();
-    }
+    tty_flush(tty);
 
     session_windows
 }
@@ -859,7 +974,7 @@ dir = "~/work/agent-switch"
     }
 
     #[test]
-    fn non_project_sessions_keep_first_seen_order_after_prioritized_sessions() {
+    fn non_project_sessions_are_sorted_alphabetically() {
         let config: ProjectsConfig = toml::from_str(
             r#"
 [[project]]
@@ -882,7 +997,7 @@ dir = "~/code/the-company-private"
             &load_session_order(&config),
         );
 
-        assert_eq!(sessions, vec!["company", "misc", "zeta", "alpha"]);
+        assert_eq!(sessions, vec!["company", "alpha", "misc", "zeta"]);
     }
 
     #[test]
@@ -896,5 +1011,64 @@ dir = "~/code/the-company-private"
 
         // Default config: no explicit ordering, no ignore list, numeric sessions allowed.
         assert_eq!(sessions, vec!["1", "web"]);
+    }
+
+    #[test]
+    fn visible_len_strips_ansi_escapes() {
+        assert_eq!(visible_len("hello"), 5);
+        assert_eq!(visible_len("\x1b[33m[hh]\x1b[0m main:1 shell"), 17);
+        assert_eq!(visible_len("\x1b[1;33mwait\x1b[0m"), 4);
+        assert_eq!(visible_len(""), 0);
+    }
+
+    #[test]
+    fn pad_visible_pads_based_on_visible_width() {
+        let s = "\x1b[33mhi\x1b[0m";
+        let padded = pad_visible(s, 10);
+        assert_eq!(visible_len(&padded), 10);
+        assert!(padded.starts_with(s));
+    }
+
+    #[test]
+    fn interleaved_height_basic() {
+        // 2 groups of 3: left gets group 0 (3), right gets group 1 (3)
+        assert_eq!(interleaved_height(&[3, 3], usize::MAX), 3);
+    }
+
+    #[test]
+    fn interleaved_height_uneven() {
+        // left: group 0 (7), right: group 1 (3) → max(7, 3) = 7
+        assert_eq!(interleaved_height(&[7, 3], usize::MAX), 7);
+    }
+
+    #[test]
+    fn interleaved_height_many_groups_with_separators() {
+        // Simulates: dotfiles(7), data-scripts(3), kanel-backend(5), kf1-go(7),
+        //            main(5), kanel-gitops(3), tf-infra(3), proj-mgmt(2), site(5), split-binary(2)
+        // Left (even):  7 +1+ 5 +1+ 5 +1+ 3 +1+ 5 = 29
+        // Right (odd):  3 +1+ 7 +1+ 3 +1+ 2 +1+ 2 = 21
+        assert_eq!(
+            interleaved_height(&[7, 3, 5, 7, 5, 3, 3, 2, 5, 2], usize::MAX),
+            29
+        );
+    }
+
+    #[test]
+    fn interleaved_height_with_cap() {
+        // Same groups capped at 3 windows each
+        // Left (even):  3 +1+ 3 +1+ 3 +1+ 3 +1+ 3 = 19
+        // Right (odd):  3 +1+ 3 +1+ 3 +1+ 2 +1+ 2 = 17
+        assert_eq!(
+            interleaved_height(&[7, 3, 5, 7, 5, 3, 3, 2, 5, 2], 3),
+            19
+        );
+    }
+
+    #[test]
+    fn cap_triggers_when_height_exceeds_max_lines() {
+        let sizes = vec![7, 3, 5, 7, 5, 3, 3, 2, 5, 2];
+        // Full height is 29, so any max_lines < 29 should trigger cap
+        assert!(interleaved_height(&sizes, usize::MAX) > 20);
+        assert!(interleaved_height(&sizes, 3) <= 20);
     }
 }
