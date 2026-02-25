@@ -448,13 +448,10 @@ fn focus_column(index: u32) {
 
 fn spawn_terminals(dir: &str) {
     let dir = shellexpand::tilde(dir).to_string();
-    for _ in 0..3 {
-        Command::new("ghostty")
-            .arg(format!("--working-directory={}", dir))
-            .spawn()
-            .ok();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
+    Command::new("ghostty")
+        .arg(format!("--working-directory={}", dir))
+        .spawn()
+        .ok();
 }
 
 fn create_workspace(name: &str, dir: Option<&str>) {
