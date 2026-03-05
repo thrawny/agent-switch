@@ -60,6 +60,8 @@ struct Config {
     project: Vec<Project>,
     #[serde(default)]
     ignore: Vec<String>,
+    #[serde(default, alias = "codexAliases", alias = "codex_aliases")]
+    codex_aliases: Vec<String>,
     #[serde(
         default = "default_ignore_unnamed_workspaces",
         alias = "ignoreUnnamedWorkspaces",
@@ -80,6 +82,7 @@ impl Default for Config {
         Self {
             project: Vec::new(),
             ignore: Vec::new(),
+            codex_aliases: Vec::new(),
             ignore_unnamed_workspaces: default_ignore_unnamed_workspaces(),
             ignore_numeric_sessions: default_ignore_numeric_sessions(),
         }
@@ -110,6 +113,7 @@ struct WorkspaceColumn {
 
 struct AppState {
     config: Config,
+    codex_aliases: Vec<String>,
     entries: Vec<WorkspaceColumn>,
     pending_key: Option<char>,
     agent_sessions: HashMap<u64, AgentSession>,
@@ -169,12 +173,38 @@ fn load_agent_sessions() -> HashMap<u64, AgentSession> {
     sessions
 }
 
+fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
+    let mut aliases = vec!["codex".to_string()];
+    for alias in config_aliases {
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if aliases
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        aliases.push(trimmed.to_string());
+    }
+    aliases
+}
+
+fn window_title_matches_codex_aliases(title: &str, aliases: &[String]) -> bool {
+    let title = title.trim();
+    aliases
+        .iter()
+        .any(|alias| !alias.is_empty() && title.eq_ignore_ascii_case(alias))
+}
+
 fn codex_state_for_entry(
     entry: &WorkspaceColumn,
     codex_by_cwd: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
 ) -> Option<AgentState> {
     let title = entry.window_title.as_deref()?.trim();
-    if !title.eq_ignore_ascii_case("codex") {
+    if !window_title_matches_codex_aliases(title, codex_aliases) {
         return None;
     }
     let dir = entry.dir.as_deref()?;
@@ -656,9 +686,11 @@ fn build_ui(
         let cache = cache.lock().unwrap();
         cache.codex_sessions.clone()
     };
+    let codex_aliases = normalized_codex_aliases(&config.codex_aliases);
 
     let state = Rc::new(RefCell::new(AppState {
         config,
+        codex_aliases,
         entries,
         pending_key: None,
         agent_sessions,
@@ -683,6 +715,7 @@ fn build_ui(
             state_ref.pending_key,
             &state_ref.agent_sessions,
             &state_ref.codex_sessions,
+            &state_ref.codex_aliases,
         );
     }
     outer_box.append(&main_box);
@@ -746,6 +779,7 @@ fn build_ui(
                 let entries = state.entries.clone();
                 let agent_sessions = state.agent_sessions.clone();
                 let codex_sessions = state.codex_sessions.clone();
+                let codex_aliases = state.codex_aliases.clone();
                 drop(state);
                 build_entry_list(
                     &main_box_clone,
@@ -753,6 +787,7 @@ fn build_ui(
                     None,
                     &agent_sessions,
                     &codex_sessions,
+                    &codex_aliases,
                 );
             } else {
                 drop(state);
@@ -781,6 +816,7 @@ fn build_ui(
                     let entries = state.entries.clone();
                     let agent_sessions = state.agent_sessions.clone();
                     let codex_sessions = state.codex_sessions.clone();
+                    let codex_aliases = state.codex_aliases.clone();
                     drop(state);
                     build_entry_list(
                         &main_box_clone,
@@ -788,6 +824,7 @@ fn build_ui(
                         None,
                         &agent_sessions,
                         &codex_sessions,
+                        &codex_aliases,
                     );
                 }
             } else if state.entries.iter().any(|e| e.workspace_key == key_char) {
@@ -795,6 +832,7 @@ fn build_ui(
                 let entries = state.entries.clone();
                 let agent_sessions = state.agent_sessions.clone();
                 let codex_sessions = state.codex_sessions.clone();
+                let codex_aliases = state.codex_aliases.clone();
                 drop(state);
                 build_entry_list(
                     &main_box_clone,
@@ -802,6 +840,7 @@ fn build_ui(
                     Some(key_char),
                     &agent_sessions,
                     &codex_sessions,
+                    &codex_aliases,
                 );
             }
         }
@@ -846,6 +885,7 @@ fn build_ui(
                         let entries = state.entries.clone();
                         let agent_sessions = state.agent_sessions.clone();
                         let codex_sessions = state.codex_sessions.clone();
+                        let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
                             &main_box_for_poll,
@@ -853,6 +893,7 @@ fn build_ui(
                             None,
                             &agent_sessions,
                             &codex_sessions,
+                            &codex_aliases,
                         );
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
@@ -864,6 +905,8 @@ fn build_ui(
                         Ok(config) => {
                             state.config = config;
                             state.entries = get_workspace_columns(&state.config);
+                            state.codex_aliases =
+                                normalized_codex_aliases(&state.config.codex_aliases);
                             state.last_config_error = None;
                             true
                         }
@@ -883,6 +926,7 @@ fn build_ui(
                         let pending = state.pending_key;
                         let agent_sessions = state.agent_sessions.clone();
                         let codex_sessions = state.codex_sessions.clone();
+                        let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
                             &main_box_for_poll,
@@ -890,6 +934,7 @@ fn build_ui(
                             pending,
                             &agent_sessions,
                             &codex_sessions,
+                            &codex_aliases,
                         );
                     }
                 }
@@ -901,6 +946,7 @@ fn build_ui(
                         let pending = state.pending_key;
                         let agent_sessions = state.agent_sessions.clone();
                         let codex_sessions = state.codex_sessions.clone();
+                        let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
                             &main_box_for_poll,
@@ -908,6 +954,7 @@ fn build_ui(
                             pending,
                             &agent_sessions,
                             &codex_sessions,
+                            &codex_aliases,
                         );
                     }
                 }
@@ -922,6 +969,7 @@ fn build_ui(
                         let pending = state.pending_key;
                         let agent_sessions = state.agent_sessions.clone();
                         let codex_sessions = state.codex_sessions.clone();
+                        let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
                             &main_box_for_poll,
@@ -929,6 +977,7 @@ fn build_ui(
                             pending,
                             &agent_sessions,
                             &codex_sessions,
+                            &codex_aliases,
                         );
                     }
                 }
@@ -1075,6 +1124,7 @@ fn build_entry_list(
     pending_key: Option<char>,
     agent_sessions: &HashMap<u64, AgentSession>,
     codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -1112,7 +1162,8 @@ fn build_entry_list(
                     session.state.color(),
                     session.state.label()
                 )
-            } else if let Some(state) = codex_state_for_entry(entry, codex_sessions) {
+            } else if let Some(state) = codex_state_for_entry(entry, codex_sessions, codex_aliases)
+            {
                 format!(
                     "{} / codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
                     entry.workspace_name,
@@ -1244,6 +1295,7 @@ mod tests {
             name: None,
             dir: "~/code/agent-switch".to_string(),
             static_workspace: false,
+            skip_first_column: true,
         };
 
         assert_eq!(project_workspace_name(&project), "agent-switch");
@@ -1317,5 +1369,15 @@ ignore = ["web"]
             &config,
             &seen,
         ));
+    }
+
+    #[test]
+    fn codex_aliases_are_normalized_and_matched_case_insensitively() {
+        let aliases = normalized_codex_aliases(&vec!["cx".to_string(), "CXY".to_string()]);
+        assert_eq!(aliases, vec!["codex", "cx", "CXY"]);
+        assert!(window_title_matches_codex_aliases("codex", &aliases));
+        assert!(window_title_matches_codex_aliases("CX", &aliases));
+        assert!(window_title_matches_codex_aliases("cxy", &aliases));
+        assert!(!window_title_matches_codex_aliases("claude", &aliases));
     }
 }

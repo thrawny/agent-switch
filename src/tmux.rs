@@ -223,6 +223,8 @@ struct ProjectsConfig {
     project: Vec<ProjectConfigEntry>,
     #[serde(default)]
     ignore: Vec<String>,
+    #[serde(default, alias = "codexAliases", alias = "codex_aliases")]
+    codex_aliases: Vec<String>,
     #[serde(
         default = "default_ignore_numeric_sessions",
         alias = "ignoreNumericSessions",
@@ -236,6 +238,7 @@ impl Default for ProjectsConfig {
         Self {
             project: Vec::new(),
             ignore: Vec::new(),
+            codex_aliases: Vec::new(),
             ignore_numeric_sessions: default_ignore_numeric_sessions(),
         }
     }
@@ -350,6 +353,34 @@ fn sorted_sessions(windows: &[TmuxWindow], order: &[String]) -> Vec<String> {
     sorted
 }
 
+fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
+    let mut aliases = vec!["codex".to_string()];
+    for alias in config_aliases {
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if aliases
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        aliases.push(trimmed.to_string());
+    }
+    aliases
+}
+
+fn contains_alias_token(text: &str, aliases: &[String]) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            aliases
+                .iter()
+                .any(|alias| token.eq_ignore_ascii_case(alias))
+        })
+}
+
 fn format_status(state: AgentState, agent: &str) -> String {
     format!("{}{} [{}]\x1b[0m", state.color(), agent, state.label())
 }
@@ -358,6 +389,7 @@ fn status_for_window(
     window: &TmuxWindow,
     status_by_tmux_id: &HashMap<String, &state::Session>,
     codex_by_cwd: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
 ) -> Option<String> {
     // First check Claude sessions
     if let Some(session) = status_by_tmux_id.get(&window.window_id)
@@ -365,12 +397,12 @@ fn status_for_window(
     {
         return Some(format_status(state, &session.agent));
     }
-    // Only check Codex for windows with "codex" in the name or command
-    let has_codex_name = window.window_name.to_lowercase().contains("codex");
+    // Only check Codex for windows with codex name/alias in the title or command.
+    let has_codex_name = contains_alias_token(&window.window_name, codex_aliases);
     let has_codex_command = window
         .pane_command
         .as_ref()
-        .map(|c| c.to_lowercase().contains("codex"))
+        .map(|c| contains_alias_token(c, codex_aliases))
         .unwrap_or(false);
     if !has_codex_name && !has_codex_command {
         return None;
@@ -507,6 +539,7 @@ fn render_sessions_screen(
     windows: &[TmuxWindow],
     status_by_tmux_id: &HashMap<String, &state::Session>,
     codex_by_cwd: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
 ) {
     print_clear(tty);
     let header = "h/j/k/l = select session | / = search | q/Esc = cancel\n\n";
@@ -526,7 +559,7 @@ fn render_sessions_screen(
             .enumerate()
         {
             let wkey = if widx < KEYS.len() { KEYS[widx] } else { '?' };
-            let status = status_for_window(window, status_by_tmux_id, codex_by_cwd);
+            let status = status_for_window(window, status_by_tmux_id, codex_by_cwd, codex_aliases);
             let content = if let Some(status) = status {
                 format!("{} {} {}", window.session_index, status, window.window_name)
             } else {
@@ -597,6 +630,7 @@ fn render_windows_screen(
     windows: &[TmuxWindow],
     status_by_tmux_id: &HashMap<String, &state::Session>,
     codex_by_cwd: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
 ) -> Vec<TmuxWindow> {
     print_clear(tty);
     tty_print(tty, "h/j/k/l = select window | q/Esc = cancel\n\n");
@@ -613,7 +647,7 @@ fn render_windows_screen(
     {
         session_windows.push(window.clone());
         let wkey = if widx < KEYS.len() { KEYS[widx] } else { '?' };
-        let status = status_for_window(window, status_by_tmux_id, codex_by_cwd);
+        let status = status_for_window(window, status_by_tmux_id, codex_by_cwd, codex_aliases);
         let content = if let Some(status) = status {
             format!("{} {} {}", window.session_index, status, window.window_name)
         } else {
@@ -694,6 +728,7 @@ pub fn run() {
 
     let session_order = load_session_order(&config);
     let sessions = sorted_sessions(&windows, &session_order);
+    let codex_aliases = normalized_codex_aliases(&config.codex_aliases);
 
     // Build lookup by tmux_id for agent status
     let status_by_tmux_id: HashMap<String, &state::Session> = store
@@ -764,6 +799,7 @@ pub fn run() {
         &windows,
         &status_by_tmux_id,
         &codex_by_cwd,
+        &codex_aliases,
     );
 
     loop {
@@ -801,6 +837,7 @@ pub fn run() {
                     &windows,
                     &status_by_tmux_id,
                     &codex_by_cwd,
+                    &codex_aliases,
                 );
                 screen = ScreenState::Windows {
                     target_session,
@@ -1019,6 +1056,30 @@ name = "scratch"
         assert_eq!(config.project[0].name.as_deref(), Some("scratch"));
         assert_eq!(config.project[0].dir, "~/");
         assert_eq!(project_name(&config.project[0]), "scratch");
+    }
+
+    #[test]
+    fn codex_aliases_parse_and_include_codex_default() {
+        let config: ProjectsConfig = toml::from_str(
+            r#"
+codexAliases = ["cx", "cxy"]
+"#,
+        )
+        .expect("projects.toml should parse");
+
+        assert_eq!(
+            normalized_codex_aliases(&config.codex_aliases),
+            vec!["codex", "cx", "cxy"]
+        );
+    }
+
+    #[test]
+    fn alias_token_match_is_exact_by_token() {
+        let aliases = vec!["codex".to_string(), "cx".to_string(), "cxy".to_string()];
+        assert!(contains_alias_token("cxy", &aliases));
+        assert!(contains_alias_token("run cx now", &aliases));
+        assert!(contains_alias_token("/home/me/bin/cx", &aliases));
+        assert!(!contains_alias_token("execute", &aliases));
     }
 
     #[test]

@@ -112,6 +112,7 @@ Example:
 ignore = ["games", "web"]
 ignoreUnnamedWorkspaces = true
 ignoreNumericSessions = true
+codexAliases = ["cx", "cxy"]
 
 [[project]]
 dir = "~/dotfiles"
@@ -128,6 +129,7 @@ dir = "~/code/agent-switch" # name inferred from folder if omitted
 Notes:
 - `ignoreUnnamedWorkspaces` defaults to `true` (niri)
 - `ignoreNumericSessions` defaults to `false` and works for both niri + tmux
+- `codexAliases` adds extra names (for example `cx`, `cxy`) to detect Codex windows in tmux + niri
 - `ignore` works for discovered niri workspaces and tmux sessions
 - if `project.name` is omitted, name is inferred from `dir` basename
 - `static_workspace = true` means “focus existing workspace, don’t auto-create”
