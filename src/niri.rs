@@ -461,6 +461,13 @@ fn focus_column(index: u32) {
     });
 }
 
+fn focus_window(id: u64) -> bool {
+    matches!(
+        niri_request(Request::Action(Action::FocusWindow { id })),
+        Some(Response::Handled)
+    )
+}
+
 fn spawn_terminals(dir: &str) {
     let dir = shellexpand::tilde(dir).to_string();
     Command::new("ghostty")
@@ -489,6 +496,12 @@ fn create_workspace(name: &str, dir: Option<&str>) {
 }
 
 fn switch_to_entry(entry: &WorkspaceColumn) {
+    if let Some(window_id) = entry.window_id
+        && focus_window(window_id)
+    {
+        return;
+    }
+
     if entry.static_workspace {
         focus_workspace(entry.workspace_ref.clone());
         if entry.app_label == "(empty)"
