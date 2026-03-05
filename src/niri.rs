@@ -38,9 +38,20 @@ struct Project {
     key: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default = "default_project_dir")]
     dir: String,
     #[serde(default)]
     static_workspace: bool,
+    #[serde(default = "default_true", alias = "skip_first_column")]
+    skip_first_column: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_project_dir() -> String {
+    "~/".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,7 +285,9 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
                                  workspace_key: char,
                                  dir: Option<String>,
                                  static_workspace: bool,
+                                 skip_first_column: bool,
                                  windows_arr: &[&Window]| {
+        let min_col: usize = if skip_first_column { 2 } else { 1 };
         let mut columns: BTreeMap<usize, Vec<&Window>> = BTreeMap::new();
 
         for window in windows_arr.iter() {
@@ -289,14 +302,14 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
             columns.entry(col_idx).or_default().push(*window);
         }
 
-        let has_columns = columns.keys().any(|&idx| idx >= 2);
+        let has_columns = columns.keys().any(|&idx| idx >= min_col);
 
         if has_columns {
             for (&col_idx, col_windows) in &columns {
-                if col_idx < 2 {
+                if col_idx < min_col {
                     continue;
                 }
-                let key_offset = col_idx - 2;
+                let key_offset = col_idx - min_col;
                 if key_offset >= KEYS.len() {
                     continue;
                 }
@@ -365,6 +378,7 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
                 workspace_key,
                 Some(project.dir.clone()),
                 project.static_workspace,
+                project.skip_first_column,
                 &windows_refs,
             );
         } else {
@@ -426,6 +440,7 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
             workspace_ref,
             workspace_key,
             None,
+            true,
             true,
             &windows_refs,
         );

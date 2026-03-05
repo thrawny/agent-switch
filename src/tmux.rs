@@ -249,7 +249,12 @@ fn default_ignore_numeric_sessions() -> bool {
 struct ProjectConfigEntry {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default = "default_project_dir")]
     dir: String,
+}
+
+fn default_project_dir() -> String {
+    "~/".to_string()
 }
 
 fn projects_config_path() -> PathBuf {
@@ -1001,6 +1006,22 @@ dir = "~/code/the-company-private"
     }
 
     #[test]
+    fn project_with_name_only_defaults_dir_to_home() {
+        let config: ProjectsConfig = toml::from_str(
+            r#"
+[[project]]
+name = "scratch"
+"#,
+        )
+        .expect("projects.toml should parse");
+
+        assert_eq!(config.project.len(), 1);
+        assert_eq!(config.project[0].name.as_deref(), Some("scratch"));
+        assert_eq!(config.project[0].dir, "~/");
+        assert_eq!(project_name(&config.project[0]), "scratch");
+    }
+
+    #[test]
     fn invalid_projects_toml_falls_back_to_default_behavior() {
         let config = parse_projects_config("ignoreNumericSessions = not-a-bool");
 
@@ -1058,10 +1079,7 @@ dir = "~/code/the-company-private"
         // Same groups capped at 3 windows each
         // Left (even):  3 +1+ 3 +1+ 3 +1+ 3 +1+ 3 = 19
         // Right (odd):  3 +1+ 3 +1+ 3 +1+ 2 +1+ 2 = 17
-        assert_eq!(
-            interleaved_height(&[7, 3, 5, 7, 5, 3, 3, 2, 5, 2], 3),
-            19
-        );
+        assert_eq!(interleaved_height(&[7, 3, 5, 7, 5, 3, 3, 2, 5, 2], 3), 19);
     }
 
     #[test]
