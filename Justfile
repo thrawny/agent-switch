@@ -18,17 +18,29 @@ run-tmux:
 run-niri:
     cargo run --features niri -- niri
 
-# Watch tmux daemon (rebuild on changes)
+# Watch tmux daemon with build-gated restart (old process stays alive on compile errors)
 watch-tmux:
-    RUST_LOG=debug watchexec -w src -e rs --restart -- cargo run -- serve
+    cargo build
+    zmx run agent-switch-build 'watchexec -w src -e rs --debounce 5000ms -- cargo build'
+    zmx run agent-switch-tmux 'RUST_LOG=debug watchexec --restart --debounce 3000ms -w target/debug/agent-switch -- ./target/debug/agent-switch serve'
+    zmx attach agent-switch-tmux
 
-# Watch niri daemon (rebuild on changes)
+# Watch niri daemon with build-gated restart (old process stays alive on compile errors)
 watch-niri:
-    RUST_LOG=debug watchexec -w src -e rs --restart -- cargo run --features niri -- niri
+    cargo build --features niri
+    zmx run agent-switch-build 'watchexec -w src -e rs --debounce 5000ms -- cargo build --features niri'
+    zmx run agent-switch-niri 'RUST_LOG=debug watchexec --restart --debounce 3000ms -w target/debug/agent-switch -- ./target/debug/agent-switch niri'
+    zmx attach agent-switch-niri
 
 # Install to ~/.cargo/bin
 install:
     cargo install --path . --locked --force {{ _niri }}
+
+# Run all post-change checks
+check:
+    just fmt
+    cargo clippy -- -D warnings {{ _niri }}
+    just test
 
 # Run clippy
 clippy:

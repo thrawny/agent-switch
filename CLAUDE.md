@@ -2,6 +2,21 @@
 
 Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) across tmux and niri.
 
+## 1) How to execute tasks
+
+- Prefer `just` recipes over raw commands.
+- Primary dev loop: `just watch-niri` or `just watch-tmux` (runs in zmx).
+
+## 2) After code changes
+
+- Do NOT run `cargo build` directly. Instead, ensure the watcher is running — it rebuilds automatically on file changes.
+- Run `just check` after every code change (runs fmt, clippy, test).
+- To check build output / runtime logs from the watcher:
+  - `zmx list --short`
+  - `zmx history agent-switch-build | tail -n 200` (build watcher)
+  - `zmx history agent-switch-niri | tail -n 200` (niri daemon)
+  - `zmx history agent-switch-tmux | tail -n 200` (tmux daemon)
+
 ## Task Runner
 
 ```bash
@@ -11,8 +26,8 @@ just install      # Install to ~/.cargo/bin
 just test         # Run tests
 just clippy       # Lint
 just fmt           # Format
-just watch-tmux   # Watch + run tmux daemon
-just watch-niri   # Watch + run niri GTK daemon
+just watch-tmux   # Watch + run tmux daemon (zmx session)
+just watch-niri   # Watch + run niri GTK daemon (zmx session)
 ```
 
 ## Architecture
