@@ -500,10 +500,34 @@ fn focus_window(id: u64) -> bool {
 
 fn spawn_terminals(dir: &str) {
     let dir = shellexpand::tilde(dir).to_string();
-    Command::new("ghostty")
+
+    // Prefer compositor-side spawn to avoid inheriting daemon/zmx env vars.
+    let spawned_via_niri = matches!(
+        niri_request(Request::Action(Action::Spawn {
+            command: vec![
+                "ghostty".to_string(),
+                format!("--working-directory={}", dir)
+            ],
+        })),
+        Some(Response::Handled)
+    );
+    if spawned_via_niri {
+        return;
+    }
+
+    // Fallback path for environments where niri IPC spawn is unavailable.
+    let mut command = Command::new("ghostty");
+    command
         .arg(format!("--working-directory={}", dir))
-        .spawn()
-        .ok();
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("TMUX_TMPDIR");
+    for (key, _) in std::env::vars() {
+        if key.starts_with("ZMX_") {
+            command.env_remove(key);
+        }
+    }
+    let _ = command.spawn();
 }
 
 fn create_workspace(name: &str, dir: Option<&str>) {

@@ -39,7 +39,7 @@ install:
 # Run all post-change checks
 check:
     just fmt
-    cargo clippy -- -D warnings {{ _niri }}
+    cargo clippy {{ _niri }} -- -D warnings
     just test
 
 # Run clippy
