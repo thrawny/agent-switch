@@ -1,6 +1,7 @@
 # agent-switch task runner
 
 _niri := if os() == "linux" { "--features niri" } else { "" }
+_build_stamp := "target/debug/agent-switch-built.stamp"
 
 # Default recipe
 default:
@@ -21,17 +22,17 @@ run-niri:
 # Watch tmux daemon with build-gated restart (old process stays alive on compile errors)
 watch-tmux:
     cargo build
-    touch target/debug/.agent-switch-built
-    zmx run agent-switch-build 'watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- cargo build && touch target/debug/.agent-switch-built'
-    zmx run agent-switch-tmux 'RUST_LOG=debug watchexec --restart --debounce 250ms -w target/debug/.agent-switch-built -- ./target/debug/agent-switch serve'
+    touch {{ _build_stamp }}
+    zmx run agent-switch-build "watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build && touch {{ _build_stamp }}'"
+    zmx run agent-switch-tmux 'RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve'
     zmx attach agent-switch-tmux
 
 # Watch niri daemon with build-gated restart (old process stays alive on compile errors)
 watch-niri:
     cargo build --features niri
-    touch target/debug/.agent-switch-built
-    zmx run agent-switch-build 'watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- cargo build --features niri && touch target/debug/.agent-switch-built'
-    zmx run agent-switch-niri 'RUST_LOG=debug watchexec --restart --debounce 250ms -w target/debug/.agent-switch-built -- ./target/debug/agent-switch niri'
+    touch {{ _build_stamp }}
+    zmx run agent-switch-build "watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build --features niri && touch {{ _build_stamp }}'"
+    zmx run agent-switch-niri 'RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch niri'
     zmx attach agent-switch-niri
 
 # Install to ~/.cargo/bin

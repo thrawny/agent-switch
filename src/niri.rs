@@ -860,15 +860,6 @@ fn build_ui(
     let outer_box = GtkBox::new(Orientation::Vertical, 0);
     outer_box.add_css_class("outer");
 
-    let header = Label::new(None);
-    header.add_css_class("header");
-    header.set_xalign(0.0);
-    header.set_margin_top(20);
-    header.set_margin_bottom(12);
-    header.set_margin_start(20);
-    header.set_margin_end(20);
-    outer_box.append(&header);
-
     let scroller = ScrolledWindow::new();
     scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
     scroller.set_propagate_natural_width(true);
@@ -877,6 +868,7 @@ fn build_ui(
     scroller.set_vexpand(true);
 
     let main_box = GtkBox::new(Orientation::Vertical, 10);
+    main_box.set_margin_top(20);
     main_box.set_margin_start(20);
     main_box.set_margin_end(20);
     main_box.set_margin_bottom(20);
@@ -885,7 +877,6 @@ fn build_ui(
     {
         let state_ref = state.borrow();
         build_entry_list(
-            &header,
             &main_box,
             &state_ref.entries,
             state_ref.pending_key,
@@ -922,10 +913,6 @@ fn build_ui(
             color: #ffffff;
             font-size: 14px;
         }
-        label.header {
-            font-size: 12px;
-            color: #888888;
-        }
         label.workspace-title {
             color: #b5bd68;
             font-size: 12px;
@@ -957,7 +944,6 @@ fn build_ui(
     let key_controller = gtk4::EventControllerKey::new();
     let state_clone = state.clone();
     let window_clone = window.clone();
-    let header_clone = header.clone();
     let main_box_clone = main_box.clone();
     let outer_box_clone = outer_box.clone();
     let scroller_clone = scroller.clone();
@@ -1010,7 +996,6 @@ fn build_ui(
                 let codex_aliases = state.codex_aliases.clone();
                 drop(state);
                 build_entry_list(
-                    &header_clone,
                     &main_box_clone,
                     &entries,
                     None,
@@ -1049,7 +1034,6 @@ fn build_ui(
                     let codex_aliases = state.codex_aliases.clone();
                     drop(state);
                     build_entry_list(
-                        &header_clone,
                         &main_box_clone,
                         &entries,
                         None,
@@ -1068,7 +1052,6 @@ fn build_ui(
                 let codex_aliases = state.codex_aliases.clone();
                 drop(state);
                 build_entry_list(
-                    &header_clone,
                     &main_box_clone,
                     &entries,
                     Some(key_char),
@@ -1092,7 +1075,6 @@ fn build_ui(
 
     let window_for_poll = window.clone();
     let state_for_poll = state.clone();
-    let header_for_poll = header.clone();
     let main_box_for_poll = main_box.clone();
     let outer_box_for_poll = outer_box.clone();
     let scroller_for_poll = scroller.clone();
@@ -1128,7 +1110,6 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
-                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             None,
@@ -1181,7 +1162,6 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
-                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             pending,
@@ -1208,7 +1188,6 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
-                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             pending,
@@ -1237,7 +1216,6 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
-                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             pending,
@@ -1433,8 +1411,7 @@ fn entry_markup(
 
         if let Some(state) = codex_state_for_entry(entry, codex_sessions, codex_aliases) {
             return format!(
-                "{} / codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
-                app_label,
+                "codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
                 state.color(),
                 state.label()
             );
@@ -1502,7 +1479,6 @@ fn build_workspace_group(
 }
 
 fn build_entry_list(
-    header: &Label,
     container: &GtkBox,
     entries: &[WorkspaceColumn],
     pending_key: Option<char>,
@@ -1513,13 +1489,6 @@ fn build_entry_list(
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
-
-    let header_text = if let Some(key) = pending_key {
-        format!("Select column for [{}] (q/Esc to cancel)", key)
-    } else {
-        "Select workspace+column (q/Esc to cancel)".to_string()
-    };
-    header.set_text(&header_text);
 
     let filtered: Vec<_> = if let Some(key) = pending_key {
         entries.iter().filter(|e| e.workspace_key == key).collect()
