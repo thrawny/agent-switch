@@ -4,8 +4,8 @@ use crate::daemon::{
 use crate::state;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Label, Orientation, PolicyType, ScrolledWindow,
-    Separator, glib,
+    Application, ApplicationWindow, Box as GtkBox, Grid, Label, Orientation, PolicyType,
+    ScrolledWindow, Separator, glib,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use niri_ipc::{
@@ -903,11 +903,20 @@ fn build_ui(
         }
         .workspace-group {
             min-width: 0;
+            padding-top: 4px;
+            padding-bottom: 4px;
         }
         separator.workspace-separator {
             margin-top: 4px;
             margin-bottom: 4px;
-            color: rgba(249, 38, 114, 0.35);
+            min-height: 1px;
+            color: rgba(249, 38, 114, 0.8);
+        }
+        separator.workspace-separator-vertical {
+            margin-left: 4px;
+            margin-right: 4px;
+            min-width: 1px;
+            color: rgba(249, 38, 114, 0.8);
         }
         label {
             color: #ffffff;
@@ -1498,43 +1507,61 @@ fn build_entry_list(
     let groups = group_entries_by_workspace(&filtered);
 
     if pending_key.is_none() && groups.len() > 1 {
-        let columns = GtkBox::new(Orientation::Horizontal, 24);
-        columns.add_css_class("workspace-columns");
+        let grid = Grid::new();
+        grid.add_css_class("workspace-columns");
+        grid.set_column_spacing(12);
 
-        let left_column = GtkBox::new(Orientation::Vertical, 12);
-        left_column.add_css_class("workspace-column");
-        left_column.set_hexpand(true);
+        let num_pair_rows = groups.len().div_ceil(2);
+        let total_grid_rows = if num_pair_rows > 1 {
+            num_pair_rows * 2 - 1
+        } else {
+            1
+        };
 
-        let right_column = GtkBox::new(Orientation::Vertical, 12);
-        right_column.add_css_class("workspace-column");
-        right_column.set_hexpand(true);
+        // Vertical separator spanning all rows
+        if groups.len() > 1 {
+            let vsep = Separator::new(Orientation::Vertical);
+            vsep.add_css_class("workspace-separator-vertical");
+            grid.attach(&vsep, 1, 0, 1, total_grid_rows as i32);
+        }
 
-        for (index, group_entries) in groups.iter().enumerate() {
-            let column = if index % 2 == 0 {
-                &left_column
+        for pair_row in 0..num_pair_rows {
+            let grid_row = if pair_row == 0 {
+                0
             } else {
-                &right_column
-            };
-
-            if column.first_child().is_some() {
+                let sep_row = (pair_row * 2 - 1) as i32;
                 let separator = Separator::new(Orientation::Horizontal);
                 separator.add_css_class("workspace-separator");
-                column.append(&separator);
-            }
+                grid.attach(&separator, 0, sep_row, 3, 1);
+                sep_row + 1
+            };
 
-            column.append(&build_workspace_group(
-                group_entries,
+            let left_idx = pair_row * 2;
+            let group = build_workspace_group(
+                &groups[left_idx],
                 agent_sessions,
                 codex_sessions,
                 codex_aliases,
-            ));
+            );
+            group.set_valign(gtk4::Align::Start);
+            group.set_hexpand(true);
+            grid.attach(&group, 0, grid_row, 1, 1);
+
+            let right_idx = left_idx + 1;
+            if right_idx < groups.len() {
+                let group = build_workspace_group(
+                    &groups[right_idx],
+                    agent_sessions,
+                    codex_sessions,
+                    codex_aliases,
+                );
+                group.set_valign(gtk4::Align::Start);
+                group.set_hexpand(true);
+                grid.attach(&group, 2, grid_row, 1, 1);
+            }
         }
 
-        columns.append(&left_column);
-        if right_column.first_child().is_some() {
-            columns.append(&right_column);
-        }
-        container.append(&columns);
+        container.append(&grid);
     } else {
         for (index, group_entries) in groups.iter().enumerate() {
             if index > 0 {
