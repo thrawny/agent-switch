@@ -3,7 +3,10 @@ use crate::daemon::{
 };
 use crate::state;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, glib};
+use gtk4::{
+    Application, ApplicationWindow, Box as GtkBox, Label, Orientation, PolicyType, ScrolledWindow,
+    glib,
+};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use niri_ipc::{
     Action, Event, Request, Response, Window, Workspace, WorkspaceReferenceArg, socket::Socket,
@@ -22,7 +25,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 const APP_ID: &str = "com.thrawny.agent-switch";
-const KEYS: [char; 8] = ['h', 'j', 'k', 'l', 'u', 'i', 'o', 'p'];
+const KEYS: [char; 12] = ['h', 'j', 'k', 'l', 'u', 'i', 'o', 'p', 'n', 'm', ',', '.'];
+const NIRI_OVERLAY_WIDTH_RATIO: f64 = 0.45;
+const NIRI_OVERLAY_HEIGHT_RATIO: f64 = 0.70;
+const NIRI_OVERLAY_MIN_WIDTH: i32 = 560;
+const NIRI_OVERLAY_MAX_WIDTH: i32 = 1100;
+const NIRI_OVERLAY_MIN_HEIGHT: i32 = 240;
+const NIRI_OVERLAY_MAX_HEIGHT: i32 = 900;
+const NIRI_OVERLAY_FALLBACK_HEIGHT: i32 = 520;
+const NIRI_OVERLAY_MARGIN: i32 = 80;
+const NIRI_OVERLAY_STEP_SCROLL: f64 = 64.0;
+const NIRI_OVERLAY_PAGE_SCROLL: f64 = 320.0;
 
 // Use DaemonMessage as base, add niri-specific ReloadConfig
 #[derive(Debug)]
@@ -298,6 +311,20 @@ fn should_skip_discovered_workspace(
         || config.ignore.iter().any(|ignored| ignored == display_name)
 }
 
+fn configured_projects(config: &Config) -> Vec<&Project> {
+    let mut seen = std::collections::HashSet::new();
+    let mut projects = Vec::new();
+
+    for project in &config.project {
+        let name = project_workspace_name(project);
+        if seen.insert(name) {
+            projects.push(project);
+        }
+    }
+
+    projects
+}
+
 fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
@@ -385,7 +412,7 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
 
     let windows_refs: Vec<&Window> = windows.iter().collect();
 
-    for project in &config.project {
+    for project in configured_projects(config) {
         if key_idx >= KEYS.len() {
             break;
         }
@@ -678,6 +705,94 @@ fn start_focus_tracker(focused_window: Arc<Mutex<Option<u64>>>) {
     });
 }
 
+fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
+    value.max(min).min(max)
+}
+
+fn overlay_monitor(window: &ApplicationWindow) -> Option<gtk4::gdk::Monitor> {
+    let display = gtk4::gdk::Display::default()?;
+
+    if let Some(surface) = window.surface()
+        && let Some(monitor) = display.monitor_at_surface(&surface)
+    {
+        return Some(monitor);
+    }
+
+    display
+        .monitors()
+        .item(0)?
+        .downcast::<gtk4::gdk::Monitor>()
+        .ok()
+}
+
+fn update_overlay_size(window: &ApplicationWindow, scroller: &ScrolledWindow) {
+    let (width, height) = overlay_monitor(window)
+        .map(|monitor| {
+            let geometry = monitor.geometry();
+            let available_width = (geometry.width() - NIRI_OVERLAY_MARGIN).max(320);
+            let available_height = (geometry.height() - NIRI_OVERLAY_MARGIN).max(200);
+            let width_floor = NIRI_OVERLAY_MIN_WIDTH.min(available_width);
+            let width_ceiling = NIRI_OVERLAY_MAX_WIDTH.min(available_width);
+            let height_floor = NIRI_OVERLAY_MIN_HEIGHT.min(available_height);
+            let height_ceiling = NIRI_OVERLAY_MAX_HEIGHT.min(available_height);
+
+            let width = clamp_i32(
+                (geometry.width() as f64 * NIRI_OVERLAY_WIDTH_RATIO).round() as i32,
+                width_floor,
+                width_ceiling,
+            );
+            let height = clamp_i32(
+                (geometry.height() as f64 * NIRI_OVERLAY_HEIGHT_RATIO).round() as i32,
+                height_floor,
+                height_ceiling,
+            );
+
+            (width, height)
+        })
+        .unwrap_or((NIRI_OVERLAY_MIN_WIDTH, NIRI_OVERLAY_FALLBACK_HEIGHT));
+
+    scroller.set_min_content_width(width);
+    scroller.set_max_content_width(width);
+    scroller.set_min_content_height(NIRI_OVERLAY_MIN_HEIGHT.min(height));
+    scroller.set_max_content_height(height);
+    window.set_default_size(width, height);
+}
+
+fn scroll_overlay(scroller: &ScrolledWindow, delta: f64) {
+    let adjustment = scroller.vadjustment();
+    let lower = adjustment.lower();
+    let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
+    let next = (adjustment.value() + delta).clamp(lower, upper);
+    adjustment.set_value(next);
+}
+
+fn scroll_overlay_by_step(scroller: &ScrolledWindow, direction: f64) {
+    let adjustment = scroller.vadjustment();
+    let delta = adjustment.step_increment().max(NIRI_OVERLAY_STEP_SCROLL) * direction;
+    scroll_overlay(scroller, delta);
+}
+
+fn scroll_overlay_by_page(scroller: &ScrolledWindow, direction: f64) {
+    let adjustment = scroller.vadjustment();
+    let delta = adjustment
+        .page_increment()
+        .max(adjustment.page_size() * 0.9)
+        .max(NIRI_OVERLAY_PAGE_SCROLL)
+        * direction;
+    scroll_overlay(scroller, delta);
+}
+
+fn reset_overlay_scroll(scroller: &ScrolledWindow) {
+    let adjustment = scroller.vadjustment();
+    adjustment.set_value(adjustment.lower());
+}
+
+fn scroll_overlay_to_end(scroller: &ScrolledWindow) {
+    let adjustment = scroller.vadjustment();
+    let upper = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    adjustment.set_value(upper);
+}
+
 fn build_ui(
     app: &Application,
     rx: mpsc::Receiver<NiriMessage>,
@@ -686,7 +801,8 @@ fn build_ui(
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .default_width(500)
+        .default_width(NIRI_OVERLAY_MIN_WIDTH)
+        .default_height(NIRI_OVERLAY_FALLBACK_HEIGHT)
         .build();
 
     window.init_layer_shell();
@@ -725,15 +841,30 @@ fn build_ui(
     let outer_box = GtkBox::new(Orientation::Vertical, 0);
     outer_box.add_css_class("outer");
 
+    let header = Label::new(None);
+    header.add_css_class("header");
+    header.set_xalign(0.0);
+    header.set_margin_top(20);
+    header.set_margin_bottom(12);
+    header.set_margin_start(20);
+    header.set_margin_end(20);
+    outer_box.append(&header);
+
+    let scroller = ScrolledWindow::new();
+    scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+
     let main_box = GtkBox::new(Orientation::Vertical, 10);
-    main_box.set_margin_top(20);
-    main_box.set_margin_bottom(20);
     main_box.set_margin_start(20);
     main_box.set_margin_end(20);
+    main_box.set_margin_bottom(20);
+    scroller.set_child(Some(&main_box));
 
     {
         let state_ref = state.borrow();
         build_entry_list(
+            &header,
             &main_box,
             &state_ref.entries,
             state_ref.pending_key,
@@ -742,7 +873,7 @@ fn build_ui(
             &state_ref.codex_aliases,
         );
     }
-    outer_box.append(&main_box);
+    outer_box.append(&scroller);
 
     let css_provider = gtk4::CssProvider::new();
     css_provider.load_from_data(
@@ -788,13 +919,43 @@ fn build_ui(
     let key_controller = gtk4::EventControllerKey::new();
     let state_clone = state.clone();
     let window_clone = window.clone();
+    let header_clone = header.clone();
     let main_box_clone = main_box.clone();
+    let scroller_clone = scroller.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
         let key_name = keyval.name().map(|s| s.to_lowercase());
         let Some(key) = key_name.as_deref() else {
             return glib::Propagation::Proceed;
         };
+
+        match key {
+            "up" => {
+                scroll_overlay_by_step(&scroller_clone, -1.0);
+                return glib::Propagation::Stop;
+            }
+            "down" => {
+                scroll_overlay_by_step(&scroller_clone, 1.0);
+                return glib::Propagation::Stop;
+            }
+            "page_up" => {
+                scroll_overlay_by_page(&scroller_clone, -1.0);
+                return glib::Propagation::Stop;
+            }
+            "page_down" => {
+                scroll_overlay_by_page(&scroller_clone, 1.0);
+                return glib::Propagation::Stop;
+            }
+            "home" => {
+                reset_overlay_scroll(&scroller_clone);
+                return glib::Propagation::Stop;
+            }
+            "end" => {
+                scroll_overlay_to_end(&scroller_clone);
+                return glib::Propagation::Stop;
+            }
+            _ => {}
+        }
 
         if key == "q" || key == "escape" {
             let mut state = state_clone.borrow_mut();
@@ -806,6 +967,7 @@ fn build_ui(
                 let codex_aliases = state.codex_aliases.clone();
                 drop(state);
                 build_entry_list(
+                    &header_clone,
                     &main_box_clone,
                     &entries,
                     None,
@@ -813,6 +975,7 @@ fn build_ui(
                     &codex_sessions,
                     &codex_aliases,
                 );
+                reset_overlay_scroll(&scroller_clone);
             } else {
                 drop(state);
                 window_clone.set_visible(false);
@@ -843,6 +1006,7 @@ fn build_ui(
                     let codex_aliases = state.codex_aliases.clone();
                     drop(state);
                     build_entry_list(
+                        &header_clone,
                         &main_box_clone,
                         &entries,
                         None,
@@ -850,6 +1014,7 @@ fn build_ui(
                         &codex_sessions,
                         &codex_aliases,
                     );
+                    reset_overlay_scroll(&scroller_clone);
                 }
             } else if state.entries.iter().any(|e| e.workspace_key == key_char) {
                 state.pending_key = Some(key_char);
@@ -859,6 +1024,7 @@ fn build_ui(
                 let codex_aliases = state.codex_aliases.clone();
                 drop(state);
                 build_entry_list(
+                    &header_clone,
                     &main_box_clone,
                     &entries,
                     Some(key_char),
@@ -866,6 +1032,7 @@ fn build_ui(
                     &codex_sessions,
                     &codex_aliases,
                 );
+                reset_overlay_scroll(&scroller_clone);
             }
         }
 
@@ -875,11 +1042,14 @@ fn build_ui(
     window.add_controller(key_controller);
     window.set_visible(false);
     window.present();
+    update_overlay_size(&window, &scroller);
     window.set_visible(false);
 
     let window_for_poll = window.clone();
     let state_for_poll = state.clone();
+    let header_for_poll = header.clone();
     let main_box_for_poll = main_box.clone();
+    let scroller_for_poll = scroller.clone();
     let focused_window_for_poll = focused_window.clone();
     let cache_for_poll = cache.clone();
 
@@ -912,6 +1082,7 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
+                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             None,
@@ -919,8 +1090,11 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                         );
+                        reset_overlay_scroll(&scroller_for_poll);
+                        update_overlay_size(&window_for_poll, &scroller_for_poll);
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
+                        update_overlay_size(&window_for_poll, &scroller_for_poll);
                     }
                 }
                 NiriMessage::ReloadConfig => {
@@ -953,6 +1127,7 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
+                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             pending,
@@ -960,6 +1135,8 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                         );
+                        reset_overlay_scroll(&scroller_for_poll);
+                        update_overlay_size(&window_for_poll, &scroller_for_poll);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::SessionsChanged) => {
@@ -973,6 +1150,7 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
+                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             pending,
@@ -980,6 +1158,7 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                         );
+                        update_overlay_size(&window_for_poll, &scroller_for_poll);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::CodexChanged) => {
@@ -996,6 +1175,7 @@ fn build_ui(
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
                         build_entry_list(
+                            &header_for_poll,
                             &main_box_for_poll,
                             &entries,
                             pending,
@@ -1003,6 +1183,7 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                         );
+                        update_overlay_size(&window_for_poll, &scroller_for_poll);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::Track(event)) => {
@@ -1143,6 +1324,7 @@ fn ends_with_question(transcript_path: &str) -> bool {
 }
 
 fn build_entry_list(
+    header: &Label,
     container: &GtkBox,
     entries: &[WorkspaceColumn],
     pending_key: Option<char>,
@@ -1159,9 +1341,7 @@ fn build_entry_list(
     } else {
         "Select workspace+column (q/Esc to cancel)".to_string()
     };
-    let header = Label::new(Some(&header_text));
-    header.add_css_class("header");
-    container.append(&header);
+    header.set_text(&header_text);
 
     let filtered: Vec<_> = if let Some(key) = pending_key {
         entries.iter().filter(|e| e.workspace_key == key).collect()
@@ -1204,6 +1384,8 @@ fn build_entry_list(
         let name_label = Label::new(None);
         name_label.set_markup(&name_text);
         name_label.add_css_class("project");
+        name_label.set_xalign(0.0);
+        name_label.set_hexpand(true);
         row.append(&name_label);
 
         container.append(&row);
@@ -1403,5 +1585,35 @@ ignore = ["web"]
         assert!(window_title_matches_codex_aliases("CX", &aliases));
         assert!(window_title_matches_codex_aliases("cxy", &aliases));
         assert!(!window_title_matches_codex_aliases("claude", &aliases));
+    }
+
+    #[test]
+    fn configured_projects_are_deduplicated_in_order() {
+        let config: Config = toml::from_str(
+            r#"
+[[project]]
+dir = "~/code/agent-switch"
+
+[[project]]
+name = "main"
+
+[[project]]
+dir = "~/code/agent-switch"
+
+[[project]]
+name = "main"
+
+[[project]]
+dir = "~/code/wayvoice"
+"#,
+        )
+        .expect("config should parse");
+
+        let names: Vec<_> = configured_projects(&config)
+            .into_iter()
+            .map(project_workspace_name)
+            .collect();
+
+        assert_eq!(names, vec!["agent-switch", "main", "wayvoice"]);
     }
 }
