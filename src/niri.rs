@@ -1401,8 +1401,7 @@ fn entry_markup(
         if let Some(session) = agent_sessions.get(&window_id) {
             let agent = glib::markup_escape_text(&session.agent);
             return format!(
-                "{} / {} <span color=\"{}\" weight=\"bold\">[{}]</span>",
-                app_label,
+                "{} <span color=\"{}\" weight=\"bold\">[{}]</span>",
                 agent,
                 session.state.color(),
                 session.state.label()
