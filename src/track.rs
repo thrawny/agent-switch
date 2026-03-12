@@ -66,7 +66,7 @@ fn get_niri_window_id() -> Option<String> {
 }
 
 /// Returns true on success, false on failure
-pub fn handle_event(event: &str) -> bool {
+pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
         eprintln!("Failed to read stdin");
@@ -92,7 +92,7 @@ pub fn handle_event(event: &str) -> bool {
     let msg = TrackMessage {
         event: event.to_string(),
         session_id,
-        agent: hook.agent,
+        agent: agent_override.map(str::to_string).or(hook.agent),
         cwd: hook.cwd,
         transcript_path: hook.transcript_path,
         notification_type: hook.notification_type,

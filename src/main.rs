@@ -22,6 +22,9 @@ struct Cli {
 enum Command {
     /// Handle hook events from agents (reads JSON from stdin)
     Track {
+        /// Override the agent name carried in the hook payload
+        #[arg(long)]
+        agent: Option<String>,
         /// Event type: session-start, session-end, prompt-submit, stop, notification
         event: String,
     },
@@ -58,8 +61,8 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Track { event } => {
-            if !track::handle_event(&event) {
+        Command::Track { event, agent } => {
+            if !track::handle_event(&event, agent.as_deref()) {
                 std::process::exit(1);
             }
         }
