@@ -28,10 +28,10 @@ const APP_ID: &str = "com.thrawny.agent-switch";
 const KEYS: [char; 12] = ['h', 'j', 'k', 'l', 'u', 'i', 'o', 'p', 'n', 'm', ',', '.'];
 const NIRI_OVERLAY_WIDTH_RATIO: f64 = 0.45;
 const NIRI_OVERLAY_HEIGHT_RATIO: f64 = 0.70;
-const NIRI_OVERLAY_MIN_WIDTH: i32 = 560;
+const NIRI_OVERLAY_MIN_WIDTH: i32 = 340;
 const NIRI_OVERLAY_MAX_WIDTH: i32 = 1100;
-const NIRI_OVERLAY_MIN_HEIGHT: i32 = 240;
 const NIRI_OVERLAY_MAX_HEIGHT: i32 = 900;
+const NIRI_OVERLAY_FALLBACK_WIDTH: i32 = 420;
 const NIRI_OVERLAY_FALLBACK_HEIGHT: i32 = 520;
 const NIRI_OVERLAY_MARGIN: i32 = 80;
 const NIRI_OVERLAY_STEP_SCROLL: f64 = 64.0;
@@ -205,10 +205,14 @@ fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
 }
 
 fn window_title_matches_codex_aliases(title: &str, aliases: &[String]) -> bool {
-    let title = title.trim();
-    aliases
-        .iter()
-        .any(|alias| !alias.is_empty() && title.eq_ignore_ascii_case(alias))
+    title
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            aliases
+                .iter()
+                .any(|alias| !alias.is_empty() && token.eq_ignore_ascii_case(alias))
+        })
 }
 
 fn codex_state_for_entry(
@@ -725,37 +729,52 @@ fn overlay_monitor(window: &ApplicationWindow) -> Option<gtk4::gdk::Monitor> {
         .ok()
 }
 
-fn update_overlay_size(window: &ApplicationWindow, scroller: &ScrolledWindow) {
-    let (width, height) = overlay_monitor(window)
+fn overlay_size_caps_for_geometry(width: i32, height: i32) -> (i32, i32) {
+    let available_width = (width - NIRI_OVERLAY_MARGIN).max(320);
+    let available_height = (height - NIRI_OVERLAY_MARGIN).max(200);
+    let max_width = clamp_i32(
+        (width as f64 * NIRI_OVERLAY_WIDTH_RATIO).round() as i32,
+        NIRI_OVERLAY_MIN_WIDTH.min(available_width),
+        NIRI_OVERLAY_MAX_WIDTH.min(available_width),
+    );
+    let max_height = clamp_i32(
+        (height as f64 * NIRI_OVERLAY_HEIGHT_RATIO).round() as i32,
+        1,
+        NIRI_OVERLAY_MAX_HEIGHT.min(available_height),
+    );
+
+    (max_width, max_height)
+}
+
+fn input_char_for_key(keyval: gtk4::gdk::Key) -> Option<char> {
+    keyval.to_unicode().map(|ch| ch.to_ascii_lowercase())
+}
+
+fn selection_key_for_input(keyval: gtk4::gdk::Key) -> Option<char> {
+    input_char_for_key(keyval).filter(|ch| KEYS.contains(ch))
+}
+
+fn update_overlay_size(window: &ApplicationWindow, scroller: &ScrolledWindow, outer_box: &GtkBox) {
+    let (max_width, max_height) = overlay_monitor(window)
         .map(|monitor| {
             let geometry = monitor.geometry();
-            let available_width = (geometry.width() - NIRI_OVERLAY_MARGIN).max(320);
-            let available_height = (geometry.height() - NIRI_OVERLAY_MARGIN).max(200);
-            let width_floor = NIRI_OVERLAY_MIN_WIDTH.min(available_width);
-            let width_ceiling = NIRI_OVERLAY_MAX_WIDTH.min(available_width);
-            let height_floor = NIRI_OVERLAY_MIN_HEIGHT.min(available_height);
-            let height_ceiling = NIRI_OVERLAY_MAX_HEIGHT.min(available_height);
-
-            let width = clamp_i32(
-                (geometry.width() as f64 * NIRI_OVERLAY_WIDTH_RATIO).round() as i32,
-                width_floor,
-                width_ceiling,
-            );
-            let height = clamp_i32(
-                (geometry.height() as f64 * NIRI_OVERLAY_HEIGHT_RATIO).round() as i32,
-                height_floor,
-                height_ceiling,
-            );
-
-            (width, height)
+            overlay_size_caps_for_geometry(geometry.width(), geometry.height())
         })
-        .unwrap_or((NIRI_OVERLAY_MIN_WIDTH, NIRI_OVERLAY_FALLBACK_HEIGHT));
+        .unwrap_or((NIRI_OVERLAY_FALLBACK_WIDTH, NIRI_OVERLAY_FALLBACK_HEIGHT));
 
-    scroller.set_min_content_width(width);
-    scroller.set_max_content_width(width);
-    scroller.set_min_content_height(NIRI_OVERLAY_MIN_HEIGHT.min(height));
-    scroller.set_max_content_height(height);
+    scroller.set_max_content_width(max_width);
+    scroller.set_max_content_height(max_height);
+
+    let (_, natural) = outer_box.preferred_size();
+    let width = clamp_i32(
+        natural.width(),
+        NIRI_OVERLAY_MIN_WIDTH.min(max_width),
+        max_width,
+    );
+    let height = clamp_i32(natural.height().max(1), 1, max_height);
+
     window.set_default_size(width, height);
+    window.queue_resize();
 }
 
 fn scroll_overlay(scroller: &ScrolledWindow, delta: f64) {
@@ -801,7 +820,7 @@ fn build_ui(
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .default_width(NIRI_OVERLAY_MIN_WIDTH)
+        .default_width(NIRI_OVERLAY_FALLBACK_WIDTH)
         .default_height(NIRI_OVERLAY_FALLBACK_HEIGHT)
         .build();
 
@@ -852,6 +871,8 @@ fn build_ui(
 
     let scroller = ScrolledWindow::new();
     scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scroller.set_propagate_natural_width(true);
+    scroller.set_propagate_natural_height(true);
     scroller.set_hexpand(true);
     scroller.set_vexpand(true);
 
@@ -921,12 +942,17 @@ fn build_ui(
     let window_clone = window.clone();
     let header_clone = header.clone();
     let main_box_clone = main_box.clone();
+    let outer_box_clone = outer_box.clone();
     let scroller_clone = scroller.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
+        let input_char = input_char_for_key(keyval);
+        let selection_key = selection_key_for_input(keyval);
         let key_name = keyval.name().map(|s| s.to_lowercase());
-        let Some(key) = key_name.as_deref() else {
-            return glib::Propagation::Proceed;
+        let key = match key_name.as_deref() {
+            Some(key) => key,
+            None if selection_key.is_some() => "",
+            None => return glib::Propagation::Proceed,
         };
 
         match key {
@@ -957,7 +983,7 @@ fn build_ui(
             _ => {}
         }
 
-        if key == "q" || key == "escape" {
+        if input_char == Some('q') || key == "escape" {
             let mut state = state_clone.borrow_mut();
             if state.pending_key.is_some() {
                 state.pending_key = None;
@@ -976,6 +1002,7 @@ fn build_ui(
                     &codex_aliases,
                 );
                 reset_overlay_scroll(&scroller_clone);
+                update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
             } else {
                 drop(state);
                 window_clone.set_visible(false);
@@ -983,8 +1010,7 @@ fn build_ui(
             return glib::Propagation::Stop;
         }
 
-        if let Some(pos) = KEYS.iter().position(|&k| k.to_string() == key) {
-            let key_char = KEYS[pos];
+        if let Some(key_char) = selection_key {
             let mut state = state_clone.borrow_mut();
 
             if let Some(first_key) = state.pending_key {
@@ -1015,6 +1041,7 @@ fn build_ui(
                         &codex_aliases,
                     );
                     reset_overlay_scroll(&scroller_clone);
+                    update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
                 }
             } else if state.entries.iter().any(|e| e.workspace_key == key_char) {
                 state.pending_key = Some(key_char);
@@ -1033,6 +1060,7 @@ fn build_ui(
                     &codex_aliases,
                 );
                 reset_overlay_scroll(&scroller_clone);
+                update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
             }
         }
 
@@ -1042,13 +1070,14 @@ fn build_ui(
     window.add_controller(key_controller);
     window.set_visible(false);
     window.present();
-    update_overlay_size(&window, &scroller);
+    update_overlay_size(&window, &scroller, &outer_box);
     window.set_visible(false);
 
     let window_for_poll = window.clone();
     let state_for_poll = state.clone();
     let header_for_poll = header.clone();
     let main_box_for_poll = main_box.clone();
+    let outer_box_for_poll = outer_box.clone();
     let scroller_for_poll = scroller.clone();
     let focused_window_for_poll = focused_window.clone();
     let cache_for_poll = cache.clone();
@@ -1091,10 +1120,18 @@ fn build_ui(
                             &codex_aliases,
                         );
                         reset_overlay_scroll(&scroller_for_poll);
-                        update_overlay_size(&window_for_poll, &scroller_for_poll);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                        );
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
-                        update_overlay_size(&window_for_poll, &scroller_for_poll);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                        );
                     }
                 }
                 NiriMessage::ReloadConfig => {
@@ -1136,7 +1173,11 @@ fn build_ui(
                             &codex_aliases,
                         );
                         reset_overlay_scroll(&scroller_for_poll);
-                        update_overlay_size(&window_for_poll, &scroller_for_poll);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                        );
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::SessionsChanged) => {
@@ -1158,7 +1199,11 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                         );
-                        update_overlay_size(&window_for_poll, &scroller_for_poll);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                        );
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::CodexChanged) => {
@@ -1183,7 +1228,11 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                         );
-                        update_overlay_size(&window_for_poll, &scroller_for_poll);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                        );
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::Track(event)) => {
@@ -1584,7 +1633,35 @@ ignore = ["web"]
         assert!(window_title_matches_codex_aliases("codex", &aliases));
         assert!(window_title_matches_codex_aliases("CX", &aliases));
         assert!(window_title_matches_codex_aliases("cxy", &aliases));
+        assert!(window_title_matches_codex_aliases("cxy resume", &aliases));
+        assert!(window_title_matches_codex_aliases(
+            "/home/me/bin/cx",
+            &aliases
+        ));
         assert!(!window_title_matches_codex_aliases("claude", &aliases));
+        assert!(!window_title_matches_codex_aliases("execute", &aliases));
+    }
+
+    #[test]
+    fn punctuation_bindings_map_to_selection_keys() {
+        let comma = gtk4::gdk::Key::from_name("comma").expect("comma key should exist");
+        let period = gtk4::gdk::Key::from_name("period").expect("period key should exist");
+
+        assert_eq!(input_char_for_key(comma), Some(','));
+        assert_eq!(selection_key_for_input(comma), Some(','));
+        assert_eq!(selection_key_for_input(period), Some('.'));
+    }
+
+    #[test]
+    fn overlay_size_caps_allow_compact_windows() {
+        let (max_width, max_height) = overlay_size_caps_for_geometry(2560, 1440);
+        let compact_width = clamp_i32(380, NIRI_OVERLAY_MIN_WIDTH.min(max_width), max_width);
+        let compact_height = clamp_i32(170, 1, max_height);
+
+        assert_eq!(compact_width, 380);
+        assert_eq!(compact_height, 170);
+        assert!(compact_width < max_width);
+        assert!(compact_height < max_height);
     }
 
     #[test]
