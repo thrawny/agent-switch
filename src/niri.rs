@@ -5,7 +5,7 @@ use crate::state;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Label, Orientation, PolicyType, ScrolledWindow,
-    glib,
+    Separator, glib,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use niri_ipc::{
@@ -907,6 +907,17 @@ fn build_ui(
             border-radius: 10px;
             border: 2px solid #f92672;
         }
+        .workspace-column {
+            min-width: 0;
+        }
+        .workspace-group {
+            min-width: 0;
+        }
+        separator.workspace-separator {
+            margin-top: 4px;
+            margin-bottom: 4px;
+            color: rgba(249, 38, 114, 0.35);
+        }
         label {
             color: #ffffff;
             font-size: 14px;
@@ -914,6 +925,12 @@ fn build_ui(
         label.header {
             font-size: 12px;
             color: #888888;
+        }
+        label.workspace-title {
+            color: #b5bd68;
+            font-size: 12px;
+            font-family: monospace;
+            font-weight: bold;
         }
         label.key {
             color: #f0c674;
@@ -1372,6 +1389,118 @@ fn ends_with_question(transcript_path: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn group_entries_by_workspace<'a>(
+    entries: &[&'a WorkspaceColumn],
+) -> Vec<Vec<&'a WorkspaceColumn>> {
+    let mut groups: Vec<Vec<&WorkspaceColumn>> = Vec::new();
+
+    for entry in entries {
+        let needs_new_group = groups
+            .last()
+            .and_then(|group| group.first())
+            .map(|first| first.workspace_key != entry.workspace_key)
+            .unwrap_or(true);
+
+        if needs_new_group {
+            groups.push(vec![*entry]);
+        } else if let Some(group) = groups.last_mut() {
+            group.push(*entry);
+        }
+    }
+
+    groups
+}
+
+fn entry_markup(
+    entry: &WorkspaceColumn,
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+) -> String {
+    let app_label = glib::markup_escape_text(&entry.app_label);
+
+    if let Some(window_id) = entry.window_id {
+        if let Some(session) = agent_sessions.get(&window_id) {
+            let agent = glib::markup_escape_text(&session.agent);
+            return format!(
+                "{} / {} <span color=\"{}\" weight=\"bold\">[{}]</span>",
+                app_label,
+                agent,
+                session.state.color(),
+                session.state.label()
+            );
+        }
+
+        if let Some(state) = codex_state_for_entry(entry, codex_sessions, codex_aliases) {
+            return format!(
+                "{} / codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
+                app_label,
+                state.color(),
+                state.label()
+            );
+        }
+    }
+
+    app_label.to_string()
+}
+
+fn build_entry_row(
+    entry: &WorkspaceColumn,
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    row.add_css_class("entry-row");
+
+    let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
+    let key_label = Label::new(Some(&key_text));
+    key_label.add_css_class("key");
+    row.append(&key_label);
+
+    let name_label = Label::new(None);
+    name_label.set_markup(&entry_markup(
+        entry,
+        agent_sessions,
+        codex_sessions,
+        codex_aliases,
+    ));
+    name_label.add_css_class("project");
+    name_label.set_xalign(0.0);
+    name_label.set_hexpand(true);
+    row.append(&name_label);
+
+    row
+}
+
+fn build_workspace_group(
+    entries: &[&WorkspaceColumn],
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+) -> GtkBox {
+    let group = GtkBox::new(Orientation::Vertical, 6);
+    group.add_css_class("workspace-group");
+
+    if let Some(first) = entries.first() {
+        let title = Label::new(Some(&first.workspace_name));
+        title.add_css_class("workspace-title");
+        title.set_xalign(0.0);
+        group.append(&title);
+    }
+
+    for entry in entries {
+        group.append(&build_entry_row(
+            entry,
+            agent_sessions,
+            codex_sessions,
+            codex_aliases,
+        ));
+    }
+
+    group
+}
+
 fn build_entry_list(
     header: &Label,
     container: &GtkBox,
@@ -1398,46 +1527,61 @@ fn build_entry_list(
         entries.iter().collect()
     };
 
-    for entry in filtered {
-        let row = GtkBox::new(Orientation::Horizontal, 10);
+    let groups = group_entries_by_workspace(&filtered);
 
-        let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
-        let key_label = Label::new(Some(&key_text));
-        key_label.add_css_class("key");
-        row.append(&key_label);
+    if pending_key.is_none() && groups.len() > 1 {
+        let columns = GtkBox::new(Orientation::Horizontal, 24);
+        columns.add_css_class("workspace-columns");
 
-        let name_text = if let Some(window_id) = entry.window_id {
-            if let Some(session) = agent_sessions.get(&window_id) {
-                format!(
-                    "{} / {} <span color=\"{}\" weight=\"bold\">[{}]</span>",
-                    entry.workspace_name,
-                    session.agent,
-                    session.state.color(),
-                    session.state.label()
-                )
-            } else if let Some(state) = codex_state_for_entry(entry, codex_sessions, codex_aliases)
-            {
-                format!(
-                    "{} / codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
-                    entry.workspace_name,
-                    state.color(),
-                    state.label()
-                )
+        let left_column = GtkBox::new(Orientation::Vertical, 12);
+        left_column.add_css_class("workspace-column");
+        left_column.set_hexpand(true);
+
+        let right_column = GtkBox::new(Orientation::Vertical, 12);
+        right_column.add_css_class("workspace-column");
+        right_column.set_hexpand(true);
+
+        for (index, group_entries) in groups.iter().enumerate() {
+            let column = if index % 2 == 0 {
+                &left_column
             } else {
-                format!("{} / {}", entry.workspace_name, entry.app_label)
+                &right_column
+            };
+
+            if column.first_child().is_some() {
+                let separator = Separator::new(Orientation::Horizontal);
+                separator.add_css_class("workspace-separator");
+                column.append(&separator);
             }
-        } else {
-            format!("{} / {}", entry.workspace_name, entry.app_label)
-        };
 
-        let name_label = Label::new(None);
-        name_label.set_markup(&name_text);
-        name_label.add_css_class("project");
-        name_label.set_xalign(0.0);
-        name_label.set_hexpand(true);
-        row.append(&name_label);
+            column.append(&build_workspace_group(
+                group_entries,
+                agent_sessions,
+                codex_sessions,
+                codex_aliases,
+            ));
+        }
 
-        container.append(&row);
+        columns.append(&left_column);
+        if right_column.first_child().is_some() {
+            columns.append(&right_column);
+        }
+        container.append(&columns);
+    } else {
+        for (index, group_entries) in groups.iter().enumerate() {
+            if index > 0 {
+                let separator = Separator::new(Orientation::Horizontal);
+                separator.add_css_class("workspace-separator");
+                container.append(&separator);
+            }
+
+            container.append(&build_workspace_group(
+                group_entries,
+                agent_sessions,
+                codex_sessions,
+                codex_aliases,
+            ));
+        }
     }
 }
 
