@@ -1,6 +1,4 @@
-use crate::daemon::{
-    self, AgentSession, AgentState, CodexSession, DaemonMessage, SessionCache, TrackEvent,
-};
+use crate::daemon::{self, AgentSession, AgentState, CodexSession, DaemonMessage, SessionCache};
 use crate::state;
 use gtk4::prelude::*;
 use gtk4::{
@@ -130,6 +128,7 @@ struct AppState {
     entries: Vec<WorkspaceColumn>,
     pending_key: Option<char>,
     agent_sessions: HashMap<u64, AgentSession>,
+    codex_bindings: HashMap<u64, String>,
     codex_sessions: HashMap<String, CodexSession>,
     last_config_error: Option<String>,
 }
@@ -186,6 +185,22 @@ fn load_agent_sessions() -> HashMap<u64, AgentSession> {
     sessions
 }
 
+fn load_codex_bindings() -> HashMap<u64, String> {
+    let store = state::load();
+    let mut bindings = HashMap::new();
+
+    for binding in store.codex_bindings.values() {
+        let window_id = match binding.window.niri_id.as_ref() {
+            Some(id) => id.parse::<u64>().ok(),
+            None => continue,
+        };
+        let Some(window_id) = window_id else { continue };
+        bindings.insert(window_id, binding.session_id.clone());
+    }
+
+    bindings
+}
+
 fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
     let mut aliases = vec!["codex".to_string()];
     for alias in config_aliases {
@@ -217,16 +232,24 @@ fn window_title_matches_codex_aliases(title: &str, aliases: &[String]) -> bool {
 
 fn codex_state_for_entry(
     entry: &WorkspaceColumn,
-    codex_by_cwd: &HashMap<String, CodexSession>,
+    codex_bindings: &HashMap<u64, String>,
+    codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
 ) -> Option<AgentState> {
+    if let Some(window_id) = entry.window_id
+        && let Some(session_id) = codex_bindings.get(&window_id)
+        && let Some(session) = codex_sessions.get(session_id)
+    {
+        return Some(session.state);
+    }
+
     let title = entry.window_title.as_deref()?.trim();
     if !window_title_matches_codex_aliases(title, codex_aliases) {
         return None;
     }
     let dir = entry.dir.as_deref()?;
     let dir = shellexpand::tilde(dir).to_string();
-    daemon::match_codex_by_dir(&dir, codex_by_cwd).map(|entry| entry.state)
+    daemon::match_codex_by_dir(&dir, codex_sessions).map(|entry| entry.state)
 }
 
 fn niri_request(request: Request) -> Option<Response> {
@@ -841,6 +864,7 @@ fn build_ui(
     };
     let entries = get_workspace_columns(&config);
     let agent_sessions = load_agent_sessions();
+    let codex_bindings = load_codex_bindings();
     let codex_sessions = {
         let cache = cache.lock().unwrap();
         cache.codex_sessions.clone()
@@ -853,6 +877,7 @@ fn build_ui(
         entries,
         pending_key: None,
         agent_sessions,
+        codex_bindings,
         codex_sessions,
         last_config_error,
     }));
@@ -869,8 +894,8 @@ fn build_ui(
 
     let main_box = GtkBox::new(Orientation::Vertical, 10);
     main_box.set_margin_top(20);
-    main_box.set_margin_start(20);
-    main_box.set_margin_end(20);
+    main_box.set_margin_start(28);
+    main_box.set_margin_end(28);
     main_box.set_margin_bottom(20);
     scroller.set_child(Some(&main_box));
 
@@ -881,6 +906,7 @@ fn build_ui(
             &state_ref.entries,
             state_ref.pending_key,
             &state_ref.agent_sessions,
+            &state_ref.codex_bindings,
             &state_ref.codex_sessions,
             &state_ref.codex_aliases,
         );
@@ -954,7 +980,6 @@ fn build_ui(
     let state_clone = state.clone();
     let window_clone = window.clone();
     let main_box_clone = main_box.clone();
-    let outer_box_clone = outer_box.clone();
     let scroller_clone = scroller.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
@@ -1001,6 +1026,7 @@ fn build_ui(
                 state.pending_key = None;
                 let entries = state.entries.clone();
                 let agent_sessions = state.agent_sessions.clone();
+                let codex_bindings = state.codex_bindings.clone();
                 let codex_sessions = state.codex_sessions.clone();
                 let codex_aliases = state.codex_aliases.clone();
                 drop(state);
@@ -1009,11 +1035,11 @@ fn build_ui(
                     &entries,
                     None,
                     &agent_sessions,
+                    &codex_bindings,
                     &codex_sessions,
                     &codex_aliases,
                 );
                 reset_overlay_scroll(&scroller_clone);
-                update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
             } else {
                 drop(state);
                 window_clone.set_visible(false);
@@ -1039,6 +1065,7 @@ fn build_ui(
                     state.pending_key = None;
                     let entries = state.entries.clone();
                     let agent_sessions = state.agent_sessions.clone();
+                    let codex_bindings = state.codex_bindings.clone();
                     let codex_sessions = state.codex_sessions.clone();
                     let codex_aliases = state.codex_aliases.clone();
                     drop(state);
@@ -1047,16 +1074,17 @@ fn build_ui(
                         &entries,
                         None,
                         &agent_sessions,
+                        &codex_bindings,
                         &codex_sessions,
                         &codex_aliases,
                     );
                     reset_overlay_scroll(&scroller_clone);
-                    update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
                 }
             } else if state.entries.iter().any(|e| e.workspace_key == key_char) {
                 state.pending_key = Some(key_char);
                 let entries = state.entries.clone();
                 let agent_sessions = state.agent_sessions.clone();
+                let codex_bindings = state.codex_bindings.clone();
                 let codex_sessions = state.codex_sessions.clone();
                 let codex_aliases = state.codex_aliases.clone();
                 drop(state);
@@ -1065,11 +1093,11 @@ fn build_ui(
                     &entries,
                     Some(key_char),
                     &agent_sessions,
+                    &codex_bindings,
                     &codex_sessions,
                     &codex_aliases,
                 );
                 reset_overlay_scroll(&scroller_clone);
-                update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
             }
         }
 
@@ -1108,6 +1136,7 @@ fn build_ui(
                         let mut state = state_for_poll.borrow_mut();
                         state.entries = get_workspace_columns(&state.config);
                         state.agent_sessions = load_agent_sessions();
+                        state.codex_bindings = load_codex_bindings();
                         state.codex_sessions = {
                             let cache = cache_for_poll.lock().unwrap();
                             cache.codex_sessions.clone()
@@ -1115,6 +1144,7 @@ fn build_ui(
                         state.pending_key = None;
                         let entries = state.entries.clone();
                         let agent_sessions = state.agent_sessions.clone();
+                        let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
@@ -1123,6 +1153,7 @@ fn build_ui(
                             &entries,
                             None,
                             &agent_sessions,
+                            &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
                         );
@@ -1167,6 +1198,7 @@ fn build_ui(
                         let entries = state.entries.clone();
                         let pending = state.pending_key;
                         let agent_sessions = state.agent_sessions.clone();
+                        let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
@@ -1175,24 +1207,22 @@ fn build_ui(
                             &entries,
                             pending,
                             &agent_sessions,
+                            &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
                         );
                         reset_overlay_scroll(&scroller_for_poll);
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
-                        );
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::SessionsChanged) => {
                     let mut state = state_for_poll.borrow_mut();
                     state.agent_sessions = load_agent_sessions();
+                    state.codex_bindings = load_codex_bindings();
                     if window_for_poll.is_visible() {
                         let entries = state.entries.clone();
                         let pending = state.pending_key;
                         let agent_sessions = state.agent_sessions.clone();
+                        let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
@@ -1201,13 +1231,9 @@ fn build_ui(
                             &entries,
                             pending,
                             &agent_sessions,
+                            &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
-                        );
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
                         );
                     }
                 }
@@ -1221,6 +1247,7 @@ fn build_ui(
                         let entries = state.entries.clone();
                         let pending = state.pending_key;
                         let agent_sessions = state.agent_sessions.clone();
+                        let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
@@ -1229,19 +1256,15 @@ fn build_ui(
                             &entries,
                             pending,
                             &agent_sessions,
+                            &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
-                        );
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
                         );
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::Track(event)) => {
                     let focused_id = *focused_window_for_poll.lock().unwrap();
-                    handle_track_event(&event, focused_id);
+                    daemon::handle_track_event(&event, focused_id);
                 }
                 NiriMessage::Daemon(DaemonMessage::List(_)) => {
                     // Handled by socket listener directly
@@ -1254,126 +1277,6 @@ fn build_ui(
         }
         glib::ControlFlow::Continue
     });
-}
-
-fn handle_track_event(event: &TrackEvent, focused_window_id: Option<u64>) {
-    let agent = event.agent.as_deref().unwrap_or("claude");
-    let session_id = &event.session_id;
-    let mut store = state::load();
-
-    match event.event.as_str() {
-        "session-start" => {
-            let Some(window_id) = focused_window_id else {
-                return;
-            };
-            let session = state::Session {
-                agent: agent.to_string(),
-                session_id: session_id.to_string(),
-                cwd: event.cwd.clone(),
-                state: "waiting".to_string(),
-                state_updated: state::now(),
-                window: state::WindowId {
-                    niri_id: Some(window_id.to_string()),
-                    tmux_id: None,
-                },
-            };
-            store.sessions.insert(window_id.to_string(), session);
-        }
-        "session-end" => {
-            let key = store
-                .sessions
-                .iter()
-                .find(|(_, s)| s.agent == agent && s.session_id == *session_id)
-                .map(|(k, _)| k.clone());
-            if let Some(key) = key {
-                store.sessions.remove(&key);
-            }
-        }
-        "prompt-submit" => {
-            if let Some(session) = state::find_by_session_id_mut(&mut store, agent, session_id) {
-                session.state = "responding".to_string();
-                session.state_updated = state::now();
-            } else if let Some(window_id) = focused_window_id {
-                let session = state::Session {
-                    agent: agent.to_string(),
-                    session_id: session_id.to_string(),
-                    cwd: event.cwd.clone(),
-                    state: "responding".to_string(),
-                    state_updated: state::now(),
-                    window: state::WindowId {
-                        niri_id: Some(window_id.to_string()),
-                        tmux_id: None,
-                    },
-                };
-                store.sessions.insert(window_id.to_string(), session);
-            }
-        }
-        "stop" => {
-            if let Some(session) = state::find_by_session_id_mut(&mut store, agent, session_id) {
-                let is_question = event
-                    .transcript_path
-                    .as_ref()
-                    .map(|p| ends_with_question(p))
-                    .unwrap_or(false);
-                session.state = if is_question { "waiting" } else { "idle" }.to_string();
-                session.state_updated = state::now();
-            }
-        }
-        "notification" => {
-            if event.notification_type.as_deref() == Some("permission_prompt")
-                && let Some(session) = state::find_by_session_id_mut(&mut store, agent, session_id)
-            {
-                session.state = "waiting".to_string();
-                session.state_updated = state::now();
-            }
-        }
-        _ => {}
-    }
-
-    state::save(&store);
-}
-
-fn ends_with_question(transcript_path: &str) -> bool {
-    use std::process::Command as StdCommand;
-
-    let output = match StdCommand::new("tail")
-        .args(["-n", "20", transcript_path])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-
-    let content = String::from_utf8_lossy(&output.stdout);
-    let mut last_text: Option<String> = None;
-
-    for line in content.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-            if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-                continue;
-            }
-            if let Some(content_arr) = entry
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array())
-            {
-                for item in content_arr {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("text")
-                        && let Some(text) = item.get("text").and_then(|t| t.as_str())
-                    {
-                        last_text = Some(text.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    last_text
-        .map(|t| t.trim_end().ends_with('?'))
-        .unwrap_or(false)
 }
 
 fn group_entries_by_workspace<'a>(
@@ -1401,6 +1304,7 @@ fn group_entries_by_workspace<'a>(
 fn entry_markup(
     entry: &WorkspaceColumn,
     agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
 ) -> String {
@@ -1417,7 +1321,9 @@ fn entry_markup(
             );
         }
 
-        if let Some(state) = codex_state_for_entry(entry, codex_sessions, codex_aliases) {
+        if let Some(state) =
+            codex_state_for_entry(entry, codex_bindings, codex_sessions, codex_aliases)
+        {
             return format!(
                 "codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
                 state.color(),
@@ -1432,6 +1338,7 @@ fn entry_markup(
 fn build_entry_row(
     entry: &WorkspaceColumn,
     agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
 ) -> GtkBox {
@@ -1447,6 +1354,7 @@ fn build_entry_row(
     name_label.set_markup(&entry_markup(
         entry,
         agent_sessions,
+        codex_bindings,
         codex_sessions,
         codex_aliases,
     ));
@@ -1461,6 +1369,7 @@ fn build_entry_row(
 fn build_workspace_group(
     entries: &[&WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
 ) -> GtkBox {
@@ -1478,6 +1387,7 @@ fn build_workspace_group(
         group.append(&build_entry_row(
             entry,
             agent_sessions,
+            codex_bindings,
             codex_sessions,
             codex_aliases,
         ));
@@ -1491,6 +1401,7 @@ fn build_entry_list(
     entries: &[WorkspaceColumn],
     pending_key: Option<char>,
     agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
 ) {
@@ -1540,6 +1451,7 @@ fn build_entry_list(
             let group = build_workspace_group(
                 &groups[left_idx],
                 agent_sessions,
+                codex_bindings,
                 codex_sessions,
                 codex_aliases,
             );
@@ -1552,6 +1464,7 @@ fn build_entry_list(
                 let group = build_workspace_group(
                     &groups[right_idx],
                     agent_sessions,
+                    codex_bindings,
                     codex_sessions,
                     codex_aliases,
                 );
@@ -1573,6 +1486,7 @@ fn build_entry_list(
             container.append(&build_workspace_group(
                 group_entries,
                 agent_sessions,
+                codex_bindings,
                 codex_sessions,
                 codex_aliases,
             ));

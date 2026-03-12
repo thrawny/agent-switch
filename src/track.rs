@@ -11,6 +11,7 @@ struct HookInput {
     cwd: Option<String>,
     transcript_path: Option<String>,
     notification_type: Option<String>,
+    niri_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -22,6 +23,7 @@ struct TrackMessage {
     transcript_path: Option<String>,
     notification_type: Option<String>,
     tmux_id: Option<String>,
+    niri_id: Option<String>,
 }
 
 fn get_tmux_window_id() -> Option<String> {
@@ -39,6 +41,28 @@ fn get_tmux_window_id() -> Option<String> {
         }
     }
     None
+}
+
+fn get_niri_window_id() -> Option<String> {
+    let output = Command::new("niri")
+        .args(["msg", "-j", "windows"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let windows = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout).ok()?;
+    windows
+        .into_iter()
+        .find(|window| {
+            window
+                .get("is_focused")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        })
+        .and_then(|window| window.get("id").and_then(|value| value.as_u64()))
+        .map(|id| id.to_string())
 }
 
 /// Returns true on success, false on failure
@@ -73,6 +97,7 @@ pub fn handle_event(event: &str) -> bool {
         transcript_path: hook.transcript_path,
         notification_type: hook.notification_type,
         tmux_id: get_tmux_window_id(),
+        niri_id: hook.niri_id.or_else(get_niri_window_id),
     };
 
     let json = match serde_json::to_string(&msg) {

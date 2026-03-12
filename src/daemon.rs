@@ -111,6 +111,8 @@ pub struct TrackEvent {
     pub notification_type: Option<String>,
     #[serde(default)]
     pub tmux_id: Option<String>,
+    #[serde(default)]
+    pub niri_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +141,10 @@ pub struct CodexListEntry {
     pub cwd: String,
     pub state: AgentState,
     pub state_updated: f64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tmux_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub niri_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -193,11 +199,16 @@ impl SessionCache {
         let codex: Vec<CodexListEntry> = self
             .codex_sessions
             .values()
-            .map(|session| CodexListEntry {
-                session_id: session.session_id.clone(),
-                cwd: session.cwd.clone(),
-                state: session.state,
-                state_updated: session.state_updated,
+            .map(|session| {
+                let binding = self.store.codex_bindings.get(&session.session_id);
+                CodexListEntry {
+                    session_id: session.session_id.clone(),
+                    cwd: session.cwd.clone(),
+                    state: session.state,
+                    state_updated: session.state_updated,
+                    tmux_id: binding.and_then(|entry| entry.window.tmux_id.clone()),
+                    niri_id: binding.and_then(|entry| entry.window.niri_id.clone()),
+                }
             })
             .collect();
 
@@ -264,11 +275,12 @@ pub fn start_socket_listener(tx: mpsc::Sender<DaemonMessage>, cache: Arc<Mutex<S
                             match serde_json::from_str::<TrackEvent>(json) {
                                 Ok(event) => {
                                     info!(
-                                        "track {} agent={} session={} tmux={:?} cwd={:?}",
+                                        "track {} agent={} session={} tmux={:?} niri={:?} cwd={:?}",
                                         event.event,
                                         event.agent.as_deref().unwrap_or("claude"),
                                         event.session_id,
                                         event.tmux_id,
+                                        event.niri_id,
                                         event.cwd
                                     );
                                     let _ = tx.send(DaemonMessage::Track(event));
@@ -741,27 +753,12 @@ pub fn load_codex_sessions() -> HashMap<String, CodexSession> {
         let mut files = Vec::new();
         walk_codex_files(root.as_path(), &mut files);
 
-        let mut by_cwd: HashMap<String, (std::time::SystemTime, PathBuf)> = HashMap::new();
+        let now = state::now();
         for file in files {
             let meta = match fs::metadata(&file).and_then(|m| m.modified()) {
                 Ok(modified) => modified,
                 Err(_) => continue,
             };
-            let (_, cwd) = match read_codex_file_meta(file.as_path()) {
-                Some(info) => info,
-                None => continue,
-            };
-            let replace = match by_cwd.get(&cwd) {
-                Some((existing, _)) => meta > *existing,
-                None => true,
-            };
-            if replace {
-                by_cwd.insert(cwd, (meta, file));
-            }
-        }
-
-        let now = state::now();
-        for (_cwd, (meta, file)) in by_cwd.iter() {
             let mtime = meta
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
@@ -779,24 +776,10 @@ pub fn load_codex_sessions() -> HashMap<String, CodexSession> {
     apply_codex_waiting(&mut codex, &last_message);
 
     let now = state::now();
-    let mut by_cwd: HashMap<String, CodexSession> = HashMap::new();
-    for entry in codex.values() {
-        if entry.cwd.is_empty() {
-            continue;
-        }
-        // Skip sessions with no activity in the cutoff period
-        if now - entry.state_updated > CODEX_MAX_AGE_SECS {
-            continue;
-        }
-        let replace = match by_cwd.get(&entry.cwd) {
-            Some(existing) => entry.state_updated >= existing.state_updated,
-            None => true,
-        };
-        if replace {
-            by_cwd.insert(entry.cwd.clone(), entry.clone());
-        }
-    }
-    by_cwd
+    codex.retain(|_, entry| {
+        !entry.cwd.is_empty() && now - entry.state_updated <= CODEX_MAX_AGE_SECS
+    });
+    codex
 }
 
 // Note: We previously had apply_codex_recent_activity() that used file mtime
@@ -871,11 +854,11 @@ pub fn match_codex_by_dir<'a>(
     entries: &'a HashMap<String, CodexSession>,
 ) -> Option<&'a CodexSession> {
     let mut best: Option<(&CodexSession, usize)> = None;
-    for (cwd, entry) in entries.iter() {
-        if !should_match_dir(entry_dir, cwd) {
+    for entry in entries.values() {
+        if !should_match_dir(entry_dir, &entry.cwd) {
             continue;
         }
-        let depth = path_depth(cwd);
+        let depth = path_depth(&entry.cwd);
         if best
             .as_ref()
             .map(|(current, current_depth)| {
@@ -973,10 +956,49 @@ pub fn run_headless() {
     }
 }
 
-fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64>) {
+pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64>) {
     let agent = event.agent.as_deref().unwrap_or("claude");
     let session_id = &event.session_id;
     let mut store = state::load();
+    let focused_niri_id = event
+        .niri_id
+        .as_deref()
+        .and_then(|id| id.parse::<u64>().ok())
+        .or(focused_niri_id);
+
+    if agent == "codex" {
+        match event.event.as_str() {
+            "session-start" => {
+                let window = match (&event.tmux_id, focused_niri_id) {
+                    (Some(tmux), niri) => state::WindowId {
+                        tmux_id: Some(tmux.clone()),
+                        niri_id: niri.map(|n| n.to_string()),
+                    },
+                    (None, Some(niri)) => state::WindowId {
+                        tmux_id: None,
+                        niri_id: Some(niri.to_string()),
+                    },
+                    (None, None) => return,
+                };
+                state::upsert_codex_binding(
+                    &mut store,
+                    state::CodexBinding {
+                        session_id: session_id.to_string(),
+                        cwd: event.cwd.clone(),
+                        updated_at: state::now(),
+                        window,
+                    },
+                );
+                state::save(&store);
+            }
+            "session-end" => {
+                store.codex_bindings.remove(session_id);
+                state::save(&store);
+            }
+            _ => {}
+        }
+        return;
+    }
 
     // Determine window key and IDs - prefer tmux_id, fall back to niri_id
     let (window_key, window_id) = match (&event.tmux_id, focused_niri_id) {
@@ -1204,5 +1226,23 @@ mod tests {
             "/Users/jonas/code/other",
             "/Users/jonas/code/project"
         ));
+    }
+
+    #[test]
+    fn match_codex_by_dir_uses_entry_cwd_not_map_key() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "session-123".to_string(),
+            CodexSession {
+                session_id: "session-123".to_string(),
+                cwd: "/Users/jonas/code/project".to_string(),
+                state: AgentState::Idle,
+                state_updated: 1.0,
+            },
+        );
+
+        let matched = match_codex_by_dir("/Users/jonas/code/project/src", &entries)
+            .expect("entry should match by cwd");
+        assert_eq!(matched.session_id, "session-123");
     }
 }
