@@ -1420,7 +1420,7 @@ fn build_entry_list(
     if pending_key.is_none() && groups.len() > 1 {
         let grid = Grid::new();
         grid.add_css_class("workspace-columns");
-        grid.set_column_spacing(12);
+        grid.set_column_spacing(36);
 
         let num_pair_rows = groups.len().div_ceil(2);
         let total_grid_rows = if num_pair_rows > 1 {
