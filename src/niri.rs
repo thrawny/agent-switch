@@ -940,11 +940,11 @@ fn build_ui(
             margin-top: 4px;
             margin-bottom: 4px;
             min-height: 1px;
-            color: rgba(249, 38, 114, 0.8);
+            background-color: rgba(255, 255, 255, 0.15);
         }
         .workspace-column-left {
             padding-right: 18px;
-            border-right: 1px solid rgba(249, 38, 114, 0.8);
+            border-right: 1px solid rgba(255, 255, 255, 0.15);
         }
         label {
             color: #ffffff;
@@ -1758,11 +1758,11 @@ fn build_demo_ui(app: &Application) {
             margin-top: 4px;
             margin-bottom: 4px;
             min-height: 1px;
-            color: rgba(249, 38, 114, 0.8);
+            background-color: rgba(255, 255, 255, 0.15);
         }
         .workspace-column-left {
             padding-right: 18px;
-            border-right: 1px solid rgba(249, 38, 114, 0.8);
+            border-right: 1px solid rgba(255, 255, 255, 0.15);
         }
         label {
             color: #ffffff;
