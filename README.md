@@ -136,7 +136,7 @@ Notes:
 
 ---
 
-## Claude Code hook setup (important)
+## Claude Code hook setup
 
 Without hooks, switching still works, but live state labels will be incomplete.
 
@@ -190,6 +190,48 @@ Configure hooks in **`~/.claude/settings.json`**:
 - `agent-switch` must be on `PATH` for Claude
 - daemon should be running (`agent-switch serve` or `agent-switch serve --niri`)
 - run Claude inside tmux if you want tmux window IDs captured
+
+---
+
+## Codex hook setup
+
+Codex rollout watching is enough for live state, but it cannot reliably distinguish multiple
+Codex sessions in the same repo by itself. Add a `SessionStart` hook so `agent-switch` can bind
+the Codex `session_id` to the current tmux or niri window.
+
+Enable Codex hooks in **`~/.codex/config.toml`**:
+
+```toml
+[features]
+codex_hooks = true
+```
+
+Configure the hook in **`~/.codex/hooks.json`**:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-switch track session-start --agent codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+- daemon should be running (`agent-switch serve` or `agent-switch serve --niri`)
+- run Codex inside tmux if you want tmux window IDs captured
+- on niri, `agent-switch track` also captures the currently focused window ID automatically
+- you still want rollout watching: the hook binds identity, the rollout files provide live state
 
 ---
 
