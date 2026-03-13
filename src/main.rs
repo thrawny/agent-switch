@@ -53,6 +53,9 @@ enum Command {
         /// Toggle visibility (send to running daemon)
         #[arg(long)]
         toggle: bool,
+        /// Show demo overlay with mock data
+        #[arg(long)]
+        demo: bool,
     },
 }
 
@@ -101,8 +104,12 @@ fn main() {
             daemon::run_headless();
         }
         #[cfg(feature = "niri")]
-        Command::Niri { toggle } => {
-            let exit_code = niri::run(toggle);
+        Command::Niri { toggle, demo } => {
+            let exit_code = if demo {
+                niri::run_demo()
+            } else {
+                niri::run(toggle)
+            };
             std::process::exit(exit_code.into());
         }
     }

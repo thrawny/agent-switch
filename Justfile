@@ -53,6 +53,10 @@ clippy:
 test:
     cargo test --release
 
+# Run niri overlay demo with mock data
+demo:
+    cargo run --features niri -- niri --demo
+
 # Format code
 fmt:
     cargo fmt

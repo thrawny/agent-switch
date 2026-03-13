@@ -797,6 +797,7 @@ fn update_overlay_size(window: &ApplicationWindow, scroller: &ScrolledWindow, ou
     let height = clamp_i32(natural.height().max(1), 1, max_height);
 
     window.set_default_size(width, height);
+    outer_box.set_size_request(width, height);
     window.queue_resize();
 }
 
@@ -897,6 +898,8 @@ fn build_ui(
     main_box.set_margin_start(28);
     main_box.set_margin_end(28);
     main_box.set_margin_bottom(20);
+    main_box.set_halign(gtk4::Align::Fill);
+    main_box.set_hexpand(true);
     scroller.set_child(Some(&main_box));
 
     {
@@ -909,6 +912,7 @@ fn build_ui(
             &state_ref.codex_bindings,
             &state_ref.codex_sessions,
             &state_ref.codex_aliases,
+            false,
         );
     }
     outer_box.append(&scroller);
@@ -938,11 +942,9 @@ fn build_ui(
             min-height: 1px;
             color: rgba(249, 38, 114, 0.8);
         }
-        separator.workspace-separator-vertical {
-            margin-left: 4px;
-            margin-right: 4px;
-            min-width: 1px;
-            color: rgba(249, 38, 114, 0.8);
+        .workspace-column-left {
+            padding-right: 18px;
+            border-right: 1px solid rgba(249, 38, 114, 0.8);
         }
         label {
             color: #ffffff;
@@ -1038,6 +1040,7 @@ fn build_ui(
                     &codex_bindings,
                     &codex_sessions,
                     &codex_aliases,
+                    true,
                 );
                 reset_overlay_scroll(&scroller_clone);
             } else {
@@ -1077,6 +1080,7 @@ fn build_ui(
                         &codex_bindings,
                         &codex_sessions,
                         &codex_aliases,
+                        true,
                     );
                     reset_overlay_scroll(&scroller_clone);
                 }
@@ -1096,6 +1100,7 @@ fn build_ui(
                     &codex_bindings,
                     &codex_sessions,
                     &codex_aliases,
+                    true,
                 );
                 reset_overlay_scroll(&scroller_clone);
             }
@@ -1148,6 +1153,7 @@ fn build_ui(
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
                         drop(state);
+                        // First pass: natural label widths for size computation
                         build_entry_list(
                             &main_box_for_poll,
                             &entries,
@@ -1156,6 +1162,7 @@ fn build_ui(
                             &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
+                            false,
                         );
                         reset_overlay_scroll(&scroller_for_poll);
                         update_overlay_size(
@@ -1163,13 +1170,19 @@ fn build_ui(
                             &scroller_for_poll,
                             &outer_box_for_poll,
                         );
+                        // Second pass: locked label widths to prevent content-driven shifts
+                        build_entry_list(
+                            &main_box_for_poll,
+                            &entries,
+                            None,
+                            &agent_sessions,
+                            &codex_bindings,
+                            &codex_sessions,
+                            &codex_aliases,
+                            true,
+                        );
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
-                        );
                     }
                 }
                 NiriMessage::ReloadConfig => {
@@ -1210,6 +1223,7 @@ fn build_ui(
                             &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
+                            true,
                         );
                         reset_overlay_scroll(&scroller_for_poll);
                     }
@@ -1234,6 +1248,7 @@ fn build_ui(
                             &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
+                            true,
                         );
                     }
                 }
@@ -1259,6 +1274,7 @@ fn build_ui(
                             &codex_bindings,
                             &codex_sessions,
                             &codex_aliases,
+                            true,
                         );
                     }
                 }
@@ -1341,6 +1357,7 @@ fn build_entry_row(
     codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
+    lock_label_widths: bool,
 ) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 10);
     row.add_css_class("entry-row");
@@ -1361,6 +1378,10 @@ fn build_entry_row(
     name_label.add_css_class("project");
     name_label.set_xalign(0.0);
     name_label.set_hexpand(true);
+    name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    if lock_label_widths {
+        name_label.set_max_width_chars(1);
+    }
     row.append(&name_label);
 
     row
@@ -1372,6 +1393,7 @@ fn build_workspace_group(
     codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
+    lock_label_widths: bool,
 ) -> GtkBox {
     let group = GtkBox::new(Orientation::Vertical, 6);
     group.add_css_class("workspace-group");
@@ -1390,12 +1412,14 @@ fn build_workspace_group(
             codex_bindings,
             codex_sessions,
             codex_aliases,
+            lock_label_widths,
         ));
     }
 
     group
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_entry_list(
     container: &GtkBox,
     entries: &[WorkspaceColumn],
@@ -1404,6 +1428,7 @@ fn build_entry_list(
     codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
+    lock_label_widths: bool,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -1421,20 +1446,9 @@ fn build_entry_list(
         let grid = Grid::new();
         grid.add_css_class("workspace-columns");
         grid.set_column_spacing(36);
+        grid.set_column_homogeneous(true);
 
         let num_pair_rows = groups.len().div_ceil(2);
-        let total_grid_rows = if num_pair_rows > 1 {
-            num_pair_rows * 2 - 1
-        } else {
-            1
-        };
-
-        // Vertical separator spanning all rows
-        if groups.len() > 1 {
-            let vsep = Separator::new(Orientation::Vertical);
-            vsep.add_css_class("workspace-separator-vertical");
-            grid.attach(&vsep, 1, 0, 1, total_grid_rows as i32);
-        }
 
         for pair_row in 0..num_pair_rows {
             let grid_row = if pair_row == 0 {
@@ -1443,7 +1457,7 @@ fn build_entry_list(
                 let sep_row = (pair_row * 2 - 1) as i32;
                 let separator = Separator::new(Orientation::Horizontal);
                 separator.add_css_class("workspace-separator");
-                grid.attach(&separator, 0, sep_row, 3, 1);
+                grid.attach(&separator, 0, sep_row, 2, 1);
                 sep_row + 1
             };
 
@@ -1454,9 +1468,10 @@ fn build_entry_list(
                 codex_bindings,
                 codex_sessions,
                 codex_aliases,
+                lock_label_widths,
             );
             group.set_valign(gtk4::Align::Start);
-            group.set_hexpand(true);
+            group.add_css_class("workspace-column-left");
             grid.attach(&group, 0, grid_row, 1, 1);
 
             let right_idx = left_idx + 1;
@@ -1467,10 +1482,10 @@ fn build_entry_list(
                     codex_bindings,
                     codex_sessions,
                     codex_aliases,
+                    lock_label_widths,
                 );
                 group.set_valign(gtk4::Align::Start);
-                group.set_hexpand(true);
-                grid.attach(&group, 2, grid_row, 1, 1);
+                grid.attach(&group, 1, grid_row, 1, 1);
             }
         }
 
@@ -1489,6 +1504,7 @@ fn build_entry_list(
                 codex_bindings,
                 codex_sessions,
                 codex_aliases,
+                lock_label_widths,
             ));
         }
     }
@@ -1574,6 +1590,362 @@ pub fn run_with_daemon() -> glib::ExitCode {
         }
     });
 
+    app.run_with_args::<&str>(&[])
+}
+
+fn mock_workspace_columns() -> Vec<WorkspaceColumn> {
+    let projects = [
+        ("agent-switch", 2),
+        ("wayvoice", 3),
+        ("kanel", 2),
+        ("dotfiles", 1),
+        ("rollout", 2),
+        ("website", 1),
+        ("infra", 2),
+        ("notes", 1),
+    ];
+
+    let app_labels = [
+        "ghostty", "claude", "codex", "ghostty", "firefox", "zed", "ghostty", "codex",
+    ];
+
+    let mut entries = Vec::new();
+    let mut window_id = 100u64;
+
+    for (proj_idx, &(name, num_columns)) in projects.iter().enumerate() {
+        if proj_idx >= KEYS.len() {
+            break;
+        }
+        let workspace_key = KEYS[proj_idx];
+
+        for (col, &column_key) in KEYS.iter().enumerate().take(num_columns) {
+            let label_idx = (proj_idx + col) % app_labels.len();
+            entries.push(WorkspaceColumn {
+                workspace_name: name.to_string(),
+                workspace_ref: WorkspaceReferenceArg::Name(name.to_string()),
+                workspace_key,
+                column_index: (col + 2) as u32,
+                column_key,
+                app_label: app_labels[label_idx].to_string(),
+                window_title: Some(app_labels[label_idx].to_string()),
+                dir: Some(format!("~/code/{name}")),
+                static_workspace: false,
+                window_id: Some(window_id),
+            });
+            window_id += 1;
+        }
+    }
+
+    entries
+}
+
+fn mock_agent_sessions(entries: &[WorkspaceColumn], cycle: usize) -> HashMap<u64, AgentSession> {
+    let states = [
+        AgentState::Waiting,
+        AgentState::Responding,
+        AgentState::Idle,
+    ];
+    let agents = ["claude", "codex", "opencode"];
+
+    let mut sessions = HashMap::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(window_id) = entry.window_id else {
+            continue;
+        };
+        // Only some entries have agent sessions
+        if i % 3 != 0 && i % 5 != 0 {
+            continue;
+        }
+        let state_idx = (i + cycle) % states.len();
+        let agent_idx = i % agents.len();
+        sessions.insert(
+            window_id,
+            AgentSession {
+                agent: agents[agent_idx].to_string(),
+                state: states[state_idx],
+                cwd: entry.dir.clone(),
+            },
+        );
+    }
+
+    sessions
+}
+
+fn build_demo_ui(app: &Application) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .default_width(NIRI_OVERLAY_FALLBACK_WIDTH)
+        .default_height(NIRI_OVERLAY_FALLBACK_HEIGHT)
+        .build();
+
+    window.init_layer_shell();
+    window.set_layer(Layer::Overlay);
+    window.set_keyboard_mode(KeyboardMode::Exclusive);
+    window.set_anchor(Edge::Top, false);
+    window.set_anchor(Edge::Bottom, false);
+    window.set_anchor(Edge::Left, false);
+    window.set_anchor(Edge::Right, false);
+
+    let entries = mock_workspace_columns();
+    let agent_sessions = mock_agent_sessions(&entries, 0);
+
+    let state = Rc::new(RefCell::new(AppState {
+        config: Config::default(),
+        codex_aliases: vec![],
+        entries,
+        pending_key: None,
+        agent_sessions,
+        codex_bindings: HashMap::new(),
+        codex_sessions: HashMap::new(),
+        last_config_error: None,
+    }));
+
+    let outer_box = GtkBox::new(Orientation::Vertical, 0);
+    outer_box.add_css_class("outer");
+
+    let scroller = ScrolledWindow::new();
+    scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scroller.set_propagate_natural_width(true);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+
+    let main_box = GtkBox::new(Orientation::Vertical, 10);
+    main_box.set_margin_top(20);
+    main_box.set_margin_start(28);
+    main_box.set_margin_end(28);
+    main_box.set_margin_bottom(20);
+    main_box.set_halign(gtk4::Align::Fill);
+    main_box.set_hexpand(true);
+    scroller.set_child(Some(&main_box));
+
+    {
+        let s = state.borrow();
+        build_entry_list(
+            &main_box,
+            &s.entries,
+            s.pending_key,
+            &s.agent_sessions,
+            &s.codex_bindings,
+            &s.codex_sessions,
+            &s.codex_aliases,
+            false,
+        );
+    }
+    outer_box.append(&scroller);
+
+    let css_provider = gtk4::CssProvider::new();
+    css_provider.load_from_data(
+        r#"
+        window {
+            background-color: transparent;
+        }
+        .outer {
+            background-color: rgba(30, 30, 30, 0.95);
+            border-radius: 10px;
+            border: 2px solid #f92672;
+        }
+        .workspace-column {
+            min-width: 0;
+        }
+        .workspace-group {
+            min-width: 0;
+            padding-top: 4px;
+            padding-bottom: 4px;
+        }
+        separator.workspace-separator {
+            margin-top: 4px;
+            margin-bottom: 4px;
+            min-height: 1px;
+            color: rgba(249, 38, 114, 0.8);
+        }
+        .workspace-column-left {
+            padding-right: 18px;
+            border-right: 1px solid rgba(249, 38, 114, 0.8);
+        }
+        label {
+            color: #ffffff;
+            font-size: 14px;
+        }
+        label.workspace-title {
+            color: #b5bd68;
+            font-size: 12px;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        label.key {
+            color: #f0c674;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        label.project {
+            color: #888888;
+        }
+        label.selected {
+            color: #b5bd68;
+        }
+        "#,
+    );
+
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().unwrap(),
+        &css_provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    window.set_child(Some(&outer_box));
+
+    // Key handler: q/Escape to quit, same pending-key logic as real UI
+    let key_controller = gtk4::EventControllerKey::new();
+    let state_clone = state.clone();
+    let window_clone = window.clone();
+    let main_box_clone = main_box.clone();
+    let scroller_clone = scroller.clone();
+
+    key_controller.connect_key_pressed(move |_, keyval, _, _| {
+        let input_char = input_char_for_key(keyval);
+        let selection_key = selection_key_for_input(keyval);
+        let key_name = keyval.name().map(|s| s.to_lowercase());
+        let key = match key_name.as_deref() {
+            Some(key) => key,
+            None if selection_key.is_some() => "",
+            None => return glib::Propagation::Proceed,
+        };
+
+        if input_char == Some('q') || key == "escape" {
+            let mut s = state_clone.borrow_mut();
+            if s.pending_key.is_some() {
+                s.pending_key = None;
+                let entries = s.entries.clone();
+                let agent_sessions = s.agent_sessions.clone();
+                let codex_bindings = s.codex_bindings.clone();
+                let codex_sessions = s.codex_sessions.clone();
+                let codex_aliases = s.codex_aliases.clone();
+                drop(s);
+                build_entry_list(
+                    &main_box_clone,
+                    &entries,
+                    None,
+                    &agent_sessions,
+                    &codex_bindings,
+                    &codex_sessions,
+                    &codex_aliases,
+                    true,
+                );
+                reset_overlay_scroll(&scroller_clone);
+            } else {
+                drop(s);
+                window_clone.close();
+            }
+            return glib::Propagation::Stop;
+        }
+
+        if let Some(key_char) = selection_key {
+            let mut s = state_clone.borrow_mut();
+            if s.pending_key.is_some() {
+                s.pending_key = None;
+                let entries = s.entries.clone();
+                let agent_sessions = s.agent_sessions.clone();
+                let codex_bindings = s.codex_bindings.clone();
+                let codex_sessions = s.codex_sessions.clone();
+                let codex_aliases = s.codex_aliases.clone();
+                drop(s);
+                build_entry_list(
+                    &main_box_clone,
+                    &entries,
+                    None,
+                    &agent_sessions,
+                    &codex_bindings,
+                    &codex_sessions,
+                    &codex_aliases,
+                    true,
+                );
+                reset_overlay_scroll(&scroller_clone);
+            } else if s.entries.iter().any(|e| e.workspace_key == key_char) {
+                s.pending_key = Some(key_char);
+                let entries = s.entries.clone();
+                let agent_sessions = s.agent_sessions.clone();
+                let codex_bindings = s.codex_bindings.clone();
+                let codex_sessions = s.codex_sessions.clone();
+                let codex_aliases = s.codex_aliases.clone();
+                drop(s);
+                build_entry_list(
+                    &main_box_clone,
+                    &entries,
+                    Some(key_char),
+                    &agent_sessions,
+                    &codex_bindings,
+                    &codex_sessions,
+                    &codex_aliases,
+                    true,
+                );
+                reset_overlay_scroll(&scroller_clone);
+            }
+        }
+
+        glib::Propagation::Stop
+    });
+
+    window.add_controller(key_controller);
+
+    // Cycle agent states every 2 seconds
+    let state_for_timer = state.clone();
+    let main_box_for_timer = main_box.clone();
+    let cycle = Rc::new(RefCell::new(0usize));
+    glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+        let mut c = cycle.borrow_mut();
+        *c += 1;
+        let mut s = state_for_timer.borrow_mut();
+        s.agent_sessions = mock_agent_sessions(&s.entries, *c);
+        let entries = s.entries.clone();
+        let pending = s.pending_key;
+        let agent_sessions = s.agent_sessions.clone();
+        let codex_bindings = s.codex_bindings.clone();
+        let codex_sessions = s.codex_sessions.clone();
+        let codex_aliases = s.codex_aliases.clone();
+        drop(s);
+        build_entry_list(
+            &main_box_for_timer,
+            &entries,
+            pending,
+            &agent_sessions,
+            &codex_bindings,
+            &codex_sessions,
+            &codex_aliases,
+            true,
+        );
+        glib::ControlFlow::Continue
+    });
+
+    // First pass used natural widths for sizing; now compute overlay size
+    update_overlay_size(&window, &scroller, &outer_box);
+
+    // Second pass: lock label widths so content changes don't shift layout
+    {
+        let s = state.borrow();
+        build_entry_list(
+            &main_box,
+            &s.entries,
+            s.pending_key,
+            &s.agent_sessions,
+            &s.codex_bindings,
+            &s.codex_sessions,
+            &s.codex_aliases,
+            true,
+        );
+    }
+
+    window.present();
+}
+
+pub fn run_demo() -> glib::ExitCode {
+    let app = Application::builder()
+        .application_id(format!("{APP_ID}.demo"))
+        .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+
+    app.connect_activate(build_demo_ui);
     app.run_with_args::<&str>(&[])
 }
 
