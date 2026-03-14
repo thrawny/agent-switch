@@ -40,10 +40,11 @@ install:
     cargo install --path . --locked --force {{ _niri }}
 
 # Run all post-change checks
-check:
-    just fmt
+check: fmt _clippy-strict test
+
+# Clippy with denied warnings (for CI/check)
+_clippy-strict:
     cargo clippy {{ _niri }} -- -D warnings
-    just test
 
 # Run clippy
 clippy:
