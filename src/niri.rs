@@ -971,7 +971,7 @@ fn build_ui(
 
     window.set_child(Some(&outer_box));
 
-    // Helper: rebuild the current view (normal or agents) with locked label widths
+    // Helper: rebuild the current view (normal or agents)
     let rebuild_current_view = |main_box: &GtkBox, state: &AppState, lock_label_widths: bool| {
         if state.agents_view {
             build_agents_list(
@@ -981,7 +981,6 @@ fn build_ui(
                 &state.codex_bindings,
                 &state.codex_sessions,
                 &state.codex_aliases,
-                lock_label_widths,
                 state.theme,
             );
         } else {
@@ -1003,6 +1002,7 @@ fn build_ui(
     let state_clone = state.clone();
     let window_clone = window.clone();
     let main_box_clone = main_box.clone();
+    let outer_box_clone = outer_box.clone();
     let scroller_clone = scroller.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
@@ -1062,9 +1062,12 @@ fn build_ui(
             let mut state = state_clone.borrow_mut();
             state.agents_view = !state.agents_view;
             state.pending_key = None;
-            rebuild_current_view(&main_box_clone, &state, true);
+            rebuild_current_view(&main_box_clone, &state, false);
             drop(state);
             reset_overlay_scroll(&scroller_clone);
+            update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
+            let state = state_clone.borrow();
+            rebuild_current_view(&main_box_clone, &state, true);
             return glib::Propagation::Stop;
         }
 
@@ -1540,7 +1543,6 @@ fn build_agents_list(
     codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
-    lock_label_widths: bool,
     theme: &themes::Theme,
 ) {
     while let Some(child) = container.first_child() {
@@ -1592,37 +1594,56 @@ fn build_agents_list(
         })
     });
 
-    for entry in &agent_entries {
-        let row = GtkBox::new(Orientation::Horizontal, 10);
-        row.add_css_class("entry-row");
+    let grid = Grid::new();
+    grid.set_column_spacing(10);
+    grid.set_row_spacing(4);
+
+    for (row, entry) in agent_entries.iter().enumerate() {
+        let row = row as i32;
 
         let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
         let key_label = Label::new(Some(&key_text));
         key_label.add_css_class("key");
-        row.append(&key_label);
+        grid.attach(&key_label, 0, row, 1, 1);
 
         let ws_label = Label::new(Some(&entry.workspace_name));
         ws_label.add_css_class("workspace-title");
-        row.append(&ws_label);
+        ws_label.set_xalign(0.0);
+        grid.attach(&ws_label, 1, row, 1, 1);
 
-        let name_label = Label::new(None);
-        name_label.set_markup(&entry_markup(
+        if let Some(info) = agent_info_for_entry(
             entry,
             agent_sessions,
             codex_bindings,
             codex_sessions,
             codex_aliases,
-            theme,
-        ));
-        name_label.add_css_class("project");
-        name_label.set_xalign(0.0);
-        name_label.set_hexpand(true);
-        name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        name_label.set_max_width_chars(if lock_label_widths { 1 } else { 25 });
-        row.append(&name_label);
+        ) {
+            let agent_label = Label::new(Some(&info.agent));
+            agent_label.add_css_class("project");
+            agent_label.set_xalign(0.0);
+            grid.attach(&agent_label, 2, row, 1, 1);
 
-        container.append(&row);
+            let color = theme.state_color(info.state);
+            let icon_label = Label::new(None);
+            icon_label.set_markup(&format!(
+                "<span color=\"{color}\">{}</span>",
+                info.state.icon()
+            ));
+            grid.attach(&icon_label, 3, row, 1, 1);
+
+            if let Some(updated) = info.state_updated {
+                let dur_label = Label::new(None);
+                dur_label.set_markup(&format!(
+                    "<span color=\"{color}\">{}</span>",
+                    format_duration(updated)
+                ));
+                dur_label.set_xalign(1.0);
+                grid.attach(&dur_label, 4, row, 1, 1);
+            }
+        }
     }
+
+    container.append(&grid);
 }
 
 /// Run the niri daemon with GTK overlay (new `serve --niri` mode)
