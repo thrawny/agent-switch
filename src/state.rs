@@ -1,3 +1,4 @@
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -59,6 +60,44 @@ pub enum StateError {
         source: serde_json::Error,
     },
     Serialize(serde_json::Error),
+}
+
+#[derive(Debug)]
+struct WindowProbeError {
+    backend: &'static str,
+    detail: String,
+}
+
+impl WindowProbeError {
+    fn command_error(backend: &'static str, source: io::Error) -> Self {
+        Self {
+            backend,
+            detail: source.to_string(),
+        }
+    }
+
+    fn command_failed(backend: &'static str, output: &std::process::Output) -> Self {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("command exited with status {}", output.status)
+        } else {
+            format!("command exited with status {}: {}", output.status, stderr)
+        };
+        Self { backend, detail }
+    }
+
+    fn parse_error(backend: &'static str, source: serde_json::Error) -> Self {
+        Self {
+            backend,
+            detail: format!("failed to parse backend output: {}", source),
+        }
+    }
+}
+
+impl fmt::Display for WindowProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} probe failed: {}", self.backend, self.detail)
+    }
 }
 
 impl StateError {
@@ -220,13 +259,14 @@ pub fn cleanup_stale(store: &mut SessionStore) {
     let valid_tmux = get_valid_tmux_windows();
     let valid_niri = get_valid_niri_windows();
 
-    store
-        .sessions
-        .retain(|_, session| retain_window_binding(&mut session.window, &valid_tmux, &valid_niri));
+    if let Err(err) = &valid_tmux {
+        warn!("Skipping tmux stale cleanup: {}", err);
+    }
+    if let Err(err) = &valid_niri {
+        warn!("Skipping niri stale cleanup: {}", err);
+    }
 
-    store
-        .codex_bindings
-        .retain(|_, binding| retain_window_binding(&mut binding.window, &valid_tmux, &valid_niri));
+    cleanup_stale_with_window_sets(store, valid_tmux.as_ref().ok(), valid_niri.as_ref().ok());
 
     // Also remove sessions older than 24h
     let cutoff = now() - 86400.0;
@@ -238,56 +278,79 @@ pub fn cleanup_stale(store: &mut SessionStore) {
         .retain(|_, binding| binding.updated_at > cutoff);
 }
 
-fn get_valid_tmux_windows() -> std::collections::HashSet<String> {
-    let mut valid = std::collections::HashSet::new();
-    if let Ok(output) = Command::new("tmux")
-        .args(["list-windows", "-a", "-F", "#{window_id}"])
-        .output()
-        && output.status.success()
-    {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let id = line.trim();
-            if !id.is_empty() {
-                valid.insert(id.to_string());
-            }
-        }
-    }
-    valid
+fn cleanup_stale_with_window_sets(
+    store: &mut SessionStore,
+    valid_tmux: Option<&HashSet<String>>,
+    valid_niri: Option<&HashSet<String>>,
+) {
+    store
+        .sessions
+        .retain(|_, session| retain_window_binding(&mut session.window, &valid_tmux, &valid_niri));
+
+    store
+        .codex_bindings
+        .retain(|_, binding| retain_window_binding(&mut binding.window, &valid_tmux, &valid_niri));
 }
 
-fn get_valid_niri_windows() -> std::collections::HashSet<String> {
+fn get_valid_tmux_windows() -> std::result::Result<HashSet<String>, WindowProbeError> {
     let mut valid = std::collections::HashSet::new();
-    if let Ok(output) = Command::new("niri").args(["msg", "-j", "windows"]).output()
-        && output.status.success()
-        && let Ok(windows) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
-    {
-        for window in windows {
-            if let Some(id) = window.get("id").and_then(|v| v.as_u64()) {
-                valid.insert(id.to_string());
-            }
+    let output = Command::new("tmux")
+        .args(["list-windows", "-a", "-F", "#{window_id}"])
+        .output()
+        .map_err(|err| WindowProbeError::command_error("tmux", err))?;
+    if !output.status.success() {
+        return Err(WindowProbeError::command_failed("tmux", &output));
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let id = line.trim();
+        if !id.is_empty() {
+            valid.insert(id.to_string());
         }
     }
-    valid
+
+    Ok(valid)
+}
+
+fn get_valid_niri_windows() -> std::result::Result<HashSet<String>, WindowProbeError> {
+    let mut valid = std::collections::HashSet::new();
+    let output = Command::new("niri")
+        .args(["msg", "-j", "windows"])
+        .output()
+        .map_err(|err| WindowProbeError::command_error("niri", err))?;
+    if !output.status.success() {
+        return Err(WindowProbeError::command_failed("niri", &output));
+    }
+
+    let windows = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+        .map_err(|err| WindowProbeError::parse_error("niri", err))?;
+    for window in windows {
+        if let Some(id) = window.get("id").and_then(|v| v.as_u64()) {
+            valid.insert(id.to_string());
+        }
+    }
+
+    Ok(valid)
 }
 
 fn retain_window_binding(
     window: &mut WindowId,
-    valid_tmux: &HashSet<String>,
-    valid_niri: &HashSet<String>,
+    valid_tmux: &Option<&HashSet<String>>,
+    valid_niri: &Option<&HashSet<String>>,
 ) -> bool {
-    let keep_tmux = window
-        .tmux_id
-        .as_ref()
-        .is_some_and(|id| valid_tmux.contains(id));
-    let keep_niri = window
-        .niri_id
-        .as_ref()
-        .is_some_and(|id| valid_niri.contains(id));
+    let drop_tmux = matches!(
+        (window.tmux_id.as_ref(), valid_tmux),
+        (Some(id), Some(valid)) if !valid.contains(id)
+    );
+    let drop_niri = matches!(
+        (window.niri_id.as_ref(), valid_niri),
+        (Some(id), Some(valid)) if !valid.contains(id)
+    );
 
-    if window.tmux_id.is_some() && !keep_tmux {
+    if drop_tmux {
         window.tmux_id = None;
     }
-    if window.niri_id.is_some() && !keep_niri {
+    if drop_niri {
         window.niri_id = None;
     }
 
@@ -458,9 +521,77 @@ mod tests {
         let valid_tmux = HashSet::from(["@7".to_string()]);
         let valid_niri = HashSet::new();
 
-        assert!(retain_window_binding(&mut window, &valid_tmux, &valid_niri));
+        assert!(retain_window_binding(
+            &mut window,
+            &Some(&valid_tmux),
+            &Some(&valid_niri)
+        ));
         assert_eq!(window.tmux_id.as_deref(), Some("@7"));
         assert_eq!(window.niri_id, None);
+    }
+
+    #[test]
+    fn retain_window_binding_keeps_tmux_binding_when_tmux_probe_fails() {
+        let mut window = WindowId {
+            niri_id: None,
+            tmux_id: Some("@7".to_string()),
+        };
+        let valid_niri = HashSet::new();
+
+        assert!(retain_window_binding(
+            &mut window,
+            &None,
+            &Some(&valid_niri)
+        ));
+        assert_eq!(window.tmux_id.as_deref(), Some("@7"));
+    }
+
+    #[test]
+    fn cleanup_stale_keeps_codex_binding_when_niri_probe_fails() {
+        let mut store = SessionStore::default();
+        store.codex_bindings.insert(
+            "codex-1".to_string(),
+            CodexBinding {
+                session_id: "codex-1".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                updated_at: now(),
+                window: WindowId {
+                    niri_id: Some("42".to_string()),
+                    tmux_id: None,
+                },
+            },
+        );
+
+        cleanup_stale_with_window_sets(&mut store, Some(&HashSet::new()), None);
+
+        let binding = store
+            .codex_bindings
+            .get("codex-1")
+            .expect("binding should be preserved when niri probe fails");
+        assert_eq!(binding.window.niri_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn cleanup_stale_drops_session_when_known_window_ids_are_all_invalid() {
+        let mut store = SessionStore::default();
+        store.sessions.insert(
+            "@9".to_string(),
+            Session {
+                agent: "claude".to_string(),
+                session_id: "session-9".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: "idle".to_string(),
+                state_updated: now(),
+                window: WindowId {
+                    niri_id: None,
+                    tmux_id: Some("@9".to_string()),
+                },
+            },
+        );
+
+        cleanup_stale_with_window_sets(&mut store, Some(&HashSet::new()), Some(&HashSet::new()));
+
+        assert!(store.sessions.is_empty());
     }
 
     #[test]
