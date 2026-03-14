@@ -1343,6 +1343,50 @@ fn format_duration(state_updated: f64) -> String {
     }
 }
 
+struct AgentInfo {
+    agent: String,
+    state: AgentState,
+    state_updated: Option<f64>,
+}
+
+fn agent_info_for_entry(
+    entry: &WorkspaceColumn,
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+) -> Option<AgentInfo> {
+    if let Some(window_id) = entry.window_id {
+        if let Some(session) = agent_sessions.get(&window_id) {
+            return Some(AgentInfo {
+                agent: session.agent.clone(),
+                state: session.state,
+                state_updated: Some(session.state_updated),
+            });
+        }
+
+        if let Some((state, state_updated)) =
+            codex_state_for_entry(entry, codex_bindings, codex_sessions, codex_aliases)
+        {
+            return Some(AgentInfo {
+                agent: "codex".to_string(),
+                state,
+                state_updated: Some(state_updated),
+            });
+        }
+    }
+
+    if entry.app_label == "Claude Code" {
+        return Some(AgentInfo {
+            agent: "claude".to_string(),
+            state: AgentState::Idle,
+            state_updated: None,
+        });
+    }
+
+    None
+}
+
 fn entry_markup(
     entry: &WorkspaceColumn,
     agent_sessions: &HashMap<u64, AgentSession>,
@@ -1351,40 +1395,25 @@ fn entry_markup(
     codex_aliases: &[String],
     theme: &themes::Theme,
 ) -> String {
-    let app_label = glib::markup_escape_text(&entry.app_label);
-
-    if let Some(window_id) = entry.window_id {
-        if let Some(session) = agent_sessions.get(&window_id) {
-            let agent = glib::markup_escape_text(&session.agent);
-            let color = theme.state_color(session.state);
-            let dur = format_duration(session.state_updated);
-            return format!(
-                "{agent} <span color=\"{color}\">{}  {dur}</span>",
-                session.state.icon(),
-            );
-        }
-
-        if let Some((state, state_updated)) =
-            codex_state_for_entry(entry, codex_bindings, codex_sessions, codex_aliases)
-        {
-            let color = theme.state_color(state);
-            let dur = format_duration(state_updated);
-            return format!(
-                "codex <span color=\"{color}\">{}  {dur}</span>",
-                state.icon(),
-            );
-        }
+    if let Some(info) = agent_info_for_entry(
+        entry,
+        agent_sessions,
+        codex_bindings,
+        codex_sessions,
+        codex_aliases,
+    ) {
+        let agent = glib::markup_escape_text(&info.agent);
+        let color = theme.state_color(info.state);
+        let icon = info.state.icon();
+        return if let Some(updated) = info.state_updated {
+            let dur = format_duration(updated);
+            format!("{agent} <span color=\"{color}\">{icon}  {dur}</span>")
+        } else {
+            format!("{agent} <span color=\"{color}\">{icon}</span>")
+        };
     }
 
-    if app_label == "Claude Code" {
-        let color = theme.state_color(AgentState::Idle);
-        return format!(
-            "claude <span color=\"{color}\">{}</span>",
-            AgentState::Idle.icon()
-        );
-    }
-
-    app_label.to_string()
+    glib::markup_escape_text(&entry.app_label).to_string()
 }
 
 fn build_entry_row(
