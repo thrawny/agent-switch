@@ -55,6 +55,9 @@ enum Command {
         /// Toggle visibility (send to running daemon)
         #[arg(long)]
         toggle: bool,
+        /// Toggle agents-only view (send to running daemon)
+        #[arg(long)]
+        toggle_agents: bool,
         /// Show demo overlay with mock data
         #[arg(long)]
         demo: bool,
@@ -111,11 +114,14 @@ fn main() {
         #[cfg(feature = "niri")]
         Command::Niri {
             toggle,
+            toggle_agents,
             demo,
             theme,
         } => {
             let exit_code = if demo {
                 niri::run_demo(theme.as_deref())
+            } else if toggle_agents {
+                niri::run_toggle_agents()
             } else {
                 niri::run(toggle)
             };

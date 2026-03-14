@@ -137,6 +137,7 @@ struct AppState {
     entries: Vec<WorkspaceColumn>,
     pending_key: Option<char>,
     agents_view: bool,
+    focused_at_open: Option<u64>,
     agent_sessions: HashMap<u64, AgentSession>,
     codex_bindings: HashMap<u64, String>,
     codex_sessions: HashMap<String, CodexSession>,
@@ -638,10 +639,10 @@ fn switch_to_entry(entry: &WorkspaceColumn) {
     focus_column(entry.column_index);
 }
 
-fn send_toggle() -> Result<(), Box<dyn std::error::Error>> {
+fn send_command(cmd: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let path = daemon::socket_path();
     let mut stream = UnixStream::connect(&path)?;
-    stream.write_all(b"toggle")?;
+    stream.write_all(cmd)?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(())
@@ -926,6 +927,7 @@ fn build_ui(
         entries,
         pending_key: None,
         agents_view: false,
+        focused_at_open: None,
         agent_sessions,
         codex_bindings,
         codex_sessions,
@@ -981,6 +983,7 @@ fn build_ui(
                 &state.codex_bindings,
                 &state.codex_sessions,
                 &state.codex_aliases,
+                state.focused_at_open,
                 state.theme,
             );
         } else {
@@ -997,6 +1000,8 @@ fn build_ui(
             );
         }
     };
+
+    let rebuild_for_poll = rebuild_current_view;
 
     let key_controller = gtk4::EventControllerKey::new();
     let state_clone = state.clone();
@@ -1045,13 +1050,13 @@ fn build_ui(
 
         if input_char == Some('q') || key == "escape" {
             let mut state = state_clone.borrow_mut();
-            if state.pending_key.is_some() || state.agents_view {
+            if state.pending_key.is_some() {
                 state.pending_key = None;
-                state.agents_view = false;
                 rebuild_current_view(&main_box_clone, &state, true);
                 drop(state);
                 reset_overlay_scroll(&scroller_clone);
             } else {
+                state.agents_view = false;
                 drop(state);
                 window_clone.set_visible(false);
             }
@@ -1068,6 +1073,27 @@ fn build_ui(
             update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
             let state = state_clone.borrow();
             rebuild_current_view(&main_box_clone, &state, true);
+            return glib::Propagation::Stop;
+        }
+
+        if key == "space" && state_clone.borrow().agents_view {
+            let state = state_clone.borrow();
+            if let Some(target) = find_smart_jump_target(
+                &state.entries,
+                &state.agent_sessions,
+                &state.codex_bindings,
+                &state.codex_sessions,
+                &state.codex_aliases,
+                state.focused_at_open,
+            ) {
+                let target = target.clone();
+                drop(state);
+                window_clone.set_visible(false);
+                let mut state = state_clone.borrow_mut();
+                state.agents_view = false;
+                drop(state);
+                switch_to_entry(&target);
+            }
             return glib::Propagation::Stop;
         }
 
@@ -1178,8 +1204,9 @@ fn build_ui(
                         };
                         state.pending_key = None;
                         state.agents_view = is_agents;
+                        state.focused_at_open = *focused_window_for_poll.lock().unwrap();
                         // First pass: natural label widths for size computation
-                        rebuild_current_view(&main_box_for_poll, &state, false);
+                        rebuild_for_poll(&main_box_for_poll, &state, false);
                         drop(state);
                         reset_overlay_scroll(&scroller_for_poll);
                         update_overlay_size(
@@ -1189,7 +1216,7 @@ fn build_ui(
                         );
                         // Second pass: locked label widths
                         let state = state_for_poll.borrow();
-                        rebuild_current_view(&main_box_for_poll, &state, true);
+                        rebuild_for_poll(&main_box_for_poll, &state, true);
                         drop(state);
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
@@ -1220,7 +1247,7 @@ fn build_ui(
                     };
 
                     if reloaded && window_for_poll.is_visible() {
-                        rebuild_current_view(&main_box_for_poll, &state, true);
+                        rebuild_for_poll(&main_box_for_poll, &state, true);
                         reset_overlay_scroll(&scroller_for_poll);
                     }
                 }
@@ -1229,7 +1256,7 @@ fn build_ui(
                     state.agent_sessions = load_agent_sessions();
                     state.codex_bindings = load_codex_bindings();
                     if window_for_poll.is_visible() {
-                        rebuild_current_view(&main_box_for_poll, &state, true);
+                        rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::CodexChanged) => {
@@ -1239,7 +1266,7 @@ fn build_ui(
                         cache.codex_sessions.clone()
                     };
                     if window_for_poll.is_visible() {
-                        rebuild_current_view(&main_box_for_poll, &state, true);
+                        rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::Track(event)) => {
@@ -1543,13 +1570,100 @@ fn build_agents_list(
     codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
+    focused_window_id: Option<u64>,
     theme: &themes::Theme,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 
-    let mut agent_entries: Vec<_> = entries
+    let agent_entries = sorted_agent_entries(
+        entries,
+        agent_sessions,
+        codex_bindings,
+        codex_sessions,
+        codex_aliases,
+    );
+
+    let jump_target_id = agent_entries
+        .iter()
+        .find(|e| e.window_id != focused_window_id)
+        .and_then(|e| e.window_id);
+
+    let grid = Grid::new();
+    grid.set_column_spacing(10);
+    grid.set_row_spacing(4);
+
+    for (row, entry) in agent_entries.iter().enumerate() {
+        let row = row as i32;
+
+        let is_current = entry.window_id == focused_window_id;
+        let is_jump_target = entry.window_id.is_some() && entry.window_id == jump_target_id;
+
+        let marker = if is_current {
+            "·"
+        } else if is_jump_target {
+            "▸"
+        } else {
+            ""
+        };
+        let marker_label = Label::new(Some(marker));
+        marker_label.add_css_class("key");
+        grid.attach(&marker_label, 0, row, 1, 1);
+
+        let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
+        let key_label = Label::new(Some(&key_text));
+        key_label.add_css_class("key");
+        grid.attach(&key_label, 1, row, 1, 1);
+
+        let ws_label = Label::new(Some(&entry.workspace_name));
+        ws_label.add_css_class("workspace-title");
+        ws_label.set_xalign(0.0);
+        grid.attach(&ws_label, 2, row, 1, 1);
+
+        if let Some(info) = agent_info_for_entry(
+            entry,
+            agent_sessions,
+            codex_bindings,
+            codex_sessions,
+            codex_aliases,
+        ) {
+            let agent_label = Label::new(Some(&info.agent));
+            agent_label.add_css_class("project");
+            agent_label.set_xalign(0.0);
+            grid.attach(&agent_label, 3, row, 1, 1);
+
+            let color = theme.state_color(info.state);
+            let icon_label = Label::new(None);
+            icon_label.set_markup(&format!(
+                "<span color=\"{color}\">{}</span>",
+                info.state.icon()
+            ));
+            grid.attach(&icon_label, 4, row, 1, 1);
+
+            if let Some(updated) = info.state_updated {
+                let dur_label = Label::new(None);
+                dur_label.set_markup(&format!(
+                    "<span color=\"{color}\">{}</span>",
+                    format_duration(updated)
+                ));
+                dur_label.set_xalign(1.0);
+                grid.attach(&dur_label, 5, row, 1, 1);
+            }
+        }
+    }
+
+    container.append(&grid);
+}
+
+fn sorted_agent_entries<'a>(
+    entries: &'a [WorkspaceColumn],
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+) -> Vec<&'a WorkspaceColumn> {
+    let mut result: Vec<_> = entries
         .iter()
         .filter(|e| {
             agent_info_for_entry(
@@ -1559,11 +1673,11 @@ fn build_agents_list(
                 codex_sessions,
                 codex_aliases,
             )
-            .is_some()
+            .is_some_and(|info| info.state_updated.is_some())
         })
         .collect();
 
-    agent_entries.sort_by(|a, b| {
+    result.sort_by(|a, b| {
         let info_a = agent_info_for_entry(
             a,
             agent_sessions,
@@ -1584,7 +1698,6 @@ fn build_agents_list(
         let waiting_b = info_b
             .as_ref()
             .is_some_and(|i| i.state == AgentState::Waiting);
-        // Waiting first, then by most recent state change
         waiting_b.cmp(&waiting_a).then_with(|| {
             let dur_a = info_a.and_then(|i| i.state_updated).unwrap_or(0.0);
             let dur_b = info_b.and_then(|i| i.state_updated).unwrap_or(0.0);
@@ -1594,56 +1707,28 @@ fn build_agents_list(
         })
     });
 
-    let grid = Grid::new();
-    grid.set_column_spacing(10);
-    grid.set_row_spacing(4);
+    result
+}
 
-    for (row, entry) in agent_entries.iter().enumerate() {
-        let row = row as i32;
-
-        let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
-        let key_label = Label::new(Some(&key_text));
-        key_label.add_css_class("key");
-        grid.attach(&key_label, 0, row, 1, 1);
-
-        let ws_label = Label::new(Some(&entry.workspace_name));
-        ws_label.add_css_class("workspace-title");
-        ws_label.set_xalign(0.0);
-        grid.attach(&ws_label, 1, row, 1, 1);
-
-        if let Some(info) = agent_info_for_entry(
-            entry,
-            agent_sessions,
-            codex_bindings,
-            codex_sessions,
-            codex_aliases,
-        ) {
-            let agent_label = Label::new(Some(&info.agent));
-            agent_label.add_css_class("project");
-            agent_label.set_xalign(0.0);
-            grid.attach(&agent_label, 2, row, 1, 1);
-
-            let color = theme.state_color(info.state);
-            let icon_label = Label::new(None);
-            icon_label.set_markup(&format!(
-                "<span color=\"{color}\">{}</span>",
-                info.state.icon()
-            ));
-            grid.attach(&icon_label, 3, row, 1, 1);
-
-            if let Some(updated) = info.state_updated {
-                let dur_label = Label::new(None);
-                dur_label.set_markup(&format!(
-                    "<span color=\"{color}\">{}</span>",
-                    format_duration(updated)
-                ));
-                dur_label.set_xalign(1.0);
-                grid.attach(&dur_label, 4, row, 1, 1);
-            }
-        }
-    }
-
-    container.append(&grid);
+#[allow(clippy::too_many_arguments)]
+fn find_smart_jump_target<'a>(
+    entries: &'a [WorkspaceColumn],
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+    focused_window_id: Option<u64>,
+) -> Option<&'a WorkspaceColumn> {
+    let sorted = sorted_agent_entries(
+        entries,
+        agent_sessions,
+        codex_bindings,
+        codex_sessions,
+        codex_aliases,
+    );
+    sorted
+        .into_iter()
+        .find(|e| e.window_id != focused_window_id)
 }
 
 /// Run the niri daemon with GTK overlay (new `serve --niri` mode)
@@ -1839,6 +1924,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         entries,
         pending_key: None,
         agents_view: false,
+        focused_at_open: None,
         agent_sessions,
         codex_bindings: HashMap::new(),
         codex_sessions: HashMap::new(),
@@ -2050,7 +2136,7 @@ pub fn run_demo(theme_override: Option<&str>) -> glib::ExitCode {
 /// Legacy run function for backward compatibility (`niri --toggle` and standalone daemon)
 pub fn run(toggle: bool) -> glib::ExitCode {
     if toggle {
-        if let Err(e) = send_toggle() {
+        if let Err(e) = send_command(b"toggle") {
             log::error!("Failed to toggle: {} (is daemon running?)", e);
             std::process::exit(1);
         }
@@ -2059,6 +2145,14 @@ pub fn run(toggle: bool) -> glib::ExitCode {
 
     // Legacy mode: run standalone with its own socket listener
     run_with_daemon()
+}
+
+pub fn run_toggle_agents() -> glib::ExitCode {
+    if let Err(e) = send_command(b"toggle-agents") {
+        log::error!("Failed to toggle agents: {} (is daemon running?)", e);
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 #[cfg(test)]

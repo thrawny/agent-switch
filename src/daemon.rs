@@ -1069,7 +1069,7 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                 agent: agent.to_string(),
                 session_id: session_id.to_string(),
                 cwd: event.cwd.clone(),
-                state: "waiting".to_string(),
+                state: "idle".to_string(),
                 state_updated: state::now(),
                 window: window_id,
             };
