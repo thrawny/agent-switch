@@ -36,11 +36,11 @@ impl AgentState {
 
     /// Get display label for the state (used by niri GTK overlay)
     #[cfg_attr(not(feature = "niri"), allow(dead_code))]
-    pub fn label(&self) -> &'static str {
+    pub fn icon(&self) -> &'static str {
         match self {
-            Self::Waiting => "waiting",
-            Self::Responding => "working",
-            Self::Idle => "idle",
+            Self::Responding => "\u{f013}", // nf-fa-cog (gear)
+            Self::Waiting => "\u{f075}",    // nf-fa-comment
+            Self::Idle => "\u{f186}",       // nf-fa-moon_o
             Self::Unknown => "?",
         }
     }

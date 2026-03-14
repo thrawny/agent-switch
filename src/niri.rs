@@ -1356,27 +1356,22 @@ fn entry_markup(
     if let Some(window_id) = entry.window_id {
         if let Some(session) = agent_sessions.get(&window_id) {
             let agent = glib::markup_escape_text(&session.agent);
+            let color = theme.state_color(session.state);
             let dur = format_duration(session.state_updated);
             return format!(
-                "{} <span color=\"{}\" weight=\"bold\">[{}]</span> <span color=\"{}\">{}</span>",
-                agent,
-                theme.state_color(session.state),
-                session.state.label(),
-                theme.state_color(session.state),
-                dur,
+                "<span color=\"{color}\">{}  </span>{agent} <span color=\"{color}\">{dur}</span>",
+                session.state.icon(),
             );
         }
 
         if let Some((state, state_updated)) =
             codex_state_for_entry(entry, codex_bindings, codex_sessions, codex_aliases)
         {
+            let color = theme.state_color(state);
             let dur = format_duration(state_updated);
             return format!(
-                "codex <span color=\"{}\" weight=\"bold\">[{}]</span> <span color=\"{}\">{}</span>",
-                theme.state_color(state),
-                state.label(),
-                theme.state_color(state),
-                dur,
+                "<span color=\"{color}\">{}  </span>codex <span color=\"{color}\">{dur}</span>",
+                state.icon(),
             );
         }
     }
