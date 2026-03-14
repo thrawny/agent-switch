@@ -169,14 +169,7 @@ impl SessionCache {
         Self::default()
     }
 
-    pub fn reload_agent_sessions(&mut self) {
-        let store = match state::load() {
-            Ok(store) => store,
-            Err(err) => {
-                error!("Failed to load state: {}", err);
-                return;
-            }
-        };
+    pub fn replace_store(&mut self, store: SessionStore) {
         self.store = store;
         self.agent_sessions.clear();
 
@@ -191,6 +184,17 @@ impl SessionCache {
                 },
             );
         }
+    }
+
+    pub fn reload_agent_sessions(&mut self) {
+        let store = match state::load() {
+            Ok(store) => store,
+            Err(err) => {
+                error!("Failed to load state: {}", err);
+                return;
+            }
+        };
+        self.replace_store(store);
     }
 
     pub fn reload_codex_sessions(&mut self) {

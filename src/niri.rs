@@ -173,14 +173,7 @@ fn notify_config_error(message: &str) {
         .status();
 }
 
-fn load_agent_sessions() -> HashMap<u64, AgentSession> {
-    let store = match state::load() {
-        Ok(store) => store,
-        Err(err) => {
-            log::error!("Failed to load state: {}", err);
-            return HashMap::new();
-        }
-    };
+fn agent_sessions_from_store(store: &state::SessionStore) -> HashMap<u64, AgentSession> {
     let mut sessions = HashMap::new();
 
     for (_, session) in store.sessions.iter() {
@@ -203,14 +196,7 @@ fn load_agent_sessions() -> HashMap<u64, AgentSession> {
     sessions
 }
 
-fn load_codex_bindings() -> HashMap<u64, String> {
-    let store = match state::load() {
-        Ok(store) => store,
-        Err(err) => {
-            log::error!("Failed to load state: {}", err);
-            return HashMap::new();
-        }
-    };
+fn codex_bindings_from_store(store: &state::SessionStore) -> HashMap<u64, String> {
     let mut bindings = HashMap::new();
 
     for binding in store.codex_bindings.values() {
@@ -223,6 +209,79 @@ fn load_codex_bindings() -> HashMap<u64, String> {
     }
 
     bindings
+}
+
+fn overlay_snapshot_from_cache(
+    cache: &Arc<Mutex<SessionCache>>,
+) -> (
+    HashMap<u64, AgentSession>,
+    HashMap<u64, String>,
+    HashMap<String, CodexSession>,
+) {
+    let cache = cache.lock().unwrap();
+    (
+        agent_sessions_from_store(&cache.store),
+        codex_bindings_from_store(&cache.store),
+        cache.codex_sessions.clone(),
+    )
+}
+
+fn load_clean_store_after_cleanup() -> state::Result<state::SessionStore> {
+    state::with_locked_store(|store| {
+        state::cleanup_stale(store);
+        Ok(store.clone())
+    })
+}
+
+fn replace_cache_store(cache: &Arc<Mutex<SessionCache>>, store: state::SessionStore) {
+    let mut cache = cache.lock().unwrap();
+    cache.replace_store(store);
+}
+
+fn process_daemon_message_with_cleanup<F>(
+    msg: DaemonMessage,
+    cache: &Arc<Mutex<SessionCache>>,
+    focused_window: &Arc<Mutex<Option<u64>>>,
+    cleanup: F,
+) -> Option<NiriMessage>
+where
+    F: FnOnce() -> state::Result<state::SessionStore>,
+{
+    match msg {
+        DaemonMessage::Toggle | DaemonMessage::ToggleAgents => {
+            match cleanup() {
+                Ok(store) => replace_cache_store(cache, store),
+                Err(err) => {
+                    log::error!("Failed to update state during overlay toggle: {}", err);
+                }
+            }
+            Some(NiriMessage::Daemon(msg))
+        }
+        DaemonMessage::Shutdown => Some(NiriMessage::Daemon(msg)),
+        DaemonMessage::Track(event) => {
+            let focused_id = *focused_window.lock().unwrap();
+            daemon::handle_track_event(&event, focused_id);
+            let mut cache = cache.lock().unwrap();
+            cache.reload_agent_sessions();
+            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
+        }
+        DaemonMessage::List(resp_tx) => {
+            let cache = cache.lock().unwrap();
+            let response = cache.build_list_response();
+            let _ = resp_tx.send(response);
+            None
+        }
+        DaemonMessage::SessionsChanged => {
+            let mut cache = cache.lock().unwrap();
+            cache.reload_agent_sessions();
+            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
+        }
+        DaemonMessage::CodexChanged => {
+            let mut cache = cache.lock().unwrap();
+            cache.reload_codex_sessions();
+            Some(NiriMessage::Daemon(DaemonMessage::CodexChanged))
+        }
+    }
 }
 
 fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
@@ -924,12 +983,7 @@ fn build_ui(
     };
     let theme = themes::get(&config.theme);
     let entries = get_workspace_columns(&config);
-    let agent_sessions = load_agent_sessions();
-    let codex_bindings = load_codex_bindings();
-    let codex_sessions = {
-        let cache = cache.lock().unwrap();
-        cache.codex_sessions.clone()
-    };
+    let (agent_sessions, codex_bindings, codex_sessions) = overlay_snapshot_from_cache(&cache);
     let codex_aliases = normalized_codex_aliases(&config.codex_aliases);
 
     let state = Rc::new(RefCell::new(AppState {
@@ -1201,22 +1255,14 @@ fn build_ui(
                         state.pending_key = None;
                         state.agents_view = false;
                     } else {
-                        // Cleanup stale sessions on toggle
-                        if let Err(err) = state::with_locked_store(|store| {
-                            state::cleanup_stale(store);
-                            Ok(())
-                        }) {
-                            log::error!("Failed to update state during overlay toggle: {}", err);
-                        }
+                        let (agent_sessions, codex_bindings, codex_sessions) =
+                            overlay_snapshot_from_cache(&cache_for_poll);
 
                         let mut state = state_for_poll.borrow_mut();
                         state.entries = get_workspace_columns(&state.config);
-                        state.agent_sessions = load_agent_sessions();
-                        state.codex_bindings = load_codex_bindings();
-                        state.codex_sessions = {
-                            let cache = cache_for_poll.lock().unwrap();
-                            cache.codex_sessions.clone()
-                        };
+                        state.agent_sessions = agent_sessions;
+                        state.codex_bindings = codex_bindings;
+                        state.codex_sessions = codex_sessions;
                         state.pending_key = None;
                         state.agents_view = is_agents;
                         state.focused_at_open = *focused_window_for_poll.lock().unwrap();
@@ -1267,9 +1313,11 @@ fn build_ui(
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::SessionsChanged) => {
+                    let (agent_sessions, codex_bindings, _) =
+                        overlay_snapshot_from_cache(&cache_for_poll);
                     let mut state = state_for_poll.borrow_mut();
-                    state.agent_sessions = load_agent_sessions();
-                    state.codex_bindings = load_codex_bindings();
+                    state.agent_sessions = agent_sessions;
+                    state.codex_bindings = codex_bindings;
                     if window_for_poll.is_visible() {
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
@@ -1746,34 +1794,7 @@ fn process_daemon_message(
     cache: &Arc<Mutex<SessionCache>>,
     focused_window: &Arc<Mutex<Option<u64>>>,
 ) -> Option<NiriMessage> {
-    match msg {
-        DaemonMessage::Toggle | DaemonMessage::ToggleAgents | DaemonMessage::Shutdown => {
-            Some(NiriMessage::Daemon(msg))
-        }
-        DaemonMessage::Track(event) => {
-            let focused_id = *focused_window.lock().unwrap();
-            daemon::handle_track_event(&event, focused_id);
-            let mut cache = cache.lock().unwrap();
-            cache.reload_agent_sessions();
-            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
-        }
-        DaemonMessage::List(resp_tx) => {
-            let cache = cache.lock().unwrap();
-            let response = cache.build_list_response();
-            let _ = resp_tx.send(response);
-            None
-        }
-        DaemonMessage::SessionsChanged => {
-            let mut cache = cache.lock().unwrap();
-            cache.reload_agent_sessions();
-            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
-        }
-        DaemonMessage::CodexChanged => {
-            let mut cache = cache.lock().unwrap();
-            cache.reload_codex_sessions();
-            Some(NiriMessage::Daemon(DaemonMessage::CodexChanged))
-        }
-    }
+    process_daemon_message_with_cleanup(msg, cache, focused_window, load_clean_store_after_cleanup)
 }
 
 /// Run the niri daemon with GTK overlay (new `serve --niri` mode)
@@ -2373,8 +2394,12 @@ dir = "~/code/wayvoice"
         let focused_window = Arc::new(Mutex::new(None));
         let (resp_tx, resp_rx) = mpsc::channel();
 
-        let forwarded =
-            process_daemon_message(DaemonMessage::List(resp_tx), &cache, &focused_window);
+        let forwarded = process_daemon_message_with_cleanup(
+            DaemonMessage::List(resp_tx),
+            &cache,
+            &focused_window,
+            || Ok(state::SessionStore::default()),
+        );
 
         assert!(forwarded.is_none());
         let response = resp_rx.recv().expect("list response should be sent");
@@ -2387,11 +2412,54 @@ dir = "~/code/wayvoice"
         let cache = Arc::new(Mutex::new(SessionCache::new()));
         let focused_window = Arc::new(Mutex::new(None));
 
-        let forwarded = process_daemon_message(DaemonMessage::Toggle, &cache, &focused_window);
+        let forwarded = process_daemon_message_with_cleanup(
+            DaemonMessage::Toggle,
+            &cache,
+            &focused_window,
+            || Ok(state::SessionStore::default()),
+        );
 
         assert!(matches!(
             forwarded,
             Some(NiriMessage::Daemon(DaemonMessage::Toggle))
         ));
+    }
+
+    #[test]
+    fn process_daemon_message_refreshes_cache_before_toggle_reaches_gtk() {
+        let cache = Arc::new(Mutex::new(SessionCache::new()));
+        let focused_window = Arc::new(Mutex::new(None));
+        let mut refreshed_store = state::SessionStore::default();
+        refreshed_store.sessions.insert(
+            "42".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-42".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: "responding".to_string(),
+                state_updated: 42.0,
+                window: state::WindowId {
+                    niri_id: Some("42".to_string()),
+                    tmux_id: None,
+                },
+            },
+        );
+
+        let forwarded = process_daemon_message_with_cleanup(
+            DaemonMessage::ToggleAgents,
+            &cache,
+            &focused_window,
+            || Ok(refreshed_store),
+        );
+
+        assert!(matches!(
+            forwarded,
+            Some(NiriMessage::Daemon(DaemonMessage::ToggleAgents))
+        ));
+        let (agent_sessions, _, _) = overlay_snapshot_from_cache(&cache);
+        assert_eq!(
+            agent_sessions.get(&42).map(|session| session.state),
+            Some(AgentState::Responding)
+        );
     }
 }
