@@ -51,6 +51,7 @@ pub struct AgentSession {
     pub agent: String,
     pub state: AgentState,
     pub cwd: Option<String>,
+    pub state_updated: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +160,7 @@ impl SessionCache {
                     agent: session.agent.clone(),
                     state: AgentState::from_str(&session.state),
                     cwd: session.cwd.clone(),
+                    state_updated: session.state_updated,
                 },
             );
         }

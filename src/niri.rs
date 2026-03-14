@@ -188,6 +188,7 @@ fn load_agent_sessions() -> HashMap<u64, AgentSession> {
                 agent: session.agent.clone(),
                 state: AgentState::from_str(&session.state),
                 cwd: session.cwd.clone(),
+                state_updated: session.state_updated,
             },
         );
     }
@@ -244,12 +245,12 @@ fn codex_state_for_entry(
     codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
-) -> Option<AgentState> {
+) -> Option<(AgentState, f64)> {
     if let Some(window_id) = entry.window_id
         && let Some(session_id) = codex_bindings.get(&window_id)
         && let Some(session) = codex_sessions.get(session_id)
     {
-        return Some(session.state);
+        return Some((session.state, session.state_updated));
     }
 
     let title = entry.window_title.as_deref()?.trim();
@@ -258,7 +259,7 @@ fn codex_state_for_entry(
     }
     let dir = entry.dir.as_deref()?;
     let dir = shellexpand::tilde(dir).to_string();
-    daemon::match_codex_by_dir(&dir, codex_sessions).map(|entry| entry.state)
+    daemon::match_codex_by_dir(&dir, codex_sessions).map(|s| (s.state, s.state_updated))
 }
 
 fn niri_request(request: Request) -> Option<Response> {
@@ -1325,6 +1326,23 @@ fn group_entries_by_workspace<'a>(
     groups
 }
 
+fn format_duration(state_updated: f64) -> String {
+    let elapsed = (state::now() - state_updated).max(0.0) as u64;
+    if elapsed < 60 {
+        format!("{}s", elapsed)
+    } else if elapsed < 3600 {
+        format!("{}m", elapsed / 60)
+    } else {
+        let h = elapsed / 3600;
+        let m = (elapsed % 3600) / 60;
+        if m == 0 {
+            format!("{}h", h)
+        } else {
+            format!("{}h{}m", h, m)
+        }
+    }
+}
+
 fn entry_markup(
     entry: &WorkspaceColumn,
     agent_sessions: &HashMap<u64, AgentSession>,
@@ -1338,21 +1356,27 @@ fn entry_markup(
     if let Some(window_id) = entry.window_id {
         if let Some(session) = agent_sessions.get(&window_id) {
             let agent = glib::markup_escape_text(&session.agent);
+            let dur = format_duration(session.state_updated);
             return format!(
-                "{} <span color=\"{}\" weight=\"bold\">[{}]</span>",
+                "{} <span color=\"{}\" weight=\"bold\">[{}]</span> <span color=\"{}\">{}</span>",
                 agent,
                 theme.state_color(session.state),
-                session.state.label()
+                session.state.label(),
+                theme.state_color(session.state),
+                dur,
             );
         }
 
-        if let Some(state) =
+        if let Some((state, state_updated)) =
             codex_state_for_entry(entry, codex_bindings, codex_sessions, codex_aliases)
         {
+            let dur = format_duration(state_updated);
             return format!(
-                "codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
+                "codex <span color=\"{}\" weight=\"bold\">[{}]</span> <span color=\"{}\">{}</span>",
                 theme.state_color(state),
-                state.label()
+                state.label(),
+                theme.state_color(state),
+                dur,
             );
         }
     }
@@ -1679,6 +1703,7 @@ fn mock_agent_sessions(entries: &[WorkspaceColumn], cycle: usize) -> HashMap<u64
                 agent: agents[agent_idx].to_string(),
                 state: states[state_idx],
                 cwd: entry.dir.clone(),
+                state_updated: state::now() - [30.0, 125.0, 3600.0, 45.0, 900.0][i % 5],
             },
         );
     }
