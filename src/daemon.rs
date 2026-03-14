@@ -583,8 +583,8 @@ fn handle_codex_record(
     codex: &mut HashMap<String, CodexSession>,
     last_message: &mut HashMap<String, LastMessage>,
     record: CodexRecord,
-    fallback_session_id: Option<&str>,
-    fallback_cwd: Option<&str>,
+    file_session_id: Option<&str>,
+    file_cwd: Option<&str>,
 ) {
     let record_ts = record_timestamp(&record);
     match record.record_type.as_str() {
@@ -597,11 +597,16 @@ fn handle_codex_record(
             if session_id.is_empty() {
                 return;
             }
+            if let Some(primary_session_id) = file_session_id
+                && session_id != primary_session_id
+            {
+                return;
+            }
             let cwd = record
                 .payload
                 .get("cwd")
                 .and_then(|v| v.as_str())
-                .or(fallback_cwd);
+                .or(file_cwd);
             update_codex_session(codex, session_id, cwd, "idle", record_ts);
         }
         "event_msg" => {
@@ -614,7 +619,7 @@ fn handle_codex_record(
                 .payload
                 .get("session_id")
                 .and_then(|v| v.as_str())
-                .or(fallback_session_id)
+                .or(file_session_id)
                 .unwrap_or("");
             if session_id.is_empty() {
                 return;
@@ -624,16 +629,16 @@ fn handle_codex_record(
             };
             match event_type {
                 "user_message" => {
-                    update_codex_session(codex, session_id, fallback_cwd, "responding", record_ts);
+                    update_codex_session(codex, session_id, file_cwd, "responding", record_ts);
                     update_last_message(last_message, session_id, "user", "", ts);
                 }
                 "agent_message" => {
-                    update_codex_session(codex, session_id, fallback_cwd, "idle", record_ts);
+                    update_codex_session(codex, session_id, file_cwd, "idle", record_ts);
                     update_last_message(last_message, session_id, "assistant", "", ts);
                 }
                 // Agent is actively thinking/reasoning
                 "agent_reasoning" => {
-                    update_codex_session(codex, session_id, fallback_cwd, "responding", record_ts);
+                    update_codex_session(codex, session_id, file_cwd, "responding", record_ts);
                 }
                 _ => {}
             }
@@ -653,7 +658,7 @@ fn handle_codex_record(
                 .payload
                 .get("session_id")
                 .and_then(|v| v.as_str())
-                .or(fallback_session_id)
+                .or(file_session_id)
                 .unwrap_or("");
             if session_id.is_empty() {
                 return;
@@ -663,7 +668,7 @@ fn handle_codex_record(
                 || item_type == "reasoning"
                 || item_type == "function_call_output"
             {
-                update_codex_session(codex, session_id, fallback_cwd, "responding", record_ts);
+                update_codex_session(codex, session_id, file_cwd, "responding", record_ts);
             }
             // Capture assistant message text for "waiting" detection (ends with ?)
             if role == "assistant" && item_type == "message" {
@@ -688,8 +693,9 @@ fn process_codex_file(
         Err(_) => return,
     };
     let reader = BufReader::new(file);
-    let mut session_id: Option<String> = None;
-    let mut cwd: Option<String> = None;
+    let file_meta = read_codex_file_meta(path);
+    let file_session_id = file_meta.as_ref().map(|(id, _)| id.as_str());
+    let file_cwd = file_meta.as_ref().map(|(_, cwd)| cwd.as_str());
 
     for line in reader.lines().map_while(Result::ok) {
         let trimmed = line.trim();
@@ -700,19 +706,7 @@ fn process_codex_file(
             Ok(record) => record,
             Err(_) => continue,
         };
-        if (session_id.is_none() || cwd.is_none())
-            && let Some((id, dir)) = read_codex_file_meta(path)
-        {
-            session_id = Some(id);
-            cwd = Some(dir);
-        }
-        handle_codex_record(
-            codex,
-            last_message,
-            record,
-            session_id.as_deref(),
-            cwd.as_deref(),
-        );
+        handle_codex_record(codex, last_message, record, file_session_id, file_cwd);
     }
 }
 
@@ -748,13 +742,12 @@ fn read_codex_file_meta(path: &Path) -> Option<(String, String)> {
     None
 }
 
-pub fn load_codex_sessions() -> HashMap<String, CodexSession> {
+fn load_codex_sessions_from_root(root: &Path) -> HashMap<String, CodexSession> {
     let mut codex: HashMap<String, CodexSession> = HashMap::new();
     let mut last_message: HashMap<String, LastMessage> = HashMap::new();
-    let root = codex_sessions_root();
     if root.exists() {
         let mut files = Vec::new();
-        walk_codex_files(root.as_path(), &mut files);
+        walk_codex_files(root, &mut files);
 
         let now = state::now();
         for file in files {
@@ -783,6 +776,11 @@ pub fn load_codex_sessions() -> HashMap<String, CodexSession> {
         !entry.cwd.is_empty() && now - entry.state_updated <= CODEX_MAX_AGE_SECS
     });
     codex
+}
+
+pub fn load_codex_sessions() -> HashMap<String, CodexSession> {
+    let root = codex_sessions_root();
+    load_codex_sessions_from_root(root.as_path())
 }
 
 // Note: We previously had apply_codex_recent_activity() that used file mtime
@@ -1188,6 +1186,38 @@ fn ends_with_question(transcript_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use time::Duration;
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_codex_root(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("agent-switch-daemon-tests")
+            .join(format!(
+                "{}-{}-{}",
+                test_name,
+                std::process::id(),
+                TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&dir).expect("test codex dir should be created");
+        dir
+    }
+
+    fn write_rollout(path: &Path, lines: &[String]) {
+        let content = lines.join("\n");
+        fs::write(path, format!("{content}\n")).expect("test rollout file should be written");
+    }
+
+    fn json_line(value: serde_json::Value) -> String {
+        serde_json::to_string(&value).expect("test json should serialize")
+    }
+
+    fn ts(seconds_ago: i64) -> String {
+        let now = OffsetDateTime::now_utc() - Duration::seconds(seconds_ago);
+        now.format(&Rfc3339).expect("timestamp should format")
+    }
 
     #[test]
     fn test_should_match_dir_exact_match() {
@@ -1249,5 +1279,70 @@ mod tests {
         let matched = match_codex_by_dir("/Users/jonas/code/project/src", &entries)
             .expect("entry should match by cwd");
         assert_eq!(matched.session_id, "session-123");
+    }
+
+    #[test]
+    fn load_codex_sessions_ignores_embedded_parent_session_meta_in_subagent_files() {
+        let root = test_codex_root("codex-subagent-parent-meta");
+        let day_dir = root.join("2026").join("03").join("14");
+        fs::create_dir_all(&day_dir).expect("test day dir should be created");
+
+        let parent_id = "parent-session";
+        let child_id = "child-session";
+        let cwd = "/tmp/project";
+
+        write_rollout(
+            &day_dir.join("rollout-parent.jsonl"),
+            &[
+                json_line(serde_json::json!({
+                    "timestamp": ts(8),
+                    "type": "session_meta",
+                    "payload": { "id": parent_id, "cwd": cwd, "timestamp": ts(8) }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(3),
+                    "type": "event_msg",
+                    "payload": { "type": "user_message" }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(1),
+                    "type": "response_item",
+                    "payload": { "type": "function_call" }
+                })),
+            ],
+        );
+
+        write_rollout(
+            &day_dir.join("rollout-child.jsonl"),
+            &[
+                json_line(serde_json::json!({
+                    "timestamp": ts(7),
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child_id,
+                        "forked_from_id": parent_id,
+                        "cwd": cwd,
+                        "timestamp": ts(7)
+                    }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(7),
+                    "type": "session_meta",
+                    "payload": { "id": parent_id, "cwd": cwd, "timestamp": ts(8) }
+                })),
+            ],
+        );
+
+        let sessions = load_codex_sessions_from_root(root.as_path());
+        let parent = sessions
+            .get(parent_id)
+            .expect("parent session should be loaded");
+        let child = sessions
+            .get(child_id)
+            .expect("child session should be loaded");
+
+        assert_eq!(parent.state, AgentState::Responding);
+        assert!(parent.state_updated > child.state_updated);
+        assert_eq!(child.state, AgentState::Idle);
     }
 }
