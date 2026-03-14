@@ -1,5 +1,7 @@
 mod daemon;
 mod state;
+#[cfg(feature = "niri")]
+mod themes;
 mod tmux;
 mod track;
 
@@ -56,6 +58,9 @@ enum Command {
         /// Show demo overlay with mock data
         #[arg(long)]
         demo: bool,
+        /// Override theme (e.g. "default", "molokai")
+        #[arg(long)]
+        theme: Option<String>,
     },
 }
 
@@ -104,9 +109,13 @@ fn main() {
             daemon::run_headless();
         }
         #[cfg(feature = "niri")]
-        Command::Niri { toggle, demo } => {
+        Command::Niri {
+            toggle,
+            demo,
+            theme,
+        } => {
             let exit_code = if demo {
-                niri::run_demo()
+                niri::run_demo(theme.as_deref())
             } else {
                 niri::run(toggle)
             };

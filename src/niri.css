@@ -1,0 +1,47 @@
+window {
+    background-color: transparent;
+}
+.outer {
+    background-color: @bg;
+    border-radius: 10px;
+    border: 2px solid @accent;
+}
+.workspace-column {
+    min-width: 0;
+}
+.workspace-group {
+    min-width: 0;
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+separator.workspace-separator {
+    margin-top: 4px;
+    margin-bottom: 4px;
+    min-height: 1px;
+    background-color: @separator;
+}
+.workspace-column-left {
+    padding-right: 18px;
+    border-right: 1px solid @separator;
+}
+label {
+    color: @text;
+    font-size: 14px;
+}
+label.workspace-title {
+    color: @title;
+    font-size: 12px;
+    font-family: monospace;
+    font-weight: bold;
+}
+label.key {
+    color: @key;
+    font-family: monospace;
+    font-weight: bold;
+}
+label.project {
+    color: @text_dim;
+}
+label.selected {
+    color: @selected;
+}

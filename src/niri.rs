@@ -1,5 +1,6 @@
 use crate::daemon::{self, AgentSession, AgentState, CodexSession, DaemonMessage, SessionCache};
 use crate::state;
+use crate::themes;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Grid, Label, Orientation, PolicyType,
@@ -86,6 +87,8 @@ struct Config {
         alias = "ignore_numeric_sessions"
     )]
     ignore_numeric_sessions: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
 }
 
 impl Default for Config {
@@ -96,8 +99,13 @@ impl Default for Config {
             codex_aliases: Vec::new(),
             ignore_unnamed_workspaces: default_ignore_unnamed_workspaces(),
             ignore_numeric_sessions: default_ignore_numeric_sessions(),
+            theme: default_theme(),
         }
     }
+}
+
+fn default_theme() -> String {
+    "molokai".to_string()
 }
 
 fn default_ignore_unnamed_workspaces() -> bool {
@@ -124,6 +132,7 @@ struct WorkspaceColumn {
 
 struct AppState {
     config: Config,
+    theme: &'static themes::Theme,
     codex_aliases: Vec<String>,
     entries: Vec<WorkspaceColumn>,
     pending_key: Option<char>,
@@ -836,6 +845,38 @@ fn scroll_overlay_to_end(scroller: &ScrolledWindow) {
     adjustment.set_value(upper);
 }
 
+fn apply_theme_css(css_provider: &gtk4::CssProvider, theme: &themes::Theme) {
+    let base_css = include_str!("niri.css");
+    css_provider.load_from_data(&format!("{}\n{}", theme.css, base_css));
+}
+
+fn load_overlay_css(theme: &themes::Theme) -> gtk4::CssProvider {
+    let display = gtk4::gdk::Display::default().unwrap();
+
+    let css_provider = gtk4::CssProvider::new();
+    apply_theme_css(&css_provider, theme);
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &css_provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    // User overrides
+    if let Some(path) = dirs::config_dir().map(|p| p.join("agent-switch").join("style.css"))
+        && let Ok(user_css) = std::fs::read_to_string(&path)
+    {
+        let user_provider = gtk4::CssProvider::new();
+        user_provider.load_from_data(&user_css);
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &user_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+    }
+
+    css_provider
+}
+
 fn build_ui(
     app: &Application,
     rx: mpsc::Receiver<NiriMessage>,
@@ -863,6 +904,7 @@ fn build_ui(
             (Config::default(), Some(err))
         }
     };
+    let theme = themes::get(&config.theme);
     let entries = get_workspace_columns(&config);
     let agent_sessions = load_agent_sessions();
     let codex_bindings = load_codex_bindings();
@@ -874,6 +916,7 @@ fn build_ui(
 
     let state = Rc::new(RefCell::new(AppState {
         config,
+        theme,
         codex_aliases,
         entries,
         pending_key: None,
@@ -913,68 +956,12 @@ fn build_ui(
             &state_ref.codex_sessions,
             &state_ref.codex_aliases,
             false,
+            state_ref.theme,
         );
     }
     outer_box.append(&scroller);
 
-    let css_provider = gtk4::CssProvider::new();
-    css_provider.load_from_data(
-        r#"
-        window {
-            background-color: transparent;
-        }
-        .outer {
-            background-color: rgba(30, 30, 30, 0.95);
-            border-radius: 10px;
-            border: 2px solid #f92672;
-        }
-        .workspace-column {
-            min-width: 0;
-        }
-        .workspace-group {
-            min-width: 0;
-            padding-top: 4px;
-            padding-bottom: 4px;
-        }
-        separator.workspace-separator {
-            margin-top: 4px;
-            margin-bottom: 4px;
-            min-height: 1px;
-            background-color: rgba(255, 255, 255, 0.15);
-        }
-        .workspace-column-left {
-            padding-right: 18px;
-            border-right: 1px solid rgba(255, 255, 255, 0.15);
-        }
-        label {
-            color: #ffffff;
-            font-size: 14px;
-        }
-        label.workspace-title {
-            color: #b5bd68;
-            font-size: 12px;
-            font-family: monospace;
-            font-weight: bold;
-        }
-        label.key {
-            color: #f0c674;
-            font-family: monospace;
-            font-weight: bold;
-        }
-        label.project {
-            color: #888888;
-        }
-        label.selected {
-            color: #b5bd68;
-        }
-        "#,
-    );
-
-    gtk4::style_context_add_provider_for_display(
-        &gtk4::gdk::Display::default().unwrap(),
-        &css_provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    let css_provider = load_overlay_css(theme);
 
     window.set_child(Some(&outer_box));
 
@@ -1031,6 +1018,7 @@ fn build_ui(
                 let codex_bindings = state.codex_bindings.clone();
                 let codex_sessions = state.codex_sessions.clone();
                 let codex_aliases = state.codex_aliases.clone();
+                let theme = state.theme;
                 drop(state);
                 build_entry_list(
                     &main_box_clone,
@@ -1041,6 +1029,7 @@ fn build_ui(
                     &codex_sessions,
                     &codex_aliases,
                     true,
+                    theme,
                 );
                 reset_overlay_scroll(&scroller_clone);
             } else {
@@ -1071,6 +1060,7 @@ fn build_ui(
                     let codex_bindings = state.codex_bindings.clone();
                     let codex_sessions = state.codex_sessions.clone();
                     let codex_aliases = state.codex_aliases.clone();
+                    let theme = state.theme;
                     drop(state);
                     build_entry_list(
                         &main_box_clone,
@@ -1081,6 +1071,7 @@ fn build_ui(
                         &codex_sessions,
                         &codex_aliases,
                         true,
+                        theme,
                     );
                     reset_overlay_scroll(&scroller_clone);
                 }
@@ -1091,6 +1082,7 @@ fn build_ui(
                 let codex_bindings = state.codex_bindings.clone();
                 let codex_sessions = state.codex_sessions.clone();
                 let codex_aliases = state.codex_aliases.clone();
+                let theme = state.theme;
                 drop(state);
                 build_entry_list(
                     &main_box_clone,
@@ -1101,6 +1093,7 @@ fn build_ui(
                     &codex_sessions,
                     &codex_aliases,
                     true,
+                    theme,
                 );
                 reset_overlay_scroll(&scroller_clone);
             }
@@ -1122,6 +1115,7 @@ fn build_ui(
     let scroller_for_poll = scroller.clone();
     let focused_window_for_poll = focused_window.clone();
     let cache_for_poll = cache.clone();
+    let css_provider_for_poll = css_provider.clone();
 
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
         while let Ok(msg) = rx.try_recv() {
@@ -1152,6 +1146,7 @@ fn build_ui(
                         let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
+                        let theme = state.theme;
                         drop(state);
                         // First pass: natural label widths for size computation
                         build_entry_list(
@@ -1163,6 +1158,7 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                             false,
+                            theme,
                         );
                         reset_overlay_scroll(&scroller_for_poll);
                         update_overlay_size(
@@ -1180,6 +1176,7 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                             true,
+                            theme,
                         );
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
@@ -1189,6 +1186,8 @@ fn build_ui(
                     let mut state = state_for_poll.borrow_mut();
                     let reloaded = match load_config() {
                         Ok(config) => {
+                            state.theme = themes::get(&config.theme);
+                            apply_theme_css(&css_provider_for_poll, state.theme);
                             state.config = config;
                             state.entries = get_workspace_columns(&state.config);
                             state.codex_aliases =
@@ -1214,6 +1213,7 @@ fn build_ui(
                         let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
+                        let theme = state.theme;
                         drop(state);
                         build_entry_list(
                             &main_box_for_poll,
@@ -1224,6 +1224,7 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                             true,
+                            theme,
                         );
                         reset_overlay_scroll(&scroller_for_poll);
                     }
@@ -1239,6 +1240,7 @@ fn build_ui(
                         let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
+                        let theme = state.theme;
                         drop(state);
                         build_entry_list(
                             &main_box_for_poll,
@@ -1249,6 +1251,7 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                             true,
+                            theme,
                         );
                     }
                 }
@@ -1265,6 +1268,7 @@ fn build_ui(
                         let codex_bindings = state.codex_bindings.clone();
                         let codex_sessions = state.codex_sessions.clone();
                         let codex_aliases = state.codex_aliases.clone();
+                        let theme = state.theme;
                         drop(state);
                         build_entry_list(
                             &main_box_for_poll,
@@ -1275,6 +1279,7 @@ fn build_ui(
                             &codex_sessions,
                             &codex_aliases,
                             true,
+                            theme,
                         );
                     }
                 }
@@ -1323,6 +1328,7 @@ fn entry_markup(
     codex_bindings: &HashMap<u64, String>,
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
+    theme: &themes::Theme,
 ) -> String {
     let app_label = glib::markup_escape_text(&entry.app_label);
 
@@ -1332,7 +1338,7 @@ fn entry_markup(
             return format!(
                 "{} <span color=\"{}\" weight=\"bold\">[{}]</span>",
                 agent,
-                session.state.color(),
+                theme.state_color(session.state),
                 session.state.label()
             );
         }
@@ -1342,7 +1348,7 @@ fn entry_markup(
         {
             return format!(
                 "codex <span color=\"{}\" weight=\"bold\">[{}]</span>",
-                state.color(),
+                theme.state_color(state),
                 state.label()
             );
         }
@@ -1358,6 +1364,7 @@ fn build_entry_row(
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
     lock_label_widths: bool,
+    theme: &themes::Theme,
 ) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 10);
     row.add_css_class("entry-row");
@@ -1374,6 +1381,7 @@ fn build_entry_row(
         codex_bindings,
         codex_sessions,
         codex_aliases,
+        theme,
     ));
     name_label.add_css_class("project");
     name_label.set_xalign(0.0);
@@ -1392,6 +1400,7 @@ fn build_workspace_group(
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
     lock_label_widths: bool,
+    theme: &themes::Theme,
 ) -> GtkBox {
     let group = GtkBox::new(Orientation::Vertical, 6);
     group.add_css_class("workspace-group");
@@ -1411,6 +1420,7 @@ fn build_workspace_group(
             codex_sessions,
             codex_aliases,
             lock_label_widths,
+            theme,
         ));
     }
 
@@ -1427,6 +1437,7 @@ fn build_entry_list(
     codex_sessions: &HashMap<String, CodexSession>,
     codex_aliases: &[String],
     lock_label_widths: bool,
+    theme: &themes::Theme,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -1467,6 +1478,7 @@ fn build_entry_list(
                 codex_sessions,
                 codex_aliases,
                 lock_label_widths,
+                theme,
             );
             group.set_valign(gtk4::Align::Start);
             group.add_css_class("workspace-column-left");
@@ -1481,6 +1493,7 @@ fn build_entry_list(
                     codex_sessions,
                     codex_aliases,
                     lock_label_widths,
+                    theme,
                 );
                 group.set_valign(gtk4::Align::Start);
                 grid.attach(&group, 1, grid_row, 1, 1);
@@ -1503,6 +1516,7 @@ fn build_entry_list(
                 codex_sessions,
                 codex_aliases,
                 lock_label_widths,
+                theme,
             ));
         }
     }
@@ -1670,7 +1684,7 @@ fn mock_agent_sessions(entries: &[WorkspaceColumn], cycle: usize) -> HashMap<u64
     sessions
 }
 
-fn build_demo_ui(app: &Application) {
+fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     let window = ApplicationWindow::builder()
         .application(app)
         .default_width(NIRI_OVERLAY_FALLBACK_WIDTH)
@@ -1685,11 +1699,17 @@ fn build_demo_ui(app: &Application) {
     window.set_anchor(Edge::Left, false);
     window.set_anchor(Edge::Right, false);
 
+    let mut config = load_config().unwrap_or_default();
+    if let Some(t) = theme_override {
+        config.theme = t;
+    }
+    let theme = themes::get(&config.theme);
     let entries = mock_workspace_columns();
     let agent_sessions = mock_agent_sessions(&entries, 0);
 
     let state = Rc::new(RefCell::new(AppState {
-        config: Config::default(),
+        config,
+        theme,
         codex_aliases: vec![],
         entries,
         pending_key: None,
@@ -1729,68 +1749,12 @@ fn build_demo_ui(app: &Application) {
             &s.codex_sessions,
             &s.codex_aliases,
             false,
+            s.theme,
         );
     }
     outer_box.append(&scroller);
 
-    let css_provider = gtk4::CssProvider::new();
-    css_provider.load_from_data(
-        r#"
-        window {
-            background-color: transparent;
-        }
-        .outer {
-            background-color: rgba(30, 30, 30, 0.95);
-            border-radius: 10px;
-            border: 2px solid #f92672;
-        }
-        .workspace-column {
-            min-width: 0;
-        }
-        .workspace-group {
-            min-width: 0;
-            padding-top: 4px;
-            padding-bottom: 4px;
-        }
-        separator.workspace-separator {
-            margin-top: 4px;
-            margin-bottom: 4px;
-            min-height: 1px;
-            background-color: rgba(255, 255, 255, 0.15);
-        }
-        .workspace-column-left {
-            padding-right: 18px;
-            border-right: 1px solid rgba(255, 255, 255, 0.15);
-        }
-        label {
-            color: #ffffff;
-            font-size: 14px;
-        }
-        label.workspace-title {
-            color: #b5bd68;
-            font-size: 12px;
-            font-family: monospace;
-            font-weight: bold;
-        }
-        label.key {
-            color: #f0c674;
-            font-family: monospace;
-            font-weight: bold;
-        }
-        label.project {
-            color: #888888;
-        }
-        label.selected {
-            color: #b5bd68;
-        }
-        "#,
-    );
-
-    gtk4::style_context_add_provider_for_display(
-        &gtk4::gdk::Display::default().unwrap(),
-        &css_provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    load_overlay_css(theme);
 
     window.set_child(Some(&outer_box));
 
@@ -1820,6 +1784,7 @@ fn build_demo_ui(app: &Application) {
                 let codex_bindings = s.codex_bindings.clone();
                 let codex_sessions = s.codex_sessions.clone();
                 let codex_aliases = s.codex_aliases.clone();
+                let theme = s.theme;
                 drop(s);
                 build_entry_list(
                     &main_box_clone,
@@ -1830,6 +1795,7 @@ fn build_demo_ui(app: &Application) {
                     &codex_sessions,
                     &codex_aliases,
                     true,
+                    theme,
                 );
                 reset_overlay_scroll(&scroller_clone);
             } else {
@@ -1848,6 +1814,7 @@ fn build_demo_ui(app: &Application) {
                 let codex_bindings = s.codex_bindings.clone();
                 let codex_sessions = s.codex_sessions.clone();
                 let codex_aliases = s.codex_aliases.clone();
+                let theme = s.theme;
                 drop(s);
                 build_entry_list(
                     &main_box_clone,
@@ -1858,6 +1825,7 @@ fn build_demo_ui(app: &Application) {
                     &codex_sessions,
                     &codex_aliases,
                     true,
+                    theme,
                 );
                 reset_overlay_scroll(&scroller_clone);
             } else if s.entries.iter().any(|e| e.workspace_key == key_char) {
@@ -1867,6 +1835,7 @@ fn build_demo_ui(app: &Application) {
                 let codex_bindings = s.codex_bindings.clone();
                 let codex_sessions = s.codex_sessions.clone();
                 let codex_aliases = s.codex_aliases.clone();
+                let theme = s.theme;
                 drop(s);
                 build_entry_list(
                     &main_box_clone,
@@ -1877,6 +1846,7 @@ fn build_demo_ui(app: &Application) {
                     &codex_sessions,
                     &codex_aliases,
                     true,
+                    theme,
                 );
                 reset_overlay_scroll(&scroller_clone);
             }
@@ -1902,6 +1872,7 @@ fn build_demo_ui(app: &Application) {
         let codex_bindings = s.codex_bindings.clone();
         let codex_sessions = s.codex_sessions.clone();
         let codex_aliases = s.codex_aliases.clone();
+        let theme = s.theme;
         drop(s);
         build_entry_list(
             &main_box_for_timer,
@@ -1912,6 +1883,7 @@ fn build_demo_ui(app: &Application) {
             &codex_sessions,
             &codex_aliases,
             true,
+            theme,
         );
         glib::ControlFlow::Continue
     });
@@ -1931,19 +1903,21 @@ fn build_demo_ui(app: &Application) {
             &s.codex_sessions,
             &s.codex_aliases,
             true,
+            s.theme,
         );
     }
 
     window.present();
 }
 
-pub fn run_demo() -> glib::ExitCode {
+pub fn run_demo(theme_override: Option<&str>) -> glib::ExitCode {
     let app = Application::builder()
         .application_id(format!("{APP_ID}.demo"))
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    app.connect_activate(build_demo_ui);
+    let theme_override = theme_override.map(|s| s.to_string());
+    app.connect_activate(move |app| build_demo_ui(app, theme_override.clone()));
     app.run_with_args::<&str>(&[])
 }
 

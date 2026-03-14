@@ -53,9 +53,9 @@ clippy:
 test:
     cargo test --release
 
-# Run niri overlay demo with mock data
-demo:
-    cargo run --features niri -- niri --demo
+# Run niri overlay demo with mock data (optional theme: just demo default)
+demo theme="":
+    cargo run --features niri -- niri --demo {{ if theme != "" { "--theme " + theme } else { "" } }}
 
 # Format code
 fmt:

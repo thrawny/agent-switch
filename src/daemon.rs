@@ -44,17 +44,6 @@ impl AgentState {
             Self::Unknown => "?",
         }
     }
-
-    /// Get display color for the state (used by niri GTK overlay)
-    #[cfg_attr(not(feature = "niri"), allow(dead_code))]
-    pub fn color(&self) -> &'static str {
-        match self {
-            Self::Waiting => "#f92672",
-            Self::Responding => "#a6e22e",
-            Self::Idle => "#888888",
-            Self::Unknown => "#888888",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
