@@ -1284,13 +1284,8 @@ fn build_ui(
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
-                NiriMessage::Daemon(DaemonMessage::Track(event)) => {
-                    let focused_id = *focused_window_for_poll.lock().unwrap();
-                    daemon::handle_track_event(&event, focused_id);
-                }
-                NiriMessage::Daemon(DaemonMessage::List(_)) => {
-                    // Handled by socket listener directly
-                }
+                NiriMessage::Daemon(DaemonMessage::Track(_))
+                | NiriMessage::Daemon(DaemonMessage::List(_)) => {}
                 NiriMessage::Daemon(DaemonMessage::Shutdown) => {
                     // Exit GTK app
                     std::process::exit(0);
@@ -1746,6 +1741,41 @@ fn find_smart_jump_target<'a>(
         .find(|e| e.window_id != focused_window_id)
 }
 
+fn process_daemon_message(
+    msg: DaemonMessage,
+    cache: &Arc<Mutex<SessionCache>>,
+    focused_window: &Arc<Mutex<Option<u64>>>,
+) -> Option<NiriMessage> {
+    match msg {
+        DaemonMessage::Toggle | DaemonMessage::ToggleAgents | DaemonMessage::Shutdown => {
+            Some(NiriMessage::Daemon(msg))
+        }
+        DaemonMessage::Track(event) => {
+            let focused_id = *focused_window.lock().unwrap();
+            daemon::handle_track_event(&event, focused_id);
+            let mut cache = cache.lock().unwrap();
+            cache.reload_agent_sessions();
+            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
+        }
+        DaemonMessage::List(resp_tx) => {
+            let cache = cache.lock().unwrap();
+            let response = cache.build_list_response();
+            let _ = resp_tx.send(response);
+            None
+        }
+        DaemonMessage::SessionsChanged => {
+            let mut cache = cache.lock().unwrap();
+            cache.reload_agent_sessions();
+            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
+        }
+        DaemonMessage::CodexChanged => {
+            let mut cache = cache.lock().unwrap();
+            cache.reload_codex_sessions();
+            Some(NiriMessage::Daemon(DaemonMessage::CodexChanged))
+        }
+    }
+}
+
 /// Run the niri daemon with GTK overlay (new `serve --niri` mode)
 pub fn run_with_daemon() -> glib::ExitCode {
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonMessage>();
@@ -1784,6 +1814,7 @@ pub fn run_with_daemon() -> glib::ExitCode {
     // Bridge daemon messages to niri message channel
     let niri_tx_clone = niri_tx.clone();
     let cache_clone = cache.clone();
+    let focused_window_for_bridge = focused_window.clone();
     thread::spawn(move || {
         loop {
             let msg = match daemon_rx.recv() {
@@ -1791,21 +1822,10 @@ pub fn run_with_daemon() -> glib::ExitCode {
                 Err(_) => break,
             };
 
-            // Handle cache updates for daemon messages
-            match &msg {
-                DaemonMessage::SessionsChanged => {
-                    let mut cache = cache_clone.lock().unwrap();
-                    cache.reload_agent_sessions();
-                }
-                DaemonMessage::CodexChanged => {
-                    let mut cache = cache_clone.lock().unwrap();
-                    cache.reload_codex_sessions();
-                }
-                _ => {}
-            }
-
-            // Forward to GTK thread
-            if niri_tx_clone.send(NiriMessage::Daemon(msg)).is_err() {
+            if let Some(niri_msg) =
+                process_daemon_message(msg, &cache_clone, &focused_window_for_bridge)
+                && niri_tx_clone.send(niri_msg).is_err()
+            {
                 break;
             }
         }
@@ -2331,5 +2351,47 @@ dir = "~/code/wayvoice"
             .collect();
 
         assert_eq!(names, vec!["agent-switch", "main", "wayvoice"]);
+    }
+
+    #[test]
+    fn process_daemon_message_answers_list_without_forwarding_to_gtk() {
+        let cache = Arc::new(Mutex::new(SessionCache::new()));
+        cache.lock().unwrap().store.sessions.insert(
+            "42".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-42".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: "idle".to_string(),
+                state_updated: 42.0,
+                window: state::WindowId {
+                    niri_id: Some("42".to_string()),
+                    tmux_id: None,
+                },
+            },
+        );
+        let focused_window = Arc::new(Mutex::new(None));
+        let (resp_tx, resp_rx) = mpsc::channel();
+
+        let forwarded =
+            process_daemon_message(DaemonMessage::List(resp_tx), &cache, &focused_window);
+
+        assert!(forwarded.is_none());
+        let response = resp_rx.recv().expect("list response should be sent");
+        assert_eq!(response.claude.len(), 1);
+        assert_eq!(response.claude[0].session_id, "session-42");
+    }
+
+    #[test]
+    fn process_daemon_message_forwards_toggle_to_gtk() {
+        let cache = Arc::new(Mutex::new(SessionCache::new()));
+        let focused_window = Arc::new(Mutex::new(None));
+
+        let forwarded = process_daemon_message(DaemonMessage::Toggle, &cache, &focused_window);
+
+        assert!(matches!(
+            forwarded,
+            Some(NiriMessage::Daemon(DaemonMessage::Toggle))
+        ));
     }
 }
