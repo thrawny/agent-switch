@@ -797,6 +797,9 @@ fn update_overlay_size(window: &ApplicationWindow, scroller: &ScrolledWindow, ou
     scroller.set_max_content_width(max_width);
     scroller.set_max_content_height(max_height);
 
+    // Reset any previous size request so preferred_size reflects actual content
+    outer_box.set_size_request(-1, -1);
+
     let (_, natural) = outer_box.preferred_size();
     let width = clamp_i32(
         natural.width(),
@@ -1455,7 +1458,6 @@ fn build_entry_list(
         let grid = Grid::new();
         grid.add_css_class("workspace-columns");
         grid.set_column_spacing(36);
-        grid.set_column_homogeneous(true);
 
         let num_pair_rows = groups.len().div_ceil(2);
 
