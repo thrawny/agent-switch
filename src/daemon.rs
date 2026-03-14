@@ -80,6 +80,7 @@ struct LastMessage {
 #[derive(Debug)]
 pub enum DaemonMessage {
     Toggle,
+    ToggleAgents,
     Track(TrackEvent),
     List(std::sync::mpsc::Sender<ListResponse>),
     SessionsChanged,
@@ -239,6 +240,10 @@ pub fn start_socket_listener(tx: mpsc::Sender<DaemonMessage>, cache: Arc<Mutex<S
                         if cmd == "toggle" {
                             debug!("toggle");
                             let _ = tx.send(DaemonMessage::Toggle);
+                            let _ = stream.write_all(b"ok");
+                        } else if cmd == "toggle-agents" {
+                            debug!("toggle-agents");
+                            let _ = tx.send(DaemonMessage::ToggleAgents);
                             let _ = stream.write_all(b"ok");
                         } else if cmd == "list" {
                             let (resp_tx, resp_rx) = mpsc::channel();
@@ -912,7 +917,7 @@ pub fn run_headless() {
         };
 
         match msg {
-            DaemonMessage::Toggle => {
+            DaemonMessage::Toggle | DaemonMessage::ToggleAgents => {
                 // No-op in headless mode
             }
             DaemonMessage::Track(event) => {

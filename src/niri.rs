@@ -136,6 +136,7 @@ struct AppState {
     codex_aliases: Vec<String>,
     entries: Vec<WorkspaceColumn>,
     pending_key: Option<char>,
+    agents_view: bool,
     agent_sessions: HashMap<u64, AgentSession>,
     codex_bindings: HashMap<u64, String>,
     codex_sessions: HashMap<String, CodexSession>,
@@ -924,6 +925,7 @@ fn build_ui(
         codex_aliases,
         entries,
         pending_key: None,
+        agents_view: false,
         agent_sessions,
         codex_bindings,
         codex_sessions,
@@ -968,6 +970,34 @@ fn build_ui(
     let css_provider = load_overlay_css(theme);
 
     window.set_child(Some(&outer_box));
+
+    // Helper: rebuild the current view (normal or agents) with locked label widths
+    let rebuild_current_view = |main_box: &GtkBox, state: &AppState, lock_label_widths: bool| {
+        if state.agents_view {
+            build_agents_list(
+                main_box,
+                &state.entries,
+                &state.agent_sessions,
+                &state.codex_bindings,
+                &state.codex_sessions,
+                &state.codex_aliases,
+                lock_label_widths,
+                state.theme,
+            );
+        } else {
+            build_entry_list(
+                main_box,
+                &state.entries,
+                state.pending_key,
+                &state.agent_sessions,
+                &state.codex_bindings,
+                &state.codex_sessions,
+                &state.codex_aliases,
+                lock_label_widths,
+                state.theme,
+            );
+        }
+    };
 
     let key_controller = gtk4::EventControllerKey::new();
     let state_clone = state.clone();
@@ -1015,31 +1045,26 @@ fn build_ui(
 
         if input_char == Some('q') || key == "escape" {
             let mut state = state_clone.borrow_mut();
-            if state.pending_key.is_some() {
+            if state.pending_key.is_some() || state.agents_view {
                 state.pending_key = None;
-                let entries = state.entries.clone();
-                let agent_sessions = state.agent_sessions.clone();
-                let codex_bindings = state.codex_bindings.clone();
-                let codex_sessions = state.codex_sessions.clone();
-                let codex_aliases = state.codex_aliases.clone();
-                let theme = state.theme;
+                state.agents_view = false;
+                rebuild_current_view(&main_box_clone, &state, true);
                 drop(state);
-                build_entry_list(
-                    &main_box_clone,
-                    &entries,
-                    None,
-                    &agent_sessions,
-                    &codex_bindings,
-                    &codex_sessions,
-                    &codex_aliases,
-                    true,
-                    theme,
-                );
                 reset_overlay_scroll(&scroller_clone);
             } else {
                 drop(state);
                 window_clone.set_visible(false);
             }
+            return glib::Propagation::Stop;
+        }
+
+        if input_char == Some('a') {
+            let mut state = state_clone.borrow_mut();
+            state.agents_view = !state.agents_view;
+            state.pending_key = None;
+            rebuild_current_view(&main_box_clone, &state, true);
+            drop(state);
+            reset_overlay_scroll(&scroller_clone);
             return glib::Propagation::Stop;
         }
 
@@ -1124,12 +1149,16 @@ fn build_ui(
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                NiriMessage::Daemon(DaemonMessage::Toggle) => {
+                NiriMessage::Daemon(
+                    inner @ (DaemonMessage::Toggle | DaemonMessage::ToggleAgents),
+                ) => {
+                    let is_agents = matches!(inner, DaemonMessage::ToggleAgents);
                     let is_visible = window_for_poll.is_visible();
                     if is_visible {
                         window_for_poll.set_visible(false);
                         let mut state = state_for_poll.borrow_mut();
                         state.pending_key = None;
+                        state.agents_view = false;
                     } else {
                         // Cleanup stale sessions on toggle
                         let mut store = state::load();
@@ -1145,43 +1174,20 @@ fn build_ui(
                             cache.codex_sessions.clone()
                         };
                         state.pending_key = None;
-                        let entries = state.entries.clone();
-                        let agent_sessions = state.agent_sessions.clone();
-                        let codex_bindings = state.codex_bindings.clone();
-                        let codex_sessions = state.codex_sessions.clone();
-                        let codex_aliases = state.codex_aliases.clone();
-                        let theme = state.theme;
-                        drop(state);
+                        state.agents_view = is_agents;
                         // First pass: natural label widths for size computation
-                        build_entry_list(
-                            &main_box_for_poll,
-                            &entries,
-                            None,
-                            &agent_sessions,
-                            &codex_bindings,
-                            &codex_sessions,
-                            &codex_aliases,
-                            false,
-                            theme,
-                        );
+                        rebuild_current_view(&main_box_for_poll, &state, false);
+                        drop(state);
                         reset_overlay_scroll(&scroller_for_poll);
                         update_overlay_size(
                             &window_for_poll,
                             &scroller_for_poll,
                             &outer_box_for_poll,
                         );
-                        // Second pass: locked label widths to prevent content-driven shifts
-                        build_entry_list(
-                            &main_box_for_poll,
-                            &entries,
-                            None,
-                            &agent_sessions,
-                            &codex_bindings,
-                            &codex_sessions,
-                            &codex_aliases,
-                            true,
-                            theme,
-                        );
+                        // Second pass: locked label widths
+                        let state = state_for_poll.borrow();
+                        rebuild_current_view(&main_box_for_poll, &state, true);
+                        drop(state);
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
                     }
@@ -1211,25 +1217,7 @@ fn build_ui(
                     };
 
                     if reloaded && window_for_poll.is_visible() {
-                        let entries = state.entries.clone();
-                        let pending = state.pending_key;
-                        let agent_sessions = state.agent_sessions.clone();
-                        let codex_bindings = state.codex_bindings.clone();
-                        let codex_sessions = state.codex_sessions.clone();
-                        let codex_aliases = state.codex_aliases.clone();
-                        let theme = state.theme;
-                        drop(state);
-                        build_entry_list(
-                            &main_box_for_poll,
-                            &entries,
-                            pending,
-                            &agent_sessions,
-                            &codex_bindings,
-                            &codex_sessions,
-                            &codex_aliases,
-                            true,
-                            theme,
-                        );
+                        rebuild_current_view(&main_box_for_poll, &state, true);
                         reset_overlay_scroll(&scroller_for_poll);
                     }
                 }
@@ -1238,25 +1226,7 @@ fn build_ui(
                     state.agent_sessions = load_agent_sessions();
                     state.codex_bindings = load_codex_bindings();
                     if window_for_poll.is_visible() {
-                        let entries = state.entries.clone();
-                        let pending = state.pending_key;
-                        let agent_sessions = state.agent_sessions.clone();
-                        let codex_bindings = state.codex_bindings.clone();
-                        let codex_sessions = state.codex_sessions.clone();
-                        let codex_aliases = state.codex_aliases.clone();
-                        let theme = state.theme;
-                        drop(state);
-                        build_entry_list(
-                            &main_box_for_poll,
-                            &entries,
-                            pending,
-                            &agent_sessions,
-                            &codex_bindings,
-                            &codex_sessions,
-                            &codex_aliases,
-                            true,
-                            theme,
-                        );
+                        rebuild_current_view(&main_box_for_poll, &state, true);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::CodexChanged) => {
@@ -1266,25 +1236,7 @@ fn build_ui(
                         cache.codex_sessions.clone()
                     };
                     if window_for_poll.is_visible() {
-                        let entries = state.entries.clone();
-                        let pending = state.pending_key;
-                        let agent_sessions = state.agent_sessions.clone();
-                        let codex_bindings = state.codex_bindings.clone();
-                        let codex_sessions = state.codex_sessions.clone();
-                        let codex_aliases = state.codex_aliases.clone();
-                        let theme = state.theme;
-                        drop(state);
-                        build_entry_list(
-                            &main_box_for_poll,
-                            &entries,
-                            pending,
-                            &agent_sessions,
-                            &codex_bindings,
-                            &codex_sessions,
-                            &codex_aliases,
-                            true,
-                            theme,
-                        );
+                        rebuild_current_view(&main_box_for_poll, &state, true);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::Track(event)) => {
@@ -1580,6 +1532,99 @@ fn build_entry_list(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_agents_list(
+    container: &GtkBox,
+    entries: &[WorkspaceColumn],
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+    lock_label_widths: bool,
+    theme: &themes::Theme,
+) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let mut agent_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            agent_info_for_entry(
+                e,
+                agent_sessions,
+                codex_bindings,
+                codex_sessions,
+                codex_aliases,
+            )
+            .is_some()
+        })
+        .collect();
+
+    agent_entries.sort_by(|a, b| {
+        let info_a = agent_info_for_entry(
+            a,
+            agent_sessions,
+            codex_bindings,
+            codex_sessions,
+            codex_aliases,
+        );
+        let info_b = agent_info_for_entry(
+            b,
+            agent_sessions,
+            codex_bindings,
+            codex_sessions,
+            codex_aliases,
+        );
+        let waiting_a = info_a
+            .as_ref()
+            .is_some_and(|i| i.state == AgentState::Waiting);
+        let waiting_b = info_b
+            .as_ref()
+            .is_some_and(|i| i.state == AgentState::Waiting);
+        // Waiting first, then by most recent state change
+        waiting_b.cmp(&waiting_a).then_with(|| {
+            let dur_a = info_a.and_then(|i| i.state_updated).unwrap_or(0.0);
+            let dur_b = info_b.and_then(|i| i.state_updated).unwrap_or(0.0);
+            dur_b
+                .partial_cmp(&dur_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    for entry in &agent_entries {
+        let row = GtkBox::new(Orientation::Horizontal, 10);
+        row.add_css_class("entry-row");
+
+        let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
+        let key_label = Label::new(Some(&key_text));
+        key_label.add_css_class("key");
+        row.append(&key_label);
+
+        let ws_label = Label::new(Some(&entry.workspace_name));
+        ws_label.add_css_class("workspace-title");
+        row.append(&ws_label);
+
+        let name_label = Label::new(None);
+        name_label.set_markup(&entry_markup(
+            entry,
+            agent_sessions,
+            codex_bindings,
+            codex_sessions,
+            codex_aliases,
+            theme,
+        ));
+        name_label.add_css_class("project");
+        name_label.set_xalign(0.0);
+        name_label.set_hexpand(true);
+        name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        name_label.set_max_width_chars(if lock_label_widths { 1 } else { 25 });
+        row.append(&name_label);
+
+        container.append(&row);
+    }
+}
+
 /// Run the niri daemon with GTK overlay (new `serve --niri` mode)
 pub fn run_with_daemon() -> glib::ExitCode {
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonMessage>();
@@ -1772,6 +1817,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         codex_aliases: vec![],
         entries,
         pending_key: None,
+        agents_view: false,
         agent_sessions,
         codex_bindings: HashMap::new(),
         codex_sessions: HashMap::new(),
