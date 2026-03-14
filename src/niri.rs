@@ -1379,9 +1379,7 @@ fn build_entry_row(
     name_label.set_xalign(0.0);
     name_label.set_hexpand(true);
     name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    if lock_label_widths {
-        name_label.set_max_width_chars(1);
-    }
+    name_label.set_max_width_chars(if lock_label_widths { 1 } else { 25 });
     row.append(&name_label);
 
     row
