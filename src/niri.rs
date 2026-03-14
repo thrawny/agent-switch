@@ -1359,7 +1359,7 @@ fn entry_markup(
             let color = theme.state_color(session.state);
             let dur = format_duration(session.state_updated);
             return format!(
-                "<span color=\"{color}\">{}  </span>{agent} <span color=\"{color}\">{dur}</span>",
+                "{agent} <span color=\"{color}\">{}  {dur}</span>",
                 session.state.icon(),
             );
         }
@@ -1370,7 +1370,7 @@ fn entry_markup(
             let color = theme.state_color(state);
             let dur = format_duration(state_updated);
             return format!(
-                "<span color=\"{color}\">{}  </span>codex <span color=\"{color}\">{dur}</span>",
+                "codex <span color=\"{color}\">{}  {dur}</span>",
                 state.icon(),
             );
         }
