@@ -3,9 +3,10 @@ use log::{debug, error, info, warn};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixListener;
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -145,6 +146,24 @@ pub struct SessionCache {
     pub store: SessionStore,
 }
 
+#[derive(Debug, Clone)]
+struct DaemonRuntimePaths {
+    socket_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct DaemonInstanceGuard {
+    _lock_file: fs::File,
+    socket_path: PathBuf,
+}
+
+impl Drop for DaemonInstanceGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
 impl SessionCache {
     pub fn new() -> Self {
         Self::default()
@@ -222,17 +241,92 @@ pub fn socket_path() -> PathBuf {
         .join("agent-switch.sock")
 }
 
-pub fn start_socket_listener(tx: mpsc::Sender<DaemonMessage>, cache: Arc<Mutex<SessionCache>>) {
-    let path = socket_path();
-    let _ = std::fs::remove_file(&path);
+fn daemon_runtime_paths() -> DaemonRuntimePaths {
+    let socket_path = socket_path();
+    let lock_path = socket_path
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("agent-switch.lock");
+    DaemonRuntimePaths {
+        socket_path,
+        lock_path,
+    }
+}
 
-    let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) => {
-            error!("Failed to bind socket: {}", e);
-            return;
+fn write_daemon_metadata(lock_file: &mut fs::File, socket_path: &Path) -> io::Result<()> {
+    lock_file.set_len(0)?;
+    lock_file.rewind()?;
+    writeln!(lock_file, "pid={}", std::process::id())?;
+    writeln!(lock_file, "socket={}", socket_path.display())?;
+    lock_file.sync_data()
+}
+
+fn acquire_daemon_instance(paths: &DaemonRuntimePaths) -> io::Result<DaemonInstanceGuard> {
+    if let Some(parent) = paths.lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&paths.lock_path)?;
+
+    let flock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if flock_result != 0 {
+        let err = io::Error::last_os_error();
+        let already_running = matches!(
+            err.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        );
+        let message = format!(
+            "agent-switch daemon already running (lock: {})",
+            paths.lock_path.display()
+        );
+        return Err(if already_running {
+            io::Error::new(io::ErrorKind::AlreadyExists, message)
+        } else {
+            io::Error::new(err.kind(), format!("{message}: {err}"))
+        });
+    }
+
+    write_daemon_metadata(&mut lock_file, &paths.socket_path)?;
+
+    if paths.socket_path.exists() {
+        match UnixStream::connect(&paths.socket_path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "agent-switch daemon already listening on {}",
+                        paths.socket_path.display()
+                    ),
+                ));
+            }
+            Err(_) => {
+                if let Err(err) = fs::remove_file(&paths.socket_path)
+                    && err.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(err);
+                }
+            }
         }
-    };
+    }
+
+    Ok(DaemonInstanceGuard {
+        _lock_file: lock_file,
+        socket_path: paths.socket_path.clone(),
+    })
+}
+
+pub fn start_socket_listener(
+    tx: mpsc::Sender<DaemonMessage>,
+    cache: Arc<Mutex<SessionCache>>,
+) -> io::Result<DaemonInstanceGuard> {
+    let paths = daemon_runtime_paths();
+    let guard = acquire_daemon_instance(&paths)?;
+    let listener = UnixListener::bind(&paths.socket_path)?;
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -306,6 +400,8 @@ pub fn start_socket_listener(tx: mpsc::Sender<DaemonMessage>, cache: Arc<Mutex<S
             }
         }
     });
+
+    Ok(guard)
 }
 
 pub fn start_sessions_watcher(tx: mpsc::Sender<DaemonMessage>) {
@@ -908,9 +1004,15 @@ pub fn run_headless() {
         cache.reload_codex_sessions();
     }
 
+    let _daemon_instance = match start_socket_listener(tx.clone(), cache.clone()) {
+        Ok(guard) => guard,
+        Err(err) => {
+            error!("Failed to start daemon: {}", err);
+            return;
+        }
+    };
     info!("daemon started, socket={:?}", socket_path());
 
-    start_socket_listener(tx.clone(), cache.clone());
     start_sessions_watcher(tx.clone());
     start_codex_poller(tx.clone());
     start_tmux_monitor(tx.clone());
@@ -1187,6 +1289,7 @@ fn ends_with_question(transcript_path: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
     use time::Duration;
 
@@ -1217,6 +1320,53 @@ mod tests {
     fn ts(seconds_ago: i64) -> String {
         let now = OffsetDateTime::now_utc() - Duration::seconds(seconds_ago);
         now.format(&Rfc3339).expect("timestamp should format")
+    }
+
+    fn test_runtime_paths(test_name: &str) -> DaemonRuntimePaths {
+        let dir = test_codex_root(test_name);
+        DaemonRuntimePaths {
+            socket_path: dir.join("agent-switch.sock"),
+            lock_path: dir.join("agent-switch.lock"),
+        }
+    }
+
+    #[test]
+    fn daemon_instance_lock_rejects_second_holder() {
+        let paths = test_runtime_paths("daemon-lock");
+
+        let first = acquire_daemon_instance(&paths).expect("first daemon lock should succeed");
+        let err = acquire_daemon_instance(&paths).expect_err("second daemon lock should fail");
+
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        drop(first);
+
+        acquire_daemon_instance(&paths).expect("lock should be released after first guard drops");
+    }
+
+    #[test]
+    fn daemon_instance_lock_removes_stale_socket_path() {
+        let paths = test_runtime_paths("stale-socket");
+        let listener =
+            UnixListener::bind(&paths.socket_path).expect("stale socket path should be created");
+        drop(listener);
+        assert!(paths.socket_path.exists());
+
+        let _guard =
+            acquire_daemon_instance(&paths).expect("daemon should recover from stale socket path");
+
+        assert!(!paths.socket_path.exists());
+    }
+
+    #[test]
+    fn daemon_instance_lock_rejects_live_socket_listener() {
+        let paths = test_runtime_paths("live-socket");
+        let _listener =
+            UnixListener::bind(&paths.socket_path).expect("live socket listener should bind");
+
+        let err =
+            acquire_daemon_instance(&paths).expect_err("active socket listener should be refused");
+
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
     }
 
     #[test]

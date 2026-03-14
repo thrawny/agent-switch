@@ -1760,13 +1760,20 @@ pub fn run_with_daemon() -> glib::ExitCode {
         cache.reload_codex_sessions();
     }
 
+    let _daemon_instance = match daemon::start_socket_listener(daemon_tx.clone(), cache.clone()) {
+        Ok(guard) => guard,
+        Err(err) => {
+            log::error!("Failed to start niri daemon: {}", err);
+            return glib::ExitCode::FAILURE;
+        }
+    };
+
     log::info!(
         "Starting niri daemon with overlay, listening on {:?}",
         daemon::socket_path()
     );
 
     // Start daemon threads (socket listener, file watchers)
-    daemon::start_socket_listener(daemon_tx.clone(), cache.clone());
     daemon::start_sessions_watcher(daemon_tx.clone());
     daemon::start_codex_poller(daemon_tx.clone());
 
