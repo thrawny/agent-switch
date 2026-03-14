@@ -151,7 +151,14 @@ impl SessionCache {
     }
 
     pub fn reload_agent_sessions(&mut self) {
-        self.store = state::load();
+        let store = match state::load() {
+            Ok(store) => store,
+            Err(err) => {
+                error!("Failed to load state: {}", err);
+                return;
+            }
+        };
+        self.store = store;
         self.agent_sessions.clear();
 
         for (key, session) in self.store.sessions.iter() {
@@ -955,182 +962,184 @@ pub fn run_headless() {
 pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64>) {
     let agent = event.agent.as_deref().unwrap_or("claude");
     let session_id = &event.session_id;
-    let mut store = state::load();
     let focused_niri_id = event
         .niri_id
         .as_deref()
         .and_then(|id| id.parse::<u64>().ok())
         .or(focused_niri_id);
 
-    if agent == "codex" {
-        match event.event.as_str() {
-            "session-start" => {
-                let window = match (&event.tmux_id, focused_niri_id) {
-                    (Some(tmux), niri) => state::WindowId {
-                        tmux_id: Some(tmux.clone()),
-                        niri_id: niri.map(|n| n.to_string()),
-                    },
-                    (None, Some(niri)) => state::WindowId {
-                        tmux_id: None,
-                        niri_id: Some(niri.to_string()),
-                    },
-                    (None, None) => return,
-                };
-                state::upsert_codex_binding(
-                    &mut store,
-                    state::CodexBinding {
-                        session_id: session_id.to_string(),
-                        cwd: event.cwd.clone(),
-                        updated_at: state::now(),
-                        window,
-                    },
-                );
-                state::save(&store);
-            }
-            "session-end" => {
-                store.codex_bindings.remove(session_id);
-                state::save(&store);
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    // Determine window key and IDs - prefer tmux_id, fall back to niri_id
-    let (window_key, window_id) = match (&event.tmux_id, focused_niri_id) {
-        (Some(tmux), niri) => (
-            tmux.clone(),
-            state::WindowId {
-                tmux_id: Some(tmux.clone()),
-                niri_id: niri.map(|n| n.to_string()),
-            },
-        ),
-        (None, Some(niri)) => (
-            niri.to_string(),
-            state::WindowId {
-                tmux_id: None,
-                niri_id: Some(niri.to_string()),
-            },
-        ),
-        (None, None) => {
-            // No window info - can only update existing sessions
+    if let Err(err) = state::with_locked_store(|store| {
+        if agent == "codex" {
             match event.event.as_str() {
-                "session-end" => {
-                    let key = store
-                        .sessions
-                        .iter()
-                        .find(|(_, s)| s.agent == agent && s.session_id == *session_id)
-                        .map(|(k, _)| k.clone());
-                    if let Some(key) = key {
-                        store.sessions.remove(&key);
-                    }
-                    state::save(&store);
+                "session-start" => {
+                    let window = match (&event.tmux_id, focused_niri_id) {
+                        (Some(tmux), niri) => state::WindowId {
+                            tmux_id: Some(tmux.clone()),
+                            niri_id: niri.map(|n| n.to_string()),
+                        },
+                        (None, Some(niri)) => state::WindowId {
+                            tmux_id: None,
+                            niri_id: Some(niri.to_string()),
+                        },
+                        (None, None) => return Ok(()),
+                    };
+                    state::upsert_codex_binding(
+                        store,
+                        state::CodexBinding {
+                            session_id: session_id.to_string(),
+                            cwd: event.cwd.clone(),
+                            updated_at: state::now(),
+                            window,
+                        },
+                    );
                 }
-                "prompt-submit" | "stop" | "notification" => {
-                    if let Some(session) =
-                        state::find_by_session_id_mut(&mut store, agent, session_id)
-                    {
-                        match event.event.as_str() {
-                            "prompt-submit" => {
-                                session.state = "responding".to_string();
-                                session.state_updated = state::now();
-                            }
-                            "stop" => {
-                                let is_question = event
-                                    .transcript_path
-                                    .as_ref()
-                                    .map(|p| ends_with_question(p))
-                                    .unwrap_or(false);
-                                session.state =
-                                    if is_question { "waiting" } else { "idle" }.to_string();
-                                session.state_updated = state::now();
-                            }
-                            "notification"
-                                if event.notification_type.as_deref()
-                                    == Some("permission_prompt") =>
-                            {
-                                session.state = "waiting".to_string();
-                                session.state_updated = state::now();
-                            }
-                            _ => {}
-                        }
-                        state::save(&store);
-                    }
+                "session-end" => {
+                    store.codex_bindings.remove(session_id);
                 }
                 _ => {}
             }
-            return;
+            return Ok(());
         }
-    };
 
-    match event.event.as_str() {
-        "session-start" => {
-            let session = state::Session {
-                agent: agent.to_string(),
-                session_id: session_id.to_string(),
-                cwd: event.cwd.clone(),
-                state: "idle".to_string(),
-                state_updated: state::now(),
-                window: window_id,
-            };
-            store.sessions.insert(window_key, session);
-        }
-        "session-end" => {
-            let key = store
-                .sessions
-                .iter()
-                .find(|(_, s)| s.agent == agent && s.session_id == *session_id)
-                .map(|(k, _)| k.clone());
-            if let Some(key) = key {
-                store.sessions.remove(&key);
+        // Determine window key and IDs - prefer tmux_id, fall back to niri_id
+        let (window_key, window_id) = match (&event.tmux_id, focused_niri_id) {
+            (Some(tmux), niri) => (
+                tmux.clone(),
+                state::WindowId {
+                    tmux_id: Some(tmux.clone()),
+                    niri_id: niri.map(|n| n.to_string()),
+                },
+            ),
+            (None, Some(niri)) => (
+                niri.to_string(),
+                state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some(niri.to_string()),
+                },
+            ),
+            (None, None) => {
+                // No window info - can only update existing sessions
+                match event.event.as_str() {
+                    "session-end" => {
+                        let key = store
+                            .sessions
+                            .iter()
+                            .find(|(_, s)| s.agent == agent && s.session_id == *session_id)
+                            .map(|(k, _)| k.clone());
+                        if let Some(key) = key {
+                            store.sessions.remove(&key);
+                        }
+                    }
+                    "prompt-submit" | "stop" | "notification" => {
+                        if let Some(session) =
+                            state::find_by_session_id_mut(store, agent, session_id)
+                        {
+                            match event.event.as_str() {
+                                "prompt-submit" => {
+                                    session.state = "responding".to_string();
+                                    session.state_updated = state::now();
+                                }
+                                "stop" => {
+                                    let is_question = event
+                                        .transcript_path
+                                        .as_ref()
+                                        .map(|p| ends_with_question(p))
+                                        .unwrap_or(false);
+                                    session.state =
+                                        if is_question { "waiting" } else { "idle" }.to_string();
+                                    session.state_updated = state::now();
+                                }
+                                "notification"
+                                    if event.notification_type.as_deref()
+                                        == Some("permission_prompt") =>
+                                {
+                                    session.state = "waiting".to_string();
+                                    session.state_updated = state::now();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
             }
-        }
-        "prompt-submit" => {
-            if let Some(session) = state::find_by_session_id_mut(&mut store, agent, session_id) {
-                session.state = "responding".to_string();
-                session.state_updated = state::now();
-                // Update window IDs if we have new info
-                if event.tmux_id.is_some() {
-                    session.window.tmux_id = event.tmux_id.clone();
-                }
-                if focused_niri_id.is_some() {
-                    session.window.niri_id = focused_niri_id.map(|n| n.to_string());
-                }
-            } else {
+        };
+
+        match event.event.as_str() {
+            "session-start" => {
                 let session = state::Session {
                     agent: agent.to_string(),
                     session_id: session_id.to_string(),
                     cwd: event.cwd.clone(),
-                    state: "responding".to_string(),
+                    state: "idle".to_string(),
                     state_updated: state::now(),
                     window: window_id,
                 };
                 store.sessions.insert(window_key, session);
             }
-        }
-        "stop" => {
-            if let Some(session) = state::find_by_session_id_mut(&mut store, agent, session_id) {
-                let is_question = event
-                    .transcript_path
-                    .as_ref()
-                    .map(|p| ends_with_question(p))
-                    .unwrap_or(false);
-                session.state = if is_question { "waiting" } else { "idle" }.to_string();
-                session.state_updated = state::now();
+            "session-end" => {
+                let key = store
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| s.agent == agent && s.session_id == *session_id)
+                    .map(|(k, _)| k.clone());
+                if let Some(key) = key {
+                    store.sessions.remove(&key);
+                }
             }
-        }
-        "notification" => {
-            if event.notification_type.as_deref() == Some("permission_prompt")
-                && let Some(session) = state::find_by_session_id_mut(&mut store, agent, session_id)
-            {
-                session.state = "waiting".to_string();
-                session.state_updated = state::now();
+            "prompt-submit" => {
+                if let Some(session) = state::find_by_session_id_mut(store, agent, session_id) {
+                    session.state = "responding".to_string();
+                    session.state_updated = state::now();
+                    // Update window IDs if we have new info
+                    if event.tmux_id.is_some() {
+                        session.window.tmux_id = event.tmux_id.clone();
+                    }
+                    if focused_niri_id.is_some() {
+                        session.window.niri_id = focused_niri_id.map(|n| n.to_string());
+                    }
+                } else {
+                    let session = state::Session {
+                        agent: agent.to_string(),
+                        session_id: session_id.to_string(),
+                        cwd: event.cwd.clone(),
+                        state: "responding".to_string(),
+                        state_updated: state::now(),
+                        window: window_id,
+                    };
+                    store.sessions.insert(window_key, session);
+                }
             }
+            "stop" => {
+                if let Some(session) = state::find_by_session_id_mut(store, agent, session_id) {
+                    let is_question = event
+                        .transcript_path
+                        .as_ref()
+                        .map(|p| ends_with_question(p))
+                        .unwrap_or(false);
+                    session.state = if is_question { "waiting" } else { "idle" }.to_string();
+                    session.state_updated = state::now();
+                }
+            }
+            "notification" => {
+                if event.notification_type.as_deref() == Some("permission_prompt")
+                    && let Some(session) = state::find_by_session_id_mut(store, agent, session_id)
+                {
+                    session.state = "waiting".to_string();
+                    session.state_updated = state::now();
+                }
+            }
+            _ => {}
         }
-        _ => {}
-    }
 
-    state::save(&store);
+        Ok(())
+    }) {
+        error!(
+            "Failed to persist track event {} for agent={} session={}: {}",
+            event.event, agent, session_id, err
+        );
+    }
 }
 
 fn ends_with_question(transcript_path: &str) -> bool {

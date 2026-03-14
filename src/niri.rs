@@ -174,7 +174,13 @@ fn notify_config_error(message: &str) {
 }
 
 fn load_agent_sessions() -> HashMap<u64, AgentSession> {
-    let store = state::load();
+    let store = match state::load() {
+        Ok(store) => store,
+        Err(err) => {
+            log::error!("Failed to load state: {}", err);
+            return HashMap::new();
+        }
+    };
     let mut sessions = HashMap::new();
 
     for (_, session) in store.sessions.iter() {
@@ -198,7 +204,13 @@ fn load_agent_sessions() -> HashMap<u64, AgentSession> {
 }
 
 fn load_codex_bindings() -> HashMap<u64, String> {
-    let store = state::load();
+    let store = match state::load() {
+        Ok(store) => store,
+        Err(err) => {
+            log::error!("Failed to load state: {}", err);
+            return HashMap::new();
+        }
+    };
     let mut bindings = HashMap::new();
 
     for binding in store.codex_bindings.values() {
@@ -1190,9 +1202,12 @@ fn build_ui(
                         state.agents_view = false;
                     } else {
                         // Cleanup stale sessions on toggle
-                        let mut store = state::load();
-                        state::cleanup_stale(&mut store);
-                        state::save(&store);
+                        if let Err(err) = state::with_locked_store(|store| {
+                            state::cleanup_stale(store);
+                            Ok(())
+                        }) {
+                            log::error!("Failed to update state during overlay toggle: {}", err);
+                        }
 
                         let mut state = state_for_poll.borrow_mut();
                         state.entries = get_workspace_columns(&state.config);

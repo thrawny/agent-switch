@@ -734,9 +734,16 @@ pub fn run() {
         return;
     }
 
-    let mut store = state::load();
-    state::cleanup_stale(&mut store);
-    state::save(&store);
+    let store = match state::with_locked_store(|store| {
+        state::cleanup_stale(store);
+        Ok(store.clone())
+    }) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("Failed to load state: {}", err);
+            return;
+        }
+    };
 
     let config = load_projects_config();
     let windows = filter_windows_by_config(list_tmux_windows(), &config);

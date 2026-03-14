@@ -79,17 +79,32 @@ fn main() {
         }
         Command::Fix => todo!("fix command"),
         Command::List => {
-            let mut store = state::load();
-            state::cleanup_stale(&mut store);
-            state::save(&store);
-            if let Ok(json) = serde_json::to_string_pretty(&store) {
-                println!("{}", json);
+            let store = match state::with_locked_store(|store| {
+                state::cleanup_stale(store);
+                Ok(store.clone())
+            }) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!("Failed to load state: {}", err);
+                    std::process::exit(1);
+                }
+            };
+            match serde_json::to_string_pretty(&store) {
+                Ok(json) => println!("{}", json),
+                Err(err) => {
+                    eprintln!("Failed to serialize state for output: {}", err);
+                    std::process::exit(1);
+                }
             }
         }
         Command::Cleanup => {
-            let mut store = state::load();
-            state::cleanup_stale(&mut store);
-            state::save(&store);
+            if let Err(err) = state::with_locked_store(|store| {
+                state::cleanup_stale(store);
+                Ok(())
+            }) {
+                eprintln!("Failed to update state: {}", err);
+                std::process::exit(1);
+            }
         }
         Command::Tmux { fzf } => {
             if fzf {
