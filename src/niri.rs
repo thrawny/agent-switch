@@ -1376,6 +1376,14 @@ fn entry_markup(
         }
     }
 
+    if app_label == "Claude Code" {
+        let color = theme.state_color(AgentState::Idle);
+        return format!(
+            "claude <span color=\"{color}\">{}</span>",
+            AgentState::Idle.icon()
+        );
+    }
+
     app_label.to_string()
 }
 
