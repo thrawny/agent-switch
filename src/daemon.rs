@@ -1431,10 +1431,27 @@ fn maybe_clear_permission_prompt_waiting(session: &mut state::Session) -> bool {
     true
 }
 
+fn maybe_clear_stale_question_waiting(session: &mut state::Session) -> bool {
+    if session.state != state::SessionState::Waiting || session.waiting_reason.is_some() {
+        return false;
+    }
+
+    let Some(transcript_path) = session.transcript_path.as_deref() else {
+        return false;
+    };
+    if ends_with_question(transcript_path) {
+        return false;
+    }
+
+    session.state = state::SessionState::Idle;
+    true
+}
+
 pub fn refresh_transcript_derived_states(store: &mut state::SessionStore) -> bool {
     let mut changed = false;
     for session in store.sessions.values_mut() {
         changed |= maybe_clear_permission_prompt_waiting(session);
+        changed |= maybe_clear_stale_question_waiting(session);
     }
     changed
 }
@@ -1443,7 +1460,7 @@ fn ends_with_question(transcript_path: &str) -> bool {
     use std::process::Command;
 
     let output = match Command::new("tail")
-        .args(["-n", "20", transcript_path])
+        .args(["-n", "120", transcript_path])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -1451,35 +1468,44 @@ fn ends_with_question(transcript_path: &str) -> bool {
     };
 
     let content = String::from_utf8_lossy(&output.stdout);
-    let mut last_text: Option<String> = None;
+    let mut awaiting_user_response = false;
 
     for line in content.lines() {
         if line.is_empty() {
             continue;
         }
         if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-            if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-                continue;
-            }
-            if let Some(content_arr) = entry
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array())
-            {
-                for item in content_arr {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("text")
-                        && let Some(text) = item.get("text").and_then(|t| t.as_str())
+            match entry.get("type").and_then(|t| t.as_str()) {
+                Some("assistant") => {
+                    if let Some(content_arr) = entry
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
                     {
-                        last_text = Some(text.to_string());
+                        for item in content_arr {
+                            match item.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => {
+                                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                        awaiting_user_response = text.trim_end().ends_with('?');
+                                    }
+                                }
+                                Some("tool_use") => {
+                                    awaiting_user_response = false;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
+                Some("user") => {
+                    awaiting_user_response = false;
+                }
+                _ => {}
             }
         }
     }
 
-    last_text
-        .map(|t| t.trim_end().ends_with('?'))
-        .unwrap_or(false)
+    awaiting_user_response
 }
 
 #[cfg(test)]
@@ -1747,10 +1773,21 @@ mod tests {
     }
 
     #[test]
-    fn refresh_transcript_derived_states_keeps_question_waiting_without_permission_reason() {
-        let transcript_path = write_test_transcript("question-waiting-sticks", "{}\n");
-        let modified_at =
-            transcript_modified_at(&transcript_path).expect("transcript mtime should be available");
+    fn refresh_transcript_derived_states_keeps_unanswered_question_waiting() {
+        let transcript_path = write_test_transcript(
+            "question-waiting-sticks",
+            &format!(
+                "{}\n",
+                json_line(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "Want me to commit?" }
+                        ]
+                    }
+                }))
+            ),
+        );
         let mut store = state::SessionStore::default();
         store.sessions.insert(
             "148".to_string(),
@@ -1759,7 +1796,7 @@ mod tests {
                 session_id: "session-148".to_string(),
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Waiting,
-                state_updated: modified_at - 1.0,
+                state_updated: 1.0,
                 waiting_reason: None,
                 transcript_path: Some(transcript_path),
                 window: state::WindowId {
@@ -1773,6 +1810,63 @@ mod tests {
         assert_eq!(
             store.sessions.get("148").map(|session| session.state),
             Some(state::SessionState::Waiting)
+        );
+    }
+
+    #[test]
+    fn refresh_transcript_derived_states_clears_answered_question_waiting() {
+        let transcript_path = write_test_transcript(
+            "question-waiting-clears-after-answer",
+            &[
+                json_line(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "Done. Want me to commit both changes?" }
+                        ]
+                    }
+                })),
+                json_line(serde_json::json!({
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "/gc" }
+                        ]
+                    }
+                })),
+                json_line(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            { "type": "tool_use", "id": "tool-1", "name": "Bash", "input": { "command": "git commit" } }
+                        ]
+                    }
+                })),
+            ]
+            .join("\n"),
+        );
+        let mut store = state::SessionStore::default();
+        store.sessions.insert(
+            "148".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-148".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: state::SessionState::Waiting,
+                state_updated: 1.0,
+                waiting_reason: None,
+                transcript_path: Some(transcript_path),
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("148".to_string()),
+                },
+            },
+        );
+
+        assert!(refresh_transcript_derived_states(&mut store));
+        assert_eq!(
+            store.sessions.get("148").map(|session| session.state),
+            Some(state::SessionState::Idle)
         );
     }
 
