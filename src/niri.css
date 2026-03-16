@@ -42,6 +42,11 @@ label.key {
 label.project {
     color: @text_dim;
 }
+label.agent-title {
+    color: @text;
+    font-family: monospace;
+    font-weight: 600;
+}
 label.selected {
     color: @selected;
 }

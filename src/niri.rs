@@ -31,6 +31,13 @@ const NIRI_OVERLAY_MAX_WIDTH: i32 = 1100;
 const NIRI_OVERLAY_MAX_HEIGHT: i32 = 900;
 const NIRI_OVERLAY_FALLBACK_WIDTH: i32 = 420;
 const NIRI_OVERLAY_FALLBACK_HEIGHT: i32 = 520;
+const NIRI_AGENTS_OVERLAY_WIDTH_RATIO: f64 = 0.62;
+const NIRI_AGENTS_OVERLAY_HEIGHT_RATIO: f64 = 0.82;
+const NIRI_AGENTS_OVERLAY_MIN_WIDTH: i32 = 560;
+const NIRI_AGENTS_OVERLAY_MAX_WIDTH: i32 = 1450;
+const NIRI_AGENTS_OVERLAY_MAX_HEIGHT: i32 = 1100;
+const NIRI_AGENTS_OVERLAY_FALLBACK_WIDTH: i32 = 780;
+const NIRI_AGENTS_OVERLAY_FALLBACK_HEIGHT: i32 = 700;
 const NIRI_OVERLAY_MARGIN: i32 = 80;
 const NIRI_OVERLAY_STEP_SCROLL: f64 = 64.0;
 const NIRI_OVERLAY_PAGE_SCROLL: f64 = 320.0;
@@ -203,6 +210,61 @@ where
 
 fn window_title_matches_codex_aliases(title: &str, aliases: &[String]) -> bool {
     projects::contains_alias_token(title, aliases)
+}
+
+fn named_claude_title(title: &str) -> Option<String> {
+    let name = title.trim().strip_prefix("✳ ")?.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("Claude Code") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn named_pi_title(title: &str) -> Option<String> {
+    let rest = title
+        .trim()
+        .strip_prefix("π - ")
+        .or_else(|| title.trim().strip_prefix("Pi - "))
+        .or_else(|| title.trim().strip_prefix("pi - "))?;
+    let name = rest
+        .rsplit_once(" - ")
+        .map(|(name, _)| name)
+        .unwrap_or(rest)
+        .trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("pi") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn named_title_for_agent(entry: &WorkspaceColumn, agent: &str) -> Option<String> {
+    let title = entry.window_title.as_deref()?;
+    match agent {
+        "claude" => named_claude_title(title),
+        "pi" => named_pi_title(title),
+        _ => None,
+    }
+}
+
+fn agent_fallback_from_window_title(entry: &WorkspaceColumn) -> Option<AgentInfo> {
+    let title = entry.window_title.as_deref()?;
+    if let Some(title) = named_claude_title(title) {
+        return Some(AgentInfo {
+            agent: "claude".to_string(),
+            state: AgentState::Idle,
+            state_updated: None,
+            title: Some(title),
+        });
+    }
+    if let Some(title) = named_pi_title(title) {
+        return Some(AgentInfo {
+            agent: "pi".to_string(),
+            state: AgentState::Idle,
+            state_updated: None,
+            title: Some(title),
+        });
+    }
+    None
 }
 
 fn codex_state_for_entry(
@@ -698,18 +760,43 @@ fn overlay_monitor(window: &ApplicationWindow) -> Option<gtk4::gdk::Monitor> {
         .ok()
 }
 
-fn overlay_size_caps_for_geometry(width: i32, height: i32) -> (i32, i32) {
+fn overlay_size_caps_for_geometry(width: i32, height: i32, wide_agents_layout: bool) -> (i32, i32) {
     let available_width = (width - NIRI_OVERLAY_MARGIN).max(320);
     let available_height = (height - NIRI_OVERLAY_MARGIN).max(200);
+    let width_ratio = if wide_agents_layout {
+        NIRI_AGENTS_OVERLAY_WIDTH_RATIO
+    } else {
+        NIRI_OVERLAY_WIDTH_RATIO
+    };
+    let height_ratio = if wide_agents_layout {
+        NIRI_AGENTS_OVERLAY_HEIGHT_RATIO
+    } else {
+        NIRI_OVERLAY_HEIGHT_RATIO
+    };
+    let min_width = if wide_agents_layout {
+        NIRI_AGENTS_OVERLAY_MIN_WIDTH
+    } else {
+        NIRI_OVERLAY_MIN_WIDTH
+    };
+    let max_width_cap = if wide_agents_layout {
+        NIRI_AGENTS_OVERLAY_MAX_WIDTH
+    } else {
+        NIRI_OVERLAY_MAX_WIDTH
+    };
+    let max_height_cap = if wide_agents_layout {
+        NIRI_AGENTS_OVERLAY_MAX_HEIGHT
+    } else {
+        NIRI_OVERLAY_MAX_HEIGHT
+    };
     let max_width = clamp_i32(
-        (width as f64 * NIRI_OVERLAY_WIDTH_RATIO).round() as i32,
-        NIRI_OVERLAY_MIN_WIDTH.min(available_width),
-        NIRI_OVERLAY_MAX_WIDTH.min(available_width),
+        (width as f64 * width_ratio).round() as i32,
+        min_width.min(available_width),
+        max_width_cap.min(available_width),
     );
     let max_height = clamp_i32(
-        (height as f64 * NIRI_OVERLAY_HEIGHT_RATIO).round() as i32,
+        (height as f64 * height_ratio).round() as i32,
         1,
-        NIRI_OVERLAY_MAX_HEIGHT.min(available_height),
+        max_height_cap.min(available_height),
     );
 
     (max_width, max_height)
@@ -723,28 +810,47 @@ fn selection_key_for_input(keyval: gtk4::gdk::Key) -> Option<char> {
     input_char_for_key(keyval).filter(|ch| KEYS.contains(ch))
 }
 
-fn update_overlay_size(window: &ApplicationWindow, scroller: &ScrolledWindow, outer_box: &GtkBox) {
+fn update_overlay_size(
+    window: &ApplicationWindow,
+    scroller: &ScrolledWindow,
+    outer_box: &GtkBox,
+    wide_agents_layout: bool,
+) {
     let (max_width, max_height) = overlay_monitor(window)
         .map(|monitor| {
             let geometry = monitor.geometry();
-            overlay_size_caps_for_geometry(geometry.width(), geometry.height())
+            overlay_size_caps_for_geometry(geometry.width(), geometry.height(), wide_agents_layout)
         })
-        .unwrap_or((NIRI_OVERLAY_FALLBACK_WIDTH, NIRI_OVERLAY_FALLBACK_HEIGHT));
+        .unwrap_or(if wide_agents_layout {
+            (
+                NIRI_AGENTS_OVERLAY_FALLBACK_WIDTH,
+                NIRI_AGENTS_OVERLAY_FALLBACK_HEIGHT,
+            )
+        } else {
+            (NIRI_OVERLAY_FALLBACK_WIDTH, NIRI_OVERLAY_FALLBACK_HEIGHT)
+        });
 
     scroller.set_max_content_width(max_width);
     scroller.set_max_content_height(max_height);
 
     // Reset any previous size request so preferred_size reflects actual content
+    window.set_size_request(-1, -1);
     outer_box.set_size_request(-1, -1);
 
     let (_, natural) = outer_box.preferred_size();
     let width = clamp_i32(
         natural.width(),
-        NIRI_OVERLAY_MIN_WIDTH.min(max_width),
+        if wide_agents_layout {
+            NIRI_AGENTS_OVERLAY_MIN_WIDTH.min(max_width)
+        } else {
+            NIRI_OVERLAY_MIN_WIDTH.min(max_width)
+        },
         max_width,
     );
     let height = clamp_i32(natural.height().max(1), 1, max_height);
 
+    // Reset to 1x1 first — set_default_size won't shrink past a previous larger value
+    window.set_default_size(1, 1);
     window.set_default_size(width, height);
     outer_box.set_size_request(width, height);
     window.queue_resize();
@@ -997,9 +1103,15 @@ fn build_ui(
             state.agents_view = !state.agents_view;
             state.pending_key = None;
             rebuild_current_view(&main_box_clone, &state, false);
+            let wide_agents_layout = uses_wide_agents_layout(&state);
             drop(state);
             reset_overlay_scroll(&scroller_clone);
-            update_overlay_size(&window_clone, &scroller_clone, &outer_box_clone);
+            update_overlay_size(
+                &window_clone,
+                &scroller_clone,
+                &outer_box_clone,
+                wide_agents_layout,
+            );
             let state = state_clone.borrow();
             rebuild_current_view(&main_box_clone, &state, true);
             return glib::Propagation::Stop;
@@ -1092,7 +1204,7 @@ fn build_ui(
     window.add_controller(key_controller);
     window.set_visible(false);
     window.present();
-    update_overlay_size(&window, &scroller, &outer_box);
+    update_overlay_size(&window, &scroller, &outer_box, false);
     window.set_visible(false);
 
     let window_for_poll = window.clone();
@@ -1131,12 +1243,14 @@ fn build_ui(
                         state.focused_at_open = *focused_window_for_poll.lock().unwrap();
                         // First pass: natural label widths for size computation
                         rebuild_for_poll(&main_box_for_poll, &state, false);
+                        let wide_agents_layout = uses_wide_agents_layout(&state);
                         drop(state);
                         reset_overlay_scroll(&scroller_for_poll);
                         update_overlay_size(
                             &window_for_poll,
                             &scroller_for_poll,
                             &outer_box_for_poll,
+                            wide_agents_layout,
                         );
                         // Second pass: locked label widths
                         let state = state_for_poll.borrow();
@@ -1171,6 +1285,16 @@ fn build_ui(
                     };
 
                     if reloaded && window_for_poll.is_visible() {
+                        rebuild_for_poll(&main_box_for_poll, &state, false);
+                        let wide_agents_layout = uses_wide_agents_layout(&state);
+                        drop(state);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                            wide_agents_layout,
+                        );
+                        let state = state_for_poll.borrow();
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                         reset_overlay_scroll(&scroller_for_poll);
                     }
@@ -1182,6 +1306,16 @@ fn build_ui(
                     state.agent_sessions = agent_sessions;
                     state.codex_bindings = codex_bindings;
                     if window_for_poll.is_visible() {
+                        rebuild_for_poll(&main_box_for_poll, &state, false);
+                        let wide_agents_layout = uses_wide_agents_layout(&state);
+                        drop(state);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                            wide_agents_layout,
+                        );
+                        let state = state_for_poll.borrow();
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
@@ -1192,6 +1326,16 @@ fn build_ui(
                         cache.codex_sessions.clone()
                     };
                     if window_for_poll.is_visible() {
+                        rebuild_for_poll(&main_box_for_poll, &state, false);
+                        let wide_agents_layout = uses_wide_agents_layout(&state);
+                        drop(state);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                            wide_agents_layout,
+                        );
+                        let state = state_for_poll.borrow();
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
@@ -1250,6 +1394,7 @@ struct AgentInfo {
     agent: String,
     state: AgentState,
     state_updated: Option<f64>,
+    title: Option<String>,
 }
 
 fn agent_info_for_entry(
@@ -1265,6 +1410,7 @@ fn agent_info_for_entry(
                 agent: session.agent.clone(),
                 state: session.state,
                 state_updated: Some(session.state_updated),
+                title: named_title_for_agent(entry, &session.agent),
             });
         }
 
@@ -1275,8 +1421,13 @@ fn agent_info_for_entry(
                 agent: "codex".to_string(),
                 state,
                 state_updated: Some(state_updated),
+                title: None,
             });
         }
+    }
+
+    if let Some(info) = agent_fallback_from_window_title(entry) {
+        return Some(info);
     }
 
     if entry.app_label == "Claude Code" {
@@ -1284,6 +1435,7 @@ fn agent_info_for_entry(
             agent: "claude".to_string(),
             state: AgentState::Idle,
             state_updated: None,
+            title: None,
         });
     }
 
@@ -1305,7 +1457,12 @@ fn entry_markup(
         codex_sessions,
         codex_aliases,
     ) {
-        let agent = glib::markup_escape_text(&info.agent);
+        let agent = if let Some(title) = info.title.as_deref() {
+            let title = glib::markup_escape_text(title);
+            format!("{} {}", glib::markup_escape_text(&info.agent), title)
+        } else {
+            glib::markup_escape_text(&info.agent).to_string()
+        };
         let color = theme.state_color(info.state);
         let icon = info.state.icon();
         return if let Some(updated) = info.state_updated {
@@ -1483,6 +1640,44 @@ fn build_entry_list(
     }
 }
 
+fn agents_view_has_titles(
+    entries: &[WorkspaceColumn],
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+) -> bool {
+    sorted_agent_entries(
+        entries,
+        agent_sessions,
+        codex_bindings,
+        codex_sessions,
+        codex_aliases,
+    )
+    .into_iter()
+    .any(|entry| {
+        agent_info_for_entry(
+            entry,
+            agent_sessions,
+            codex_bindings,
+            codex_sessions,
+            codex_aliases,
+        )
+        .is_some_and(|info| info.title.is_some())
+    })
+}
+
+fn uses_wide_agents_layout(state: &AppState) -> bool {
+    state.agents_view
+        && agents_view_has_titles(
+            &state.entries,
+            &state.agent_sessions,
+            &state.codex_bindings,
+            &state.codex_sessions,
+            &state.codex_aliases,
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_agents_list(
     container: &GtkBox,
@@ -1510,10 +1705,20 @@ fn build_agents_list(
         .iter()
         .find(|e| e.window_id != focused_window_id)
         .and_then(|e| e.window_id);
+    let show_title_column = agent_entries.iter().any(|entry| {
+        agent_info_for_entry(
+            entry,
+            agent_sessions,
+            codex_bindings,
+            codex_sessions,
+            codex_aliases,
+        )
+        .is_some_and(|info| info.title.is_some())
+    });
 
     let grid = Grid::new();
-    grid.set_column_spacing(10);
-    grid.set_row_spacing(4);
+    grid.set_column_spacing(14);
+    grid.set_row_spacing(6);
 
     for (row, entry) in agent_entries.iter().enumerate() {
         let row = row as i32;
@@ -1549,10 +1754,25 @@ fn build_agents_list(
             codex_sessions,
             codex_aliases,
         ) {
+            let agent_column = if show_title_column { 4 } else { 3 };
+            let icon_column = if show_title_column { 5 } else { 4 };
+            let duration_column = if show_title_column { 6 } else { 5 };
+
+            if show_title_column {
+                let title_text = info.title.clone().unwrap_or_default();
+                let title_label = Label::new(Some(&title_text));
+                title_label.add_css_class("agent-title");
+                title_label.set_xalign(0.0);
+                title_label.set_hexpand(true);
+                title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                title_label.set_max_width_chars(40);
+                grid.attach(&title_label, 3, row, 1, 1);
+            }
+
             let agent_label = Label::new(Some(&info.agent));
-            agent_label.add_css_class("project");
+            agent_label.add_css_class("workspace-title");
             agent_label.set_xalign(0.0);
-            grid.attach(&agent_label, 3, row, 1, 1);
+            grid.attach(&agent_label, agent_column, row, 1, 1);
 
             let color = theme.state_color(info.state);
             let icon_label = Label::new(None);
@@ -1560,7 +1780,7 @@ fn build_agents_list(
                 "<span color=\"{color}\">{}</span>",
                 info.state.icon()
             ));
-            grid.attach(&icon_label, 4, row, 1, 1);
+            grid.attach(&icon_label, icon_column, row, 1, 1);
 
             if let Some(updated) = info.state_updated {
                 let dur_label = Label::new(None);
@@ -1569,7 +1789,7 @@ fn build_agents_list(
                     format_duration(updated)
                 ));
                 dur_label.set_xalign(1.0);
-                grid.attach(&dur_label, 5, row, 1, 1);
+                grid.attach(&dur_label, duration_column, row, 1, 1);
             }
         }
     }
@@ -1594,7 +1814,7 @@ fn sorted_agent_entries<'a>(
                 codex_sessions,
                 codex_aliases,
             )
-            .is_some_and(|info| info.state_updated.is_some())
+            .is_some_and(|info| info.state_updated.is_some() || info.title.is_some())
         })
         .collect();
 
@@ -1624,11 +1844,22 @@ fn sorted_agent_entries<'a>(
             .map(|info| agent_sort_rank(info, updated_b))
             .unwrap_or(0);
 
-        rank_b.cmp(&rank_a).then_with(|| {
-            updated_b
-                .partial_cmp(&updated_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        rank_b
+            .cmp(&rank_a)
+            .then_with(|| {
+                updated_b
+                    .partial_cmp(&updated_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.workspace_key.cmp(&b.workspace_key))
+            .then_with(|| a.column_index.cmp(&b.column_index))
+            .then_with(|| a.column_key.cmp(&b.column_key))
+            .then_with(|| {
+                a.window_title
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.window_title.as_deref().unwrap_or(""))
+            })
     });
 
     result
@@ -2039,7 +2270,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     });
 
     // First pass used natural widths for sizing; now compute overlay size
-    update_overlay_size(&window, &scroller, &outer_box);
+    update_overlay_size(&window, &scroller, &outer_box, false);
 
     // Second pass: lock label widths so content changes don't shift layout
     {
@@ -2112,6 +2343,28 @@ mod tests {
             column_key,
             app_label: "Claude Code".to_string(),
             window_title: Some("Claude Code".to_string()),
+            dir: Some(format!("~/code/{name}")),
+            static_workspace: false,
+            window_id: Some(window_id),
+        }
+    }
+
+    fn workspace_entry_with_window(
+        name: &str,
+        workspace_key: char,
+        column_key: char,
+        window_id: u64,
+        app_label: &str,
+        window_title: &str,
+    ) -> WorkspaceColumn {
+        WorkspaceColumn {
+            workspace_name: name.to_string(),
+            workspace_ref: WorkspaceReferenceArg::Name(name.to_string()),
+            workspace_key,
+            column_index: 2,
+            column_key,
+            app_label: app_label.to_string(),
+            window_title: Some(window_title.to_string()),
             dir: Some(format!("~/code/{name}")),
             static_workspace: false,
             window_id: Some(window_id),
@@ -2218,6 +2471,123 @@ ignore = ["web"]
     }
 
     #[test]
+    fn named_agent_titles_are_extracted_for_claude_and_pi() {
+        assert_eq!(
+            named_claude_title("✳ debug-helium-launch-issues").as_deref(),
+            Some("debug-helium-launch-issues")
+        );
+        assert_eq!(named_claude_title("✳ Claude Code"), None);
+        assert_eq!(
+            named_pi_title("π - test-foo - agent-switch").as_deref(),
+            Some("test-foo")
+        );
+    }
+
+    #[test]
+    fn agent_info_uses_named_window_title_for_tracked_session() {
+        let entry = workspace_entry_with_window(
+            "dotfiles",
+            'a',
+            'h',
+            292,
+            "debug-helium-launch-issues",
+            "✳ debug-helium-launch-issues",
+        );
+        let agent_sessions = HashMap::from([(
+            292,
+            AgentSession {
+                agent: "claude".to_string(),
+                state: AgentState::Responding,
+                cwd: Some("/tmp/dotfiles".to_string()),
+                state_updated: 42.0,
+            },
+        )]);
+
+        let info = agent_info_for_entry(
+            &entry,
+            &agent_sessions,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        )
+        .expect("tracked claude session should be detected");
+
+        assert_eq!(info.agent, "claude");
+        assert_eq!(info.title.as_deref(), Some("debug-helium-launch-issues"));
+    }
+
+    #[test]
+    fn sorted_agent_entries_include_named_pi_window_without_tracking() {
+        let entry = workspace_entry_with_window(
+            "agent-switch",
+            'a',
+            'h',
+            293,
+            "π - test-foo - agent-switch",
+            "π - test-foo - agent-switch",
+        );
+        let entries = [entry];
+
+        let sorted = sorted_agent_entries(
+            &entries,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+
+        assert_eq!(sorted.len(), 1);
+        let info = agent_info_for_entry(
+            sorted[0],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        )
+        .expect("named pi title should be treated as an agent window");
+        assert_eq!(info.agent, "pi");
+        assert_eq!(info.title.as_deref(), Some("test-foo"));
+        assert_eq!(info.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn agents_view_only_uses_wide_layout_when_titles_are_present() {
+        let untitled = workspace_entry("kanel-backend", 'a', 'h', 148);
+        let titled = workspace_entry_with_window(
+            "agent-switch",
+            'b',
+            'j',
+            293,
+            "π - test-foo - agent-switch",
+            "π - test-foo - agent-switch",
+        );
+        let agent_sessions = HashMap::from([(
+            148,
+            AgentSession {
+                agent: "claude".to_string(),
+                state: AgentState::Idle,
+                cwd: Some("/tmp/kanel-backend".to_string()),
+                state_updated: 42.0,
+            },
+        )]);
+
+        assert!(!agents_view_has_titles(
+            std::slice::from_ref(&untitled),
+            &agent_sessions,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        ));
+        assert!(agents_view_has_titles(
+            std::slice::from_ref(&titled),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        ));
+    }
+
+    #[test]
     fn punctuation_bindings_map_to_selection_keys() {
         let comma = gtk4::gdk::Key::from_name("comma").expect("comma key should exist");
         let period = gtk4::gdk::Key::from_name("period").expect("period key should exist");
@@ -2229,7 +2599,7 @@ ignore = ["web"]
 
     #[test]
     fn overlay_size_caps_allow_compact_windows() {
-        let (max_width, max_height) = overlay_size_caps_for_geometry(2560, 1440);
+        let (max_width, max_height) = overlay_size_caps_for_geometry(2560, 1440, false);
         let compact_width = clamp_i32(380, NIRI_OVERLAY_MIN_WIDTH.min(max_width), max_width);
         let compact_height = clamp_i32(170, 1, max_height);
 
@@ -2237,6 +2607,15 @@ ignore = ["web"]
         assert_eq!(compact_height, 170);
         assert!(compact_width < max_width);
         assert!(compact_height < max_height);
+    }
+
+    #[test]
+    fn overlay_size_caps_expand_for_wide_agents_layout() {
+        let regular = overlay_size_caps_for_geometry(2560, 1440, false);
+        let agents = overlay_size_caps_for_geometry(2560, 1440, true);
+
+        assert!(agents.0 > regular.0);
+        assert!(agents.1 > regular.1);
     }
 
     #[test]
