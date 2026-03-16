@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::str::FromStr;
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -16,7 +17,7 @@ struct HookInput {
 
 #[derive(Debug, Serialize)]
 struct TrackMessage {
-    event: String,
+    event: daemon::TrackEventKind,
     session_id: String,
     agent: Option<String>,
     cwd: Option<String>,
@@ -81,6 +82,14 @@ pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
         }
     };
 
+    let event = match daemon::TrackEventKind::from_str(event) {
+        Ok(event) => event,
+        Err(err) => {
+            eprintln!("Invalid event: {}", err);
+            return false;
+        }
+    };
+
     let session_id = match hook.session_id {
         Some(id) => id,
         None => {
@@ -90,7 +99,7 @@ pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
     };
 
     let msg = TrackMessage {
-        event: event.to_string(),
+        event,
         session_id,
         agent: agent_override.map(str::to_string).or(hook.agent),
         cwd: hook.cwd,

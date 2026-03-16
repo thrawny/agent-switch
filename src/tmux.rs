@@ -48,15 +48,16 @@ enum AgentState {
     Waiting,
     Responding,
     Idle,
+    Unknown,
 }
 
 impl AgentState {
-    fn from_str(state: &str) -> Option<Self> {
+    fn from_session_state(state: state::SessionState) -> Self {
         match state {
-            "waiting" => Some(Self::Waiting),
-            "responding" => Some(Self::Responding),
-            "idle" => Some(Self::Idle),
-            _ => None,
+            state::SessionState::Waiting => Self::Waiting,
+            state::SessionState::Responding => Self::Responding,
+            state::SessionState::Idle => Self::Idle,
+            state::SessionState::Unknown => Self::Unknown,
         }
     }
 
@@ -65,7 +66,7 @@ impl AgentState {
             daemon::AgentState::Waiting => Self::Waiting,
             daemon::AgentState::Responding => Self::Responding,
             daemon::AgentState::Idle => Self::Idle,
-            daemon::AgentState::Unknown => Self::Idle,
+            daemon::AgentState::Unknown => Self::Unknown,
         }
     }
 
@@ -74,6 +75,7 @@ impl AgentState {
             Self::Waiting => "waiting",
             Self::Responding => "working",
             Self::Idle => "idle",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -82,6 +84,7 @@ impl AgentState {
             Self::Waiting => "\x1b[1;33m",  // bold yellow
             Self::Responding => "\x1b[34m", // blue
             Self::Idle => "\x1b[90m",       // gray
+            Self::Unknown => "\x1b[31m",    // red
         }
     }
 }
@@ -393,9 +396,8 @@ fn status_for_window(
     codex_aliases: &[String],
 ) -> Option<String> {
     // First check Claude sessions
-    if let Some(session) = status_by_tmux_id.get(&window.window_id)
-        && let Some(state) = AgentState::from_str(&session.state)
-    {
+    if let Some(session) = status_by_tmux_id.get(&window.window_id) {
+        let state = AgentState::from_session_state(session.state);
         return Some(format_status(state, &session.agent));
     }
     if let Some(codex) = codex_by_tmux_id.get(&window.window_id) {

@@ -18,13 +18,23 @@ pub struct WindowId {
     pub tmux_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionState {
+    Waiting,
+    Responding,
+    Idle,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub agent: String,
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    pub state: String,
+    pub state: SessionState,
     pub state_updated: f64,
     pub window: WindowId,
 }
@@ -580,7 +590,7 @@ mod tests {
                 agent: "claude".to_string(),
                 session_id: "session-9".to_string(),
                 cwd: Some("/tmp/project".to_string()),
-                state: "idle".to_string(),
+                state: SessionState::Idle,
                 state_updated: now(),
                 window: WindowId {
                     niri_id: None,
@@ -613,7 +623,7 @@ mod tests {
                 agent: "claude".to_string(),
                 session_id: "session-1".to_string(),
                 cwd: Some("/tmp/project".to_string()),
-                state: "idle".to_string(),
+                state: SessionState::Idle,
                 state_updated: 1.0,
                 window: WindowId {
                     niri_id: None,
@@ -647,7 +657,7 @@ mod tests {
                     agent: "claude".to_string(),
                     session_id: "session-9".to_string(),
                     cwd: None,
-                    state: "responding".to_string(),
+                    state: SessionState::Responding,
                     state_updated: 9.0,
                     window: WindowId {
                         niri_id: None,
@@ -661,5 +671,35 @@ mod tests {
 
         let loaded = load_from_path(&path).expect("mutated state should load");
         assert!(loaded.sessions.contains_key("@9"));
+    }
+
+    #[test]
+    fn session_state_deserializes_legacy_lowercase_strings() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "agent": "claude",
+            "session_id": "session-1",
+            "cwd": "/tmp/project",
+            "state": "responding",
+            "state_updated": 1.0,
+            "window": { "tmux_id": "@1" }
+        }))
+        .expect("legacy lowercase session state should deserialize");
+
+        assert_eq!(session.state, SessionState::Responding);
+    }
+
+    #[test]
+    fn session_state_treats_unknown_values_as_unknown() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "agent": "claude",
+            "session_id": "session-1",
+            "cwd": "/tmp/project",
+            "state": "mystery",
+            "state_updated": 1.0,
+            "window": { "tmux_id": "@1" }
+        }))
+        .expect("unknown session state should still deserialize");
+
+        assert_eq!(session.state, SessionState::Unknown);
     }
 }

@@ -3,6 +3,7 @@ use log::{debug, error, info, warn};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::os::fd::AsRawFd;
@@ -43,6 +44,17 @@ impl AgentState {
             Self::Waiting => "\u{f075}",    // nf-fa-comment
             Self::Idle => "\u{f186}",       // nf-fa-moon_o
             Self::Unknown => "?",
+        }
+    }
+}
+
+impl From<state::SessionState> for AgentState {
+    fn from(value: state::SessionState) -> Self {
+        match value {
+            state::SessionState::Waiting => Self::Waiting,
+            state::SessionState::Responding => Self::Responding,
+            state::SessionState::Idle => Self::Idle,
+            state::SessionState::Unknown => Self::Unknown,
         }
     }
 }
@@ -89,9 +101,52 @@ pub enum DaemonMessage {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrackEventKind {
+    SessionStart,
+    SessionEnd,
+    PromptSubmit,
+    Stop,
+    Notification,
+}
+
+impl TrackEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session-start",
+            Self::SessionEnd => "session-end",
+            Self::PromptSubmit => "prompt-submit",
+            Self::Stop => "stop",
+            Self::Notification => "notification",
+        }
+    }
+}
+
+impl fmt::Display for TrackEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TrackEventKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "session-start" => Ok(Self::SessionStart),
+            "session-end" => Ok(Self::SessionEnd),
+            "prompt-submit" => Ok(Self::PromptSubmit),
+            "stop" => Ok(Self::Stop),
+            "notification" => Ok(Self::Notification),
+            _ => Err(format!("unknown track event: {value}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrackEvent {
-    pub event: String,
+    pub event: TrackEventKind,
     #[serde(default)]
     pub agent: Option<String>,
     pub session_id: String,
@@ -178,7 +233,7 @@ impl SessionCache {
                 key.clone(),
                 AgentSession {
                     agent: session.agent.clone(),
-                    state: AgentState::from_str(&session.state),
+                    state: session.state.into(),
                     cwd: session.cwd.clone(),
                     state_updated: session.state_updated,
                 },
@@ -210,7 +265,7 @@ impl SessionCache {
                 session_id: session.session_id.clone(),
                 agent: session.agent.clone(),
                 cwd: session.cwd.clone(),
-                state: AgentState::from_str(&session.state),
+                state: session.state.into(),
                 state_updated: session.state_updated,
                 window_id: key.clone(),
                 tmux_id: session.window.tmux_id.clone(),
@@ -1074,8 +1129,8 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
 
     if let Err(err) = state::with_locked_store(|store| {
         if agent == "codex" {
-            match event.event.as_str() {
-                "session-start" => {
+            match event.event {
+                TrackEventKind::SessionStart => {
                     let window = match (&event.tmux_id, focused_niri_id) {
                         (Some(tmux), niri) => state::WindowId {
                             tmux_id: Some(tmux.clone()),
@@ -1097,7 +1152,7 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                         },
                     );
                 }
-                "session-end" => {
+                TrackEventKind::SessionEnd => {
                     store.codex_bindings.remove(session_id);
                 }
                 _ => {}
@@ -1123,8 +1178,8 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
             ),
             (None, None) => {
                 // No window info - can only update existing sessions
-                match event.event.as_str() {
-                    "session-end" => {
+                match event.event {
+                    TrackEventKind::SessionEnd => {
                         let key = store
                             .sessions
                             .iter()
@@ -1134,30 +1189,35 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                             store.sessions.remove(&key);
                         }
                     }
-                    "prompt-submit" | "stop" | "notification" => {
+                    TrackEventKind::PromptSubmit
+                    | TrackEventKind::Stop
+                    | TrackEventKind::Notification => {
                         if let Some(session) =
                             state::find_by_session_id_mut(store, agent, session_id)
                         {
-                            match event.event.as_str() {
-                                "prompt-submit" => {
-                                    session.state = "responding".to_string();
+                            match event.event {
+                                TrackEventKind::PromptSubmit => {
+                                    session.state = state::SessionState::Responding;
                                     session.state_updated = state::now();
                                 }
-                                "stop" => {
+                                TrackEventKind::Stop => {
                                     let is_question = event
                                         .transcript_path
                                         .as_ref()
                                         .map(|p| ends_with_question(p))
                                         .unwrap_or(false);
-                                    session.state =
-                                        if is_question { "waiting" } else { "idle" }.to_string();
+                                    session.state = if is_question {
+                                        state::SessionState::Waiting
+                                    } else {
+                                        state::SessionState::Idle
+                                    };
                                     session.state_updated = state::now();
                                 }
-                                "notification"
+                                TrackEventKind::Notification
                                     if event.notification_type.as_deref()
                                         == Some("permission_prompt") =>
                                 {
-                                    session.state = "waiting".to_string();
+                                    session.state = state::SessionState::Waiting;
                                     session.state_updated = state::now();
                                 }
                                 _ => {}
@@ -1170,19 +1230,20 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
             }
         };
 
-        match event.event.as_str() {
-            "session-start" => {
+        match event.event {
+            TrackEventKind::SessionStart => {
+                remove_other_session_bindings(store, agent, session_id, &window_key);
                 let session = state::Session {
                     agent: agent.to_string(),
                     session_id: session_id.to_string(),
                     cwd: event.cwd.clone(),
-                    state: "idle".to_string(),
+                    state: state::SessionState::Idle,
                     state_updated: state::now(),
                     window: window_id,
                 };
                 store.sessions.insert(window_key, session);
             }
-            "session-end" => {
+            TrackEventKind::SessionEnd => {
                 let key = store
                     .sessions
                     .iter()
@@ -1192,49 +1253,50 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                     store.sessions.remove(&key);
                 }
             }
-            "prompt-submit" => {
+            TrackEventKind::PromptSubmit => {
                 if let Some(session) = state::find_by_session_id_mut(store, agent, session_id) {
-                    session.state = "responding".to_string();
+                    session.state = state::SessionState::Responding;
                     session.state_updated = state::now();
-                    // Update window IDs if we have new info
-                    if event.tmux_id.is_some() {
-                        session.window.tmux_id = event.tmux_id.clone();
-                    }
-                    if focused_niri_id.is_some() {
-                        session.window.niri_id = focused_niri_id.map(|n| n.to_string());
-                    }
+                    update_session_window_binding(
+                        session,
+                        event.tmux_id.as_deref(),
+                        focused_niri_id,
+                    );
                 } else {
                     let session = state::Session {
                         agent: agent.to_string(),
                         session_id: session_id.to_string(),
                         cwd: event.cwd.clone(),
-                        state: "responding".to_string(),
+                        state: state::SessionState::Responding,
                         state_updated: state::now(),
                         window: window_id,
                     };
                     store.sessions.insert(window_key, session);
                 }
             }
-            "stop" => {
+            TrackEventKind::Stop => {
                 if let Some(session) = state::find_by_session_id_mut(store, agent, session_id) {
                     let is_question = event
                         .transcript_path
                         .as_ref()
                         .map(|p| ends_with_question(p))
                         .unwrap_or(false);
-                    session.state = if is_question { "waiting" } else { "idle" }.to_string();
+                    session.state = if is_question {
+                        state::SessionState::Waiting
+                    } else {
+                        state::SessionState::Idle
+                    };
                     session.state_updated = state::now();
                 }
             }
-            "notification" => {
+            TrackEventKind::Notification => {
                 if event.notification_type.as_deref() == Some("permission_prompt")
                     && let Some(session) = state::find_by_session_id_mut(store, agent, session_id)
                 {
-                    session.state = "waiting".to_string();
+                    session.state = state::SessionState::Waiting;
                     session.state_updated = state::now();
                 }
             }
-            _ => {}
         }
 
         Ok(())
@@ -1243,6 +1305,54 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
             "Failed to persist track event {} for agent={} session={}: {}",
             event.event, agent, session_id, err
         );
+    }
+}
+
+fn remove_other_session_bindings(
+    store: &mut state::SessionStore,
+    agent: &str,
+    session_id: &str,
+    keep_window_key: &str,
+) {
+    store.sessions.retain(|window_key, session| {
+        window_key == keep_window_key || session.agent != agent || session.session_id != session_id
+    });
+}
+
+fn update_session_window_binding(
+    session: &mut state::Session,
+    tmux_id: Option<&str>,
+    niri_id: Option<u64>,
+) {
+    if let Some(tmux_id) = tmux_id {
+        match session.window.tmux_id.as_deref() {
+            Some(existing) if existing != tmux_id => {
+                debug!(
+                    "Ignoring tmux rebinding for session {}: keeping {} over {}",
+                    session.session_id, existing, tmux_id
+                );
+            }
+            None => {
+                session.window.tmux_id = Some(tmux_id.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(niri_id) = niri_id {
+        let niri_id = niri_id.to_string();
+        match session.window.niri_id.as_deref() {
+            Some(existing) if existing != niri_id => {
+                debug!(
+                    "Ignoring niri rebinding for session {}: keeping {} over {}",
+                    session.session_id, existing, niri_id
+                );
+            }
+            None => {
+                session.window.niri_id = Some(niri_id);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1371,6 +1481,133 @@ mod tests {
             acquire_daemon_instance(&paths).expect_err("active socket listener should be refused");
 
         assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn track_event_kind_round_trips_kebab_case() {
+        let kind: TrackEventKind =
+            serde_json::from_str("\"prompt-submit\"").expect("track event should deserialize");
+
+        assert_eq!(kind, TrackEventKind::PromptSubmit);
+        assert_eq!(
+            serde_json::to_string(&kind).expect("track event should serialize"),
+            "\"prompt-submit\""
+        );
+        assert_eq!(kind.to_string(), "prompt-submit");
+    }
+
+    #[test]
+    fn track_event_deserializes_typed_event_kind() {
+        let event: TrackEvent = serde_json::from_value(serde_json::json!({
+            "event": "notification",
+            "session_id": "session-1",
+            "notification_type": "permission_prompt"
+        }))
+        .expect("track event payload should deserialize");
+
+        assert_eq!(event.event, TrackEventKind::Notification);
+        assert_eq!(event.session_id, "session-1");
+        assert_eq!(
+            event.notification_type.as_deref(),
+            Some("permission_prompt")
+        );
+    }
+
+    #[test]
+    fn prompt_submit_preserves_existing_niri_binding() {
+        let mut session = state::Session {
+            agent: "claude".to_string(),
+            session_id: "session-1".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            state: state::SessionState::Idle,
+            state_updated: 1.0,
+            window: state::WindowId {
+                tmux_id: None,
+                niri_id: Some("122".to_string()),
+            },
+        };
+
+        update_session_window_binding(&mut session, None, Some(56));
+
+        assert_eq!(session.window.niri_id.as_deref(), Some("122"));
+    }
+
+    #[test]
+    fn prompt_submit_backfills_missing_niri_binding() {
+        let mut session = state::Session {
+            agent: "claude".to_string(),
+            session_id: "session-1".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            state: state::SessionState::Idle,
+            state_updated: 1.0,
+            window: state::WindowId {
+                tmux_id: None,
+                niri_id: None,
+            },
+        };
+
+        update_session_window_binding(&mut session, None, Some(56));
+
+        assert_eq!(session.window.niri_id.as_deref(), Some("56"));
+    }
+
+    #[test]
+    fn session_start_replaces_existing_binding_for_same_session() {
+        let mut store = state::SessionStore::default();
+        store.sessions.insert(
+            "122".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-1".to_string(),
+                cwd: Some("/tmp/old".to_string()),
+                state: state::SessionState::Idle,
+                state_updated: 1.0,
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("122".to_string()),
+                },
+            },
+        );
+        store.sessions.insert(
+            "219".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "other-session".to_string(),
+                cwd: Some("/tmp/other".to_string()),
+                state: state::SessionState::Idle,
+                state_updated: 1.0,
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("219".to_string()),
+                },
+            },
+        );
+
+        remove_other_session_bindings(&mut store, "claude", "session-1", "56");
+        store.sessions.insert(
+            "56".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-1".to_string(),
+                cwd: Some("/tmp/new".to_string()),
+                state: state::SessionState::Idle,
+                state_updated: 2.0,
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("56".to_string()),
+                },
+            },
+        );
+
+        assert!(!store.sessions.contains_key("122"));
+        assert_eq!(
+            store
+                .sessions
+                .get("56")
+                .map(|session| session.session_id.as_str()),
+            Some("session-1")
+        );
+        assert!(store.sessions.contains_key("219"));
     }
 
     #[test]

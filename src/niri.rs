@@ -176,24 +176,35 @@ fn notify_config_error(message: &str) {
 fn agent_sessions_from_store(store: &state::SessionStore) -> HashMap<u64, AgentSession> {
     let mut sessions = HashMap::new();
 
-    for (_, session) in store.sessions.iter() {
-        let window_id = match session.window.niri_id.as_ref() {
-            Some(id) => id.parse::<u64>().ok(),
-            None => continue,
-        };
+    for (window_key, session) in store.sessions.iter() {
+        let window_id = session_niri_window_id(window_key, session);
         let Some(window_id) = window_id else { continue };
 
         sessions.insert(
             window_id,
             AgentSession {
                 agent: session.agent.clone(),
-                state: AgentState::from_str(&session.state),
+                state: session.state.into(),
                 cwd: session.cwd.clone(),
                 state_updated: session.state_updated,
             },
         );
     }
     sessions
+}
+
+fn session_niri_window_id(window_key: &str, session: &state::Session) -> Option<u64> {
+    if session.window.tmux_id.is_none()
+        && let Ok(window_id) = window_key.parse::<u64>()
+    {
+        return Some(window_id);
+    }
+
+    session
+        .window
+        .niri_id
+        .as_ref()
+        .and_then(|id| id.parse::<u64>().ok())
 }
 
 fn codex_bindings_from_store(store: &state::SessionStore) -> HashMap<u64, String> {
@@ -2383,7 +2394,7 @@ dir = "~/code/wayvoice"
                 agent: "claude".to_string(),
                 session_id: "session-42".to_string(),
                 cwd: Some("/tmp/project".to_string()),
-                state: "idle".to_string(),
+                state: state::SessionState::Idle,
                 state_updated: 42.0,
                 window: state::WindowId {
                     niri_id: Some("42".to_string()),
@@ -2405,6 +2416,30 @@ dir = "~/code/wayvoice"
         let response = resp_rx.recv().expect("list response should be sent");
         assert_eq!(response.claude.len(), 1);
         assert_eq!(response.claude[0].session_id, "session-42");
+    }
+
+    #[test]
+    fn agent_sessions_from_store_prefers_niri_session_key_for_niri_only_sessions() {
+        let mut store = state::SessionStore::default();
+        store.sessions.insert(
+            "122".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-122".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: state::SessionState::Responding,
+                state_updated: 42.0,
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("56".to_string()),
+                },
+            },
+        );
+
+        let sessions = agent_sessions_from_store(&store);
+
+        assert!(sessions.contains_key(&122));
+        assert!(!sessions.contains_key(&56));
     }
 
     #[test]
@@ -2436,7 +2471,7 @@ dir = "~/code/wayvoice"
                 agent: "claude".to_string(),
                 session_id: "session-42".to_string(),
                 cwd: Some("/tmp/project".to_string()),
-                state: "responding".to_string(),
+                state: state::SessionState::Responding,
                 state_updated: 42.0,
                 window: state::WindowId {
                     niri_id: Some("42".to_string()),
