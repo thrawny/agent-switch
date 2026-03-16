@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::UNIX_EPOCH;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const CODEX_MAX_AGE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0; // 7 days
@@ -224,8 +225,7 @@ impl SessionCache {
         Self::default()
     }
 
-    pub fn replace_store(&mut self, store: SessionStore) {
-        self.store = store;
+    fn sync_agent_sessions_from_store(&mut self) {
         self.agent_sessions.clear();
 
         for (key, session) in self.store.sessions.iter() {
@@ -238,6 +238,18 @@ impl SessionCache {
                     state_updated: session.state_updated,
                 },
             );
+        }
+    }
+
+    pub fn replace_store(&mut self, mut store: SessionStore) {
+        refresh_transcript_derived_states(&mut store);
+        self.store = store;
+        self.sync_agent_sessions_from_store();
+    }
+
+    pub fn refresh_dynamic_agent_states(&mut self) {
+        if refresh_transcript_derived_states(&mut self.store) {
+            self.sync_agent_sessions_from_store();
         }
     }
 
@@ -256,7 +268,8 @@ impl SessionCache {
         self.codex_sessions = load_codex_sessions();
     }
 
-    pub fn build_list_response(&self) -> ListResponse {
+    pub fn build_list_response(&mut self) -> ListResponse {
+        self.refresh_dynamic_agent_states();
         let claude: Vec<ClaudeListEntry> = self
             .store
             .sessions
@@ -416,7 +429,7 @@ pub fn start_socket_listener(
                                     }
                                 } else {
                                     // Daemon busy or shutting down, read cache directly
-                                    let cache = cache.lock().unwrap();
+                                    let mut cache = cache.lock().unwrap();
                                     let response = cache.build_list_response();
                                     if let Ok(json) = serde_json::to_string(&response) {
                                         let _ = stream.write_all(json.as_bytes());
@@ -1092,7 +1105,7 @@ pub fn run_headless() {
                 cache.reload_agent_sessions();
             }
             DaemonMessage::List(resp_tx) => {
-                let cache = cache.lock().unwrap();
+                let mut cache = cache.lock().unwrap();
                 let response = cache.build_list_response();
                 let _ = resp_tx.send(response);
             }
@@ -1195,10 +1208,12 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                         if let Some(session) =
                             state::find_by_session_id_mut(store, agent, session_id)
                         {
+                            update_session_metadata(session, event);
                             match event.event {
                                 TrackEventKind::PromptSubmit => {
                                     session.state = state::SessionState::Responding;
                                     session.state_updated = state::now();
+                                    clear_waiting_reason(session);
                                 }
                                 TrackEventKind::Stop => {
                                     let is_question = event
@@ -1212,13 +1227,13 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                                         state::SessionState::Idle
                                     };
                                     session.state_updated = state::now();
+                                    clear_waiting_reason(session);
                                 }
                                 TrackEventKind::Notification
                                     if event.notification_type.as_deref()
                                         == Some("permission_prompt") =>
                                 {
-                                    session.state = state::SessionState::Waiting;
-                                    session.state_updated = state::now();
+                                    set_permission_prompt_waiting(session);
                                 }
                                 _ => {}
                             }
@@ -1239,6 +1254,8 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                     cwd: event.cwd.clone(),
                     state: state::SessionState::Idle,
                     state_updated: state::now(),
+                    waiting_reason: None,
+                    transcript_path: event.transcript_path.clone(),
                     window: window_id,
                 };
                 store.sessions.insert(window_key, session);
@@ -1255,8 +1272,10 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
             }
             TrackEventKind::PromptSubmit => {
                 if let Some(session) = state::find_by_session_id_mut(store, agent, session_id) {
+                    update_session_metadata(session, event);
                     session.state = state::SessionState::Responding;
                     session.state_updated = state::now();
+                    clear_waiting_reason(session);
                     update_session_window_binding(
                         session,
                         event.tmux_id.as_deref(),
@@ -1269,6 +1288,8 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                         cwd: event.cwd.clone(),
                         state: state::SessionState::Responding,
                         state_updated: state::now(),
+                        waiting_reason: None,
+                        transcript_path: event.transcript_path.clone(),
                         window: window_id,
                     };
                     store.sessions.insert(window_key, session);
@@ -1276,6 +1297,7 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
             }
             TrackEventKind::Stop => {
                 if let Some(session) = state::find_by_session_id_mut(store, agent, session_id) {
+                    update_session_metadata(session, event);
                     let is_question = event
                         .transcript_path
                         .as_ref()
@@ -1287,14 +1309,15 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
                         state::SessionState::Idle
                     };
                     session.state_updated = state::now();
+                    clear_waiting_reason(session);
                 }
             }
             TrackEventKind::Notification => {
                 if event.notification_type.as_deref() == Some("permission_prompt")
                     && let Some(session) = state::find_by_session_id_mut(store, agent, session_id)
                 {
-                    session.state = state::SessionState::Waiting;
-                    session.state_updated = state::now();
+                    update_session_metadata(session, event);
+                    set_permission_prompt_waiting(session);
                 }
             }
         }
@@ -1354,6 +1377,66 @@ fn update_session_window_binding(
             _ => {}
         }
     }
+}
+
+fn update_session_metadata(session: &mut state::Session, event: &TrackEvent) {
+    if let Some(cwd) = &event.cwd {
+        session.cwd = Some(cwd.clone());
+    }
+    if let Some(transcript_path) = &event.transcript_path {
+        session.transcript_path = Some(transcript_path.clone());
+    }
+}
+
+fn set_permission_prompt_waiting(session: &mut state::Session) {
+    session.state = state::SessionState::Waiting;
+    session.state_updated = state::now();
+    session.waiting_reason = Some(state::WaitingReason::PermissionPrompt);
+}
+
+fn clear_waiting_reason(session: &mut state::Session) {
+    session.waiting_reason = None;
+}
+
+fn transcript_modified_at(path: &str) -> Option<f64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs_f64())
+}
+
+fn maybe_clear_permission_prompt_waiting(session: &mut state::Session) -> bool {
+    if session.state != state::SessionState::Waiting
+        || session.waiting_reason != Some(state::WaitingReason::PermissionPrompt)
+    {
+        return false;
+    }
+
+    let Some(transcript_path) = session.transcript_path.as_deref() else {
+        return false;
+    };
+    let Some(modified_at) = transcript_modified_at(transcript_path) else {
+        return false;
+    };
+    if modified_at <= session.state_updated {
+        return false;
+    }
+
+    session.state = state::SessionState::Responding;
+    session.state_updated = modified_at;
+    session.waiting_reason = None;
+    true
+}
+
+pub fn refresh_transcript_derived_states(store: &mut state::SessionStore) -> bool {
+    let mut changed = false;
+    for session in store.sessions.values_mut() {
+        changed |= maybe_clear_permission_prompt_waiting(session);
+    }
+    changed
 }
 
 fn ends_with_question(transcript_path: &str) -> bool {
@@ -1444,6 +1527,13 @@ mod tests {
         }
     }
 
+    fn write_test_transcript(test_name: &str, contents: &str) -> String {
+        let dir = test_codex_root(test_name);
+        let path = dir.join("transcript.jsonl");
+        fs::write(&path, contents).expect("test transcript should be written");
+        path.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn daemon_instance_lock_rejects_second_holder() {
         let paths = test_runtime_paths("daemon-lock");
@@ -1521,6 +1611,8 @@ mod tests {
             cwd: Some("/tmp/project".to_string()),
             state: state::SessionState::Idle,
             state_updated: 1.0,
+            waiting_reason: None,
+            transcript_path: None,
             window: state::WindowId {
                 tmux_id: None,
                 niri_id: Some("122".to_string()),
@@ -1540,6 +1632,8 @@ mod tests {
             cwd: Some("/tmp/project".to_string()),
             state: state::SessionState::Idle,
             state_updated: 1.0,
+            waiting_reason: None,
+            transcript_path: None,
             window: state::WindowId {
                 tmux_id: None,
                 niri_id: None,
@@ -1562,6 +1656,8 @@ mod tests {
                 cwd: Some("/tmp/old".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 1.0,
+                waiting_reason: None,
+                transcript_path: None,
                 window: state::WindowId {
                     tmux_id: None,
                     niri_id: Some("122".to_string()),
@@ -1576,6 +1672,8 @@ mod tests {
                 cwd: Some("/tmp/other".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 1.0,
+                waiting_reason: None,
+                transcript_path: None,
                 window: state::WindowId {
                     tmux_id: None,
                     niri_id: Some("219".to_string()),
@@ -1592,6 +1690,8 @@ mod tests {
                 cwd: Some("/tmp/new".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 2.0,
+                waiting_reason: None,
+                transcript_path: None,
                 window: state::WindowId {
                     tmux_id: None,
                     niri_id: Some("56".to_string()),
@@ -1608,6 +1708,72 @@ mod tests {
             Some("session-1")
         );
         assert!(store.sessions.contains_key("219"));
+    }
+
+    #[test]
+    fn build_list_response_clears_permission_prompt_waiting_after_transcript_progress() {
+        let transcript_path = write_test_transcript("permission-prompt-progress", "{}\n");
+        let modified_at =
+            transcript_modified_at(&transcript_path).expect("transcript mtime should be available");
+        let mut cache = SessionCache::new();
+        cache.store.sessions.insert(
+            "148".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-148".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: state::SessionState::Waiting,
+                state_updated: modified_at - 1.0,
+                waiting_reason: Some(state::WaitingReason::PermissionPrompt),
+                transcript_path: Some(transcript_path),
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("148".to_string()),
+                },
+            },
+        );
+
+        let response = cache.build_list_response();
+        let session = cache
+            .store
+            .sessions
+            .get("148")
+            .expect("session should remain in cache");
+
+        assert_eq!(response.claude[0].state, AgentState::Responding);
+        assert_eq!(session.state, state::SessionState::Responding);
+        assert_eq!(session.waiting_reason, None);
+        assert!(session.state_updated >= modified_at);
+    }
+
+    #[test]
+    fn refresh_transcript_derived_states_keeps_question_waiting_without_permission_reason() {
+        let transcript_path = write_test_transcript("question-waiting-sticks", "{}\n");
+        let modified_at =
+            transcript_modified_at(&transcript_path).expect("transcript mtime should be available");
+        let mut store = state::SessionStore::default();
+        store.sessions.insert(
+            "148".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-148".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: state::SessionState::Waiting,
+                state_updated: modified_at - 1.0,
+                waiting_reason: None,
+                transcript_path: Some(transcript_path),
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("148".to_string()),
+                },
+            },
+        );
+
+        assert!(!refresh_transcript_derived_states(&mut store));
+        assert_eq!(
+            store.sessions.get("148").map(|session| session.state),
+            Some(state::SessionState::Waiting)
+        );
     }
 
     #[test]

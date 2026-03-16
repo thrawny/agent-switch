@@ -134,7 +134,8 @@ fn overlay_snapshot_from_cache(
     HashMap<u64, String>,
     HashMap<String, CodexSession>,
 ) {
-    let cache = cache.lock().unwrap();
+    let mut cache = cache.lock().unwrap();
+    cache.refresh_dynamic_agent_states();
     (
         agent_sessions_from_store(&cache.store),
         codex_bindings_from_store(&cache.store),
@@ -182,7 +183,7 @@ where
             Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
         }
         DaemonMessage::List(resp_tx) => {
-            let cache = cache.lock().unwrap();
+            let mut cache = cache.lock().unwrap();
             let response = cache.build_list_response();
             let _ = resp_tx.send(response);
             None
@@ -2332,6 +2333,8 @@ dir = "~/code/wayvoice"
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 42.0,
+                waiting_reason: None,
+                transcript_path: None,
                 window: state::WindowId {
                     niri_id: Some("42".to_string()),
                     tmux_id: None,
@@ -2365,6 +2368,8 @@ dir = "~/code/wayvoice"
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Responding,
                 state_updated: 42.0,
+                waiting_reason: None,
+                transcript_path: None,
                 window: state::WindowId {
                     tmux_id: None,
                     niri_id: Some("56".to_string()),
@@ -2409,6 +2414,8 @@ dir = "~/code/wayvoice"
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Responding,
                 state_updated: 42.0,
+                waiting_reason: None,
+                transcript_path: None,
                 window: state::WindowId {
                     niri_id: Some("42".to_string()),
                     tmux_id: None,

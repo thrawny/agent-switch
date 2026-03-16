@@ -28,6 +28,12 @@ pub enum SessionState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WaitingReason {
+    PermissionPrompt,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub agent: String,
@@ -36,6 +42,10 @@ pub struct Session {
     pub cwd: Option<String>,
     pub state: SessionState,
     pub state_updated: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub window: WindowId,
 }
 
@@ -592,6 +602,8 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 state: SessionState::Idle,
                 state_updated: now(),
+                waiting_reason: None,
+                transcript_path: None,
                 window: WindowId {
                     niri_id: None,
                     tmux_id: Some("@9".to_string()),
@@ -625,6 +637,8 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 state: SessionState::Idle,
                 state_updated: 1.0,
+                waiting_reason: None,
+                transcript_path: None,
                 window: WindowId {
                     niri_id: None,
                     tmux_id: Some("@1".to_string()),
@@ -659,6 +673,8 @@ mod tests {
                     cwd: None,
                     state: SessionState::Responding,
                     state_updated: 9.0,
+                    waiting_reason: None,
+                    transcript_path: None,
                     window: WindowId {
                         niri_id: None,
                         tmux_id: Some("@9".to_string()),

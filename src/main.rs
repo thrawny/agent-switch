@@ -82,6 +82,7 @@ fn main() {
         Command::List => {
             let store = match state::with_locked_store(|store| {
                 state::cleanup_stale(store);
+                daemon::refresh_transcript_derived_states(store);
                 Ok(store.clone())
             }) {
                 Ok(store) => store,
