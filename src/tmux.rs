@@ -1,4 +1,5 @@
 use crate::daemon::{self, CodexSession, ListResponse};
+use crate::projects;
 use crate::state;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -7,7 +8,6 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -220,115 +220,21 @@ fn list_tmux_windows() -> Vec<TmuxWindow> {
     windows
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ProjectsConfig {
-    #[serde(default)]
-    project: Vec<ProjectConfigEntry>,
-    #[serde(default)]
-    ignore: Vec<String>,
-    #[serde(default, alias = "codexAliases", alias = "codex_aliases")]
-    codex_aliases: Vec<String>,
-    #[serde(
-        default = "default_ignore_numeric_sessions",
-        alias = "ignoreNumericSessions",
-        alias = "ignore_numeric_sessions"
-    )]
-    ignore_numeric_sessions: bool,
+fn load_projects_config() -> projects::Config {
+    projects::load_config().unwrap_or_default()
 }
 
-impl Default for ProjectsConfig {
-    fn default() -> Self {
-        Self {
-            project: Vec::new(),
-            ignore: Vec::new(),
-            codex_aliases: Vec::new(),
-            ignore_numeric_sessions: default_ignore_numeric_sessions(),
-        }
-    }
+fn load_session_order(config: &projects::Config) -> Vec<String> {
+    projects::configured_project_names(config)
 }
 
-fn default_ignore_numeric_sessions() -> bool {
-    false
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ProjectConfigEntry {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default = "default_project_dir")]
-    dir: String,
-}
-
-fn default_project_dir() -> String {
-    "~/".to_string()
-}
-
-fn projects_config_path() -> PathBuf {
-    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home).join("projects.toml");
-    }
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".config")
-        .join("projects.toml")
-}
-
-fn project_name(entry: &ProjectConfigEntry) -> String {
-    if let Some(name) = entry.name.as_deref().map(str::trim)
-        && !name.is_empty()
-    {
-        return name.to_string();
-    }
-
-    Path::new(&entry.dir)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| entry.dir.clone())
-}
-
-fn is_numeric_name(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn parse_projects_config(content: &str) -> ProjectsConfig {
-    toml::from_str(content).unwrap_or_default()
-}
-
-fn load_projects_config() -> ProjectsConfig {
-    let path = projects_config_path();
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(_) => return ProjectsConfig::default(),
-    };
-
-    parse_projects_config(&content)
-}
-
-fn load_session_order(config: &ProjectsConfig) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut order = Vec::new();
-
-    for entry in &config.project {
-        let name = project_name(entry);
-        if seen.insert(name.clone()) {
-            order.push(name);
-        }
-    }
-
-    order
-}
-
-fn should_ignore_session(session_name: &str, config: &ProjectsConfig) -> bool {
-    config.ignore.iter().any(|name| name == session_name)
-        || (config.ignore_numeric_sessions && is_numeric_name(session_name))
-}
-
-fn filter_windows_by_config(windows: Vec<TmuxWindow>, config: &ProjectsConfig) -> Vec<TmuxWindow> {
+fn filter_windows_by_config(
+    windows: Vec<TmuxWindow>,
+    config: &projects::Config,
+) -> Vec<TmuxWindow> {
     windows
         .into_iter()
-        .filter(|window| !should_ignore_session(&window.session_name, config))
+        .filter(|window| !projects::should_ignore_name(&window.session_name, config))
         .collect()
 }
 
@@ -356,34 +262,6 @@ fn sorted_sessions(windows: &[TmuxWindow], order: &[String]) -> Vec<String> {
     sorted
 }
 
-fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
-    let mut aliases = vec!["codex".to_string()];
-    for alias in config_aliases {
-        let trimmed = alias.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if aliases
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(trimmed))
-        {
-            continue;
-        }
-        aliases.push(trimmed.to_string());
-    }
-    aliases
-}
-
-fn contains_alias_token(text: &str, aliases: &[String]) -> bool {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            aliases
-                .iter()
-                .any(|alias| token.eq_ignore_ascii_case(alias))
-        })
-}
-
 fn format_status(state: AgentState, agent: &str) -> String {
     format!("{}{} [{}]\x1b[0m", state.color(), agent, state.label())
 }
@@ -405,11 +283,11 @@ fn status_for_window(
         return Some(format_status(state, "codex"));
     }
     // Only check Codex for windows with codex name/alias in the title or command.
-    let has_codex_name = contains_alias_token(&window.window_name, codex_aliases);
+    let has_codex_name = projects::contains_alias_token(&window.window_name, codex_aliases);
     let has_codex_command = window
         .pane_command
         .as_ref()
-        .map(|c| contains_alias_token(c, codex_aliases))
+        .map(|c| projects::contains_alias_token(c, codex_aliases))
         .unwrap_or(false);
     if !has_codex_name && !has_codex_command {
         return None;
@@ -756,7 +634,7 @@ pub fn run() {
 
     let session_order = load_session_order(&config);
     let sessions = sorted_sessions(&windows, &session_order);
-    let codex_aliases = normalized_codex_aliases(&config.codex_aliases);
+    let codex_aliases = projects::normalized_codex_aliases(&config.codex_aliases);
 
     // Build lookup by tmux_id for agent status
     let status_by_tmux_id: HashMap<String, &state::Session> = store
@@ -944,7 +822,7 @@ mod tests {
 
     #[test]
     fn projects_toml_drives_tmux_order_and_filtering() {
-        let config: ProjectsConfig = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 ignore = ["web"]
 ignoreNumericSessions = true
@@ -978,7 +856,7 @@ dir = "~/code/the-company-private"
 
     #[test]
     fn numeric_tmux_sessions_are_kept_when_not_ignored() {
-        let config: ProjectsConfig = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 ignoreNumericSessions = false
 "#,
@@ -995,7 +873,7 @@ ignoreNumericSessions = false
 
     #[test]
     fn ignore_list_wins_even_for_prioritized_projects() {
-        let config: ProjectsConfig = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 ignore = ["company"]
 
@@ -1027,7 +905,7 @@ dir = "~/code/agent-switch"
 
     #[test]
     fn duplicate_project_names_are_deduplicated_in_order() {
-        let config: ProjectsConfig = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 [[project]]
 dir = "~/code/agent-switch"
@@ -1054,7 +932,7 @@ dir = "~/work/agent-switch"
 
     #[test]
     fn non_project_sessions_are_sorted_alphabetically() {
-        let config: ProjectsConfig = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 [[project]]
 name = "company"
@@ -1081,7 +959,7 @@ dir = "~/code/the-company-private"
 
     #[test]
     fn project_with_name_only_defaults_dir_to_home() {
-        let config: ProjectsConfig = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 [[project]]
 name = "scratch"
@@ -1092,12 +970,15 @@ name = "scratch"
         assert_eq!(config.project.len(), 1);
         assert_eq!(config.project[0].name.as_deref(), Some("scratch"));
         assert_eq!(config.project[0].dir, "~/");
-        assert_eq!(project_name(&config.project[0]), "scratch");
+        assert_eq!(
+            projects::project_workspace_name(&config.project[0]),
+            "scratch"
+        );
     }
 
     #[test]
     fn codex_aliases_parse_and_include_codex_default() {
-        let config: ProjectsConfig = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 codexAliases = ["cx", "cxy"]
 "#,
@@ -1105,7 +986,7 @@ codexAliases = ["cx", "cxy"]
         .expect("projects.toml should parse");
 
         assert_eq!(
-            normalized_codex_aliases(&config.codex_aliases),
+            projects::normalized_codex_aliases(&config.codex_aliases),
             vec!["codex", "cx", "cxy"]
         );
     }
@@ -1113,15 +994,15 @@ codexAliases = ["cx", "cxy"]
     #[test]
     fn alias_token_match_is_exact_by_token() {
         let aliases = vec!["codex".to_string(), "cx".to_string(), "cxy".to_string()];
-        assert!(contains_alias_token("cxy", &aliases));
-        assert!(contains_alias_token("run cx now", &aliases));
-        assert!(contains_alias_token("/home/me/bin/cx", &aliases));
-        assert!(!contains_alias_token("execute", &aliases));
+        assert!(projects::contains_alias_token("cxy", &aliases));
+        assert!(projects::contains_alias_token("run cx now", &aliases));
+        assert!(projects::contains_alias_token("/home/me/bin/cx", &aliases));
+        assert!(!projects::contains_alias_token("execute", &aliases));
     }
 
     #[test]
     fn invalid_projects_toml_falls_back_to_default_behavior() {
-        let config = parse_projects_config("ignoreNumericSessions = not-a-bool");
+        let config = projects::parse_config_or_default("ignoreNumericSessions = not-a-bool");
 
         let sessions = sorted_sessions(
             &filter_windows_by_config(vec![window("1", "@1"), window("web", "@2")], &config),

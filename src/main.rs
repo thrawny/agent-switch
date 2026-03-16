@@ -1,4 +1,5 @@
 mod daemon;
+mod projects;
 mod state;
 #[cfg(feature = "niri")]
 mod themes;

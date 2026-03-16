@@ -1,4 +1,5 @@
 use crate::daemon::{self, AgentSession, AgentState, CodexSession, DaemonMessage, SessionCache};
+use crate::projects;
 use crate::state;
 use crate::themes;
 use gtk4::prelude::*;
@@ -11,12 +12,10 @@ use niri_ipc::{
     Action, Event, Request, Response, Window, Workspace, WorkspaceReferenceArg, socket::Socket,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -43,79 +42,6 @@ enum NiriMessage {
     ReloadConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct Project {
-    #[allow(dead_code)]
-    #[serde(default)]
-    key: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default = "default_project_dir")]
-    dir: String,
-    #[serde(default)]
-    static_workspace: bool,
-    #[serde(default = "default_true", alias = "skip_first_column")]
-    skip_first_column: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_project_dir() -> String {
-    "~/".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    #[serde(default)]
-    project: Vec<Project>,
-    #[serde(default)]
-    ignore: Vec<String>,
-    #[serde(default, alias = "codexAliases", alias = "codex_aliases")]
-    codex_aliases: Vec<String>,
-    #[serde(
-        default = "default_ignore_unnamed_workspaces",
-        alias = "ignoreUnnamedWorkspaces",
-        alias = "ignore_unnamed",
-        alias = "ignore_unnamed_workspaces"
-    )]
-    ignore_unnamed_workspaces: bool,
-    #[serde(
-        default = "default_ignore_numeric_sessions",
-        alias = "ignoreNumericSessions",
-        alias = "ignore_numeric_sessions"
-    )]
-    ignore_numeric_sessions: bool,
-    #[serde(default = "default_theme")]
-    theme: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            project: Vec::new(),
-            ignore: Vec::new(),
-            codex_aliases: Vec::new(),
-            ignore_unnamed_workspaces: default_ignore_unnamed_workspaces(),
-            ignore_numeric_sessions: default_ignore_numeric_sessions(),
-            theme: default_theme(),
-        }
-    }
-}
-
-fn default_theme() -> String {
-    "molokai".to_string()
-}
-
-fn default_ignore_unnamed_workspaces() -> bool {
-    true
-}
-
-fn default_ignore_numeric_sessions() -> bool {
-    false
-}
-
 #[derive(Debug, Clone)]
 struct WorkspaceColumn {
     workspace_name: String,
@@ -131,7 +57,7 @@ struct WorkspaceColumn {
 }
 
 struct AppState {
-    config: Config,
+    config: projects::Config,
     theme: &'static themes::Theme,
     codex_aliases: Vec<String>,
     entries: Vec<WorkspaceColumn>,
@@ -144,32 +70,10 @@ struct AppState {
     last_config_error: Option<String>,
 }
 
-fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("projects.toml")
-}
-
-fn load_config() -> Result<Config, String> {
-    let path = config_path();
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Config::default());
-        }
-        Err(err) => {
-            return Err(format!("Failed to read {}: {}", path.display(), err));
-        }
-    };
-
-    toml::from_str::<Config>(&content)
-        .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))
-}
-
 fn notify_config_error(message: &str) {
     log::warn!("{}", message);
     let _ = Command::new("notify-send")
-        .args(["agent-switch: projects.toml error", message])
+        .args(["agent-switch: config.toml error", message])
         .status();
 }
 
@@ -295,33 +199,8 @@ where
     }
 }
 
-fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
-    let mut aliases = vec!["codex".to_string()];
-    for alias in config_aliases {
-        let trimmed = alias.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if aliases
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(trimmed))
-        {
-            continue;
-        }
-        aliases.push(trimmed.to_string());
-    }
-    aliases
-}
-
 fn window_title_matches_codex_aliases(title: &str, aliases: &[String]) -> bool {
-    title
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            aliases
-                .iter()
-                .any(|alias| !alias.is_empty() && token.eq_ignore_ascii_case(alias))
-        })
+    projects::contains_alias_token(title, aliases)
 }
 
 fn codex_state_for_entry(
@@ -400,53 +279,19 @@ fn simplify_label(title: &str, app_id: &str) -> String {
     }
 }
 
-fn project_workspace_name(project: &Project) -> String {
-    if let Some(name) = project.name.as_deref().map(str::trim)
-        && !name.is_empty()
-    {
-        return name.to_string();
-    }
-
-    let expanded_dir = shellexpand::tilde(&project.dir).to_string();
-    Path::new(&expanded_dir)
-        .file_name()
-        .and_then(|v| v.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| project.dir.clone())
-}
-
-fn is_numeric_name(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
-}
-
 fn should_skip_discovered_workspace(
     name_opt: Option<&str>,
     display_name: &str,
-    config: &Config,
+    config: &projects::Config,
     seen_workspaces: &std::collections::HashSet<String>,
 ) -> bool {
     (name_opt.is_none() && config.ignore_unnamed_workspaces)
-        || (config.ignore_numeric_sessions && is_numeric_name(display_name))
+        || (config.ignore_numeric_sessions && projects::is_numeric_name(display_name))
         || seen_workspaces.contains(display_name)
         || config.ignore.iter().any(|ignored| ignored == display_name)
 }
 
-fn configured_projects(config: &Config) -> Vec<&Project> {
-    let mut seen = std::collections::HashSet::new();
-    let mut projects = Vec::new();
-
-    for project in &config.project {
-        let name = project_workspace_name(project);
-        if seen.insert(name) {
-            projects.push(project);
-        }
-    }
-
-    projects
-}
-
-fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
+fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
     let workspaces = niri_workspaces();
@@ -533,12 +378,12 @@ fn get_workspace_columns(config: &Config) -> Vec<WorkspaceColumn> {
 
     let windows_refs: Vec<&Window> = windows.iter().collect();
 
-    for project in configured_projects(config) {
+    for project in projects::configured_projects(config) {
         if key_idx >= KEYS.len() {
             break;
         }
 
-        let project_name = project_workspace_name(project);
+        let project_name = projects::project_workspace_name(project);
         seen_workspaces.insert(project_name.clone());
         let workspace_key = KEYS[key_idx];
 
@@ -731,12 +576,15 @@ fn send_command(cmd: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn start_config_watcher(tx: mpsc::Sender<NiriMessage>) {
-    let config = config_path();
-    let config_dir = config.parent().map(|p| p.to_path_buf());
+    let watched_paths = projects::config_paths();
+    let watched_dirs: Vec<_> = watched_paths
+        .iter()
+        .filter_map(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .collect();
 
     thread::spawn(move || {
         let tx_clone = tx.clone();
-        let config_filename = config.file_name().map(|s| s.to_os_string());
+        let watched_paths = watched_paths.clone();
 
         let mut watcher = match RecommendedWatcher::new(
             move |res: Result<notify::Event, notify::Error>| {
@@ -744,7 +592,7 @@ fn start_config_watcher(tx: mpsc::Sender<NiriMessage>) {
                     let dominated_by_config = event
                         .paths
                         .iter()
-                        .any(|p| p.file_name() == config_filename.as_deref());
+                        .any(|path| watched_paths.iter().any(|entry| entry == path));
                     if dominated_by_config {
                         match event.kind {
                             notify::EventKind::Modify(_) | notify::EventKind::Create(_) => {
@@ -764,14 +612,16 @@ fn start_config_watcher(tx: mpsc::Sender<NiriMessage>) {
             }
         };
 
-        if let Some(dir) = config_dir {
+        for dir in watched_dirs {
+            let _ = std::fs::create_dir_all(&dir);
             if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
                 log::error!("Failed to watch config directory: {}", e);
                 return;
             }
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
-            }
+        }
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     });
 }
@@ -985,17 +835,17 @@ fn build_ui(
     window.set_anchor(Edge::Left, false);
     window.set_anchor(Edge::Right, false);
 
-    let (config, last_config_error) = match load_config() {
+    let (config, last_config_error) = match projects::load_config() {
         Ok(config) => (config, None),
         Err(err) => {
             notify_config_error(&err);
-            (Config::default(), Some(err))
+            (projects::Config::default(), Some(err))
         }
     };
     let theme = themes::get(&config.theme);
     let entries = get_workspace_columns(&config);
     let (agent_sessions, codex_bindings, codex_sessions) = overlay_snapshot_from_cache(&cache);
-    let codex_aliases = normalized_codex_aliases(&config.codex_aliases);
+    let codex_aliases = projects::normalized_codex_aliases(&config.codex_aliases);
 
     let state = Rc::new(RefCell::new(AppState {
         config,
@@ -1296,14 +1146,14 @@ fn build_ui(
                 }
                 NiriMessage::ReloadConfig => {
                     let mut state = state_for_poll.borrow_mut();
-                    let reloaded = match load_config() {
+                    let reloaded = match projects::load_config() {
                         Ok(config) => {
                             state.theme = themes::get(&config.theme);
                             apply_theme_css(&css_provider_for_poll, state.theme);
                             state.config = config;
                             state.entries = get_workspace_columns(&state.config);
                             state.codex_aliases =
-                                normalized_codex_aliases(&state.config.codex_aliases);
+                                projects::normalized_codex_aliases(&state.config.codex_aliases);
                             state.last_config_error = None;
                             true
                         }
@@ -1983,7 +1833,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     window.set_anchor(Edge::Left, false);
     window.set_anchor(Edge::Right, false);
 
-    let mut config = load_config().unwrap_or_default();
+    let mut config = projects::load_config().unwrap_or_default();
     if let Some(t) = theme_override {
         config.theme = t;
     }
@@ -2236,7 +2086,7 @@ mod tests {
 
     #[test]
     fn project_name_is_inferred_from_dir_when_missing() {
-        let project = Project {
+        let project = projects::Project {
             key: None,
             name: None,
             dir: "~/code/agent-switch".to_string(),
@@ -2244,12 +2094,12 @@ mod tests {
             skip_first_column: true,
         };
 
-        assert_eq!(project_workspace_name(&project), "agent-switch");
+        assert_eq!(projects::project_workspace_name(&project), "agent-switch");
     }
 
     #[test]
     fn unnamed_workspaces_are_ignored_by_default() {
-        let config: Config = toml::from_str("").expect("default config should parse");
+        let config: projects::Config = toml::from_str("").expect("default config should parse");
         let seen = HashSet::new();
 
         assert!(should_skip_discovered_workspace(
@@ -2261,7 +2111,7 @@ mod tests {
 
     #[test]
     fn ignore_numeric_sessions_hides_numeric_named_workspaces() {
-        let config: Config = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 ignoreUnnamedWorkspaces = false
 ignoreNumericSessions = true
@@ -2286,7 +2136,7 @@ ignoreNumericSessions = true
 
     #[test]
     fn ignore_list_and_seen_workspace_names_are_filtered() {
-        let config: Config = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 ignoreUnnamedWorkspaces = false
 ignore = ["web"]
@@ -2319,7 +2169,7 @@ ignore = ["web"]
 
     #[test]
     fn codex_aliases_are_normalized_and_matched_case_insensitively() {
-        let aliases = normalized_codex_aliases(&vec!["cx".to_string(), "CXY".to_string()]);
+        let aliases = projects::normalized_codex_aliases(&["cx".to_string(), "CXY".to_string()]);
         assert_eq!(aliases, vec!["codex", "cx", "CXY"]);
         assert!(window_title_matches_codex_aliases("codex", &aliases));
         assert!(window_title_matches_codex_aliases("CX", &aliases));
@@ -2357,7 +2207,7 @@ ignore = ["web"]
 
     #[test]
     fn configured_projects_are_deduplicated_in_order() {
-        let config: Config = toml::from_str(
+        let config: projects::Config = toml::from_str(
             r#"
 [[project]]
 dir = "~/code/agent-switch"
@@ -2377,9 +2227,9 @@ dir = "~/code/wayvoice"
         )
         .expect("config should parse");
 
-        let names: Vec<_> = configured_projects(&config)
+        let names: Vec<_> = projects::configured_projects(&config)
             .into_iter()
-            .map(project_workspace_name)
+            .map(projects::project_workspace_name)
             .collect();
 
         assert_eq!(names, vec!["agent-switch", "main", "wayvoice"]);

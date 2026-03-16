@@ -60,7 +60,7 @@ bind-key -n C-` display-popup -E -w 60% -h 60% "agent-switch tmux"
 
 ### Session order source
 
-tmux session ordering is read from `~/.config/projects.toml` using the `[[project]]` list order
+tmux session ordering is read from `~/.config/agent-switch/config.toml` using the `[[project]]` list order
 (the same file used by niri). If `name` is omitted, the project name is inferred from the
 last folder segment of `dir`.
 
@@ -104,7 +104,7 @@ Optional startup entry:
 spawn-at-startup "agent-switch" "serve" "--niri"
 ```
 
-### niri project config (`~/.config/projects.toml`)
+### niri project config (`~/.config/agent-switch/config.toml`)
 
 Example:
 
