@@ -34,6 +34,7 @@ const NIRI_OVERLAY_FALLBACK_HEIGHT: i32 = 520;
 const NIRI_OVERLAY_MARGIN: i32 = 80;
 const NIRI_OVERLAY_STEP_SCROLL: f64 = 64.0;
 const NIRI_OVERLAY_PAGE_SCROLL: f64 = 320.0;
+const WAITING_PRIORITY_WINDOW_SECS: f64 = 30.0 * 60.0;
 
 // Use DaemonMessage as base, add niri-specific ReloadConfig
 #[derive(Debug)]
@@ -1611,22 +1612,34 @@ fn sorted_agent_entries<'a>(
             codex_sessions,
             codex_aliases,
         );
-        let waiting_a = info_a
+        let updated_a = info_a.as_ref().and_then(|i| i.state_updated).unwrap_or(0.0);
+        let updated_b = info_b.as_ref().and_then(|i| i.state_updated).unwrap_or(0.0);
+        let rank_a = info_a
             .as_ref()
-            .is_some_and(|i| i.state == AgentState::Waiting);
-        let waiting_b = info_b
+            .map(|info| agent_sort_rank(info, updated_a))
+            .unwrap_or(0);
+        let rank_b = info_b
             .as_ref()
-            .is_some_and(|i| i.state == AgentState::Waiting);
-        waiting_b.cmp(&waiting_a).then_with(|| {
-            let dur_a = info_a.and_then(|i| i.state_updated).unwrap_or(0.0);
-            let dur_b = info_b.and_then(|i| i.state_updated).unwrap_or(0.0);
-            dur_b
-                .partial_cmp(&dur_a)
+            .map(|info| agent_sort_rank(info, updated_b))
+            .unwrap_or(0);
+
+        rank_b.cmp(&rank_a).then_with(|| {
+            updated_b
+                .partial_cmp(&updated_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     });
 
     result
+}
+
+fn agent_sort_rank(info: &AgentInfo, state_updated: f64) -> u8 {
+    match info.state {
+        AgentState::Waiting if state::now() - state_updated <= WAITING_PRIORITY_WINDOW_SECS => 3,
+        AgentState::Responding => 2,
+        AgentState::Waiting => 1,
+        _ => 0,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2082,7 +2095,27 @@ pub fn run_toggle_agents() -> glib::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    fn workspace_entry(
+        name: &str,
+        workspace_key: char,
+        column_key: char,
+        window_id: u64,
+    ) -> WorkspaceColumn {
+        WorkspaceColumn {
+            workspace_name: name.to_string(),
+            workspace_ref: WorkspaceReferenceArg::Name(name.to_string()),
+            workspace_key,
+            column_index: 2,
+            column_key,
+            app_label: "Claude Code".to_string(),
+            window_title: Some("Claude Code".to_string()),
+            dir: Some(format!("~/code/{name}")),
+            static_workspace: false,
+            window_id: Some(window_id),
+        }
+    }
 
     #[test]
     fn project_name_is_inferred_from_dir_when_missing() {
@@ -2233,6 +2266,59 @@ dir = "~/code/wayvoice"
             .collect();
 
         assert_eq!(names, vec!["agent-switch", "main", "wayvoice"]);
+    }
+
+    #[test]
+    fn sorted_agent_entries_demotes_stale_waiting_below_responding() {
+        let entries = vec![
+            workspace_entry("fresh-waiting", 'a', 'h', 1),
+            workspace_entry("responding", 'b', 'j', 2),
+            workspace_entry("stale-waiting", 'c', 'k', 3),
+        ];
+        let now = state::now();
+        let agent_sessions = HashMap::from([
+            (
+                1,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Waiting,
+                    cwd: Some("/tmp/fresh".to_string()),
+                    state_updated: now - 60.0,
+                },
+            ),
+            (
+                2,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Responding,
+                    cwd: Some("/tmp/responding".to_string()),
+                    state_updated: now - 120.0,
+                },
+            ),
+            (
+                3,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Waiting,
+                    cwd: Some("/tmp/stale".to_string()),
+                    state_updated: now - WAITING_PRIORITY_WINDOW_SECS - 1.0,
+                },
+            ),
+        ]);
+
+        let sorted = sorted_agent_entries(
+            &entries,
+            &agent_sessions,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+        let ids: Vec<_> = sorted
+            .into_iter()
+            .filter_map(|entry| entry.window_id)
+            .collect();
+
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]
