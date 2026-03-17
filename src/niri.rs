@@ -19,6 +19,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 const APP_ID: &str = "com.thrawny.agent-switch";
 const KEYS: [char; 12] = ['h', 'j', 'k', 'l', 'u', 'i', 'o', 'p', 'n', 'm', ',', '.'];
@@ -46,7 +47,10 @@ const WAITING_PRIORITY_WINDOW_SECS: f64 = 30.0 * 60.0;
 enum NiriMessage {
     Daemon(DaemonMessage),
     ReloadConfig,
-    WorkspaceColumns(Vec<WorkspaceColumn>),
+    WorkspaceColumns {
+        entries: Vec<WorkspaceColumn>,
+        agents_only: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +72,7 @@ struct AppState {
     theme: &'static themes::Theme,
     codex_aliases: Vec<String>,
     entries: Vec<WorkspaceColumn>,
+    agent_entries: Vec<WorkspaceColumn>,
     pending_key: Option<char>,
     agents_view: bool,
     focused_at_open: Option<u64>,
@@ -205,10 +210,29 @@ fn process_daemon_message(
     }
 }
 
-fn request_workspace_refresh(tx: mpsc::Sender<NiriMessage>, config: projects::Config) {
+fn request_workspace_refresh(
+    tx: mpsc::Sender<NiriMessage>,
+    config: projects::Config,
+    agents_only: bool,
+) {
     thread::spawn(move || {
-        let entries = get_workspace_columns(&config);
-        let _ = tx.send(NiriMessage::WorkspaceColumns(entries));
+        let refresh_start = Instant::now();
+        let entries = if agents_only {
+            get_agent_workspace_columns(&config)
+        } else {
+            get_workspace_columns(&config)
+        };
+        let elapsed = refresh_start.elapsed();
+        log::debug!(
+            "workspace refresh: {}ms agents_only={} entries={}",
+            elapsed.as_millis(),
+            agents_only,
+            entries.len(),
+        );
+        let _ = tx.send(NiriMessage::WorkspaceColumns {
+            entries,
+            agents_only,
+        });
     });
 }
 
@@ -366,7 +390,15 @@ fn should_skip_discovered_workspace(
         || config.ignore.iter().any(|ignored| ignored == display_name)
 }
 
-fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
+fn workspace_key_for_index(index: usize) -> char {
+    KEYS.get(index).copied().unwrap_or('\0')
+}
+
+fn get_workspace_columns_with_cap(
+    config: &projects::Config,
+    workspace_limit: Option<usize>,
+    allow_unkeyed_columns: bool,
+) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
     let workspaces = niri_workspaces();
@@ -408,10 +440,10 @@ fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
                     continue;
                 }
                 let key_offset = col_idx - min_col;
-                if key_offset >= KEYS.len() {
+                if key_offset >= KEYS.len() && !allow_unkeyed_columns {
                     continue;
                 }
-                let column_key = KEYS[key_offset];
+                let column_key = workspace_key_for_index(key_offset);
 
                 let first_window = col_windows.first();
                 let title = first_window.and_then(|w| w.title.as_deref()).unwrap_or("?");
@@ -441,7 +473,7 @@ fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
                 workspace_ref: workspace_ref.clone(),
                 workspace_key,
                 column_index: 2,
-                column_key: KEYS[0],
+                column_key: workspace_key_for_index(0),
                 app_label: "(empty)".to_string(),
                 window_title: None,
                 dir: dir.clone(),
@@ -454,13 +486,13 @@ fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
     let windows_refs: Vec<&Window> = windows.iter().collect();
 
     for project in projects::configured_projects(config) {
-        if key_idx >= KEYS.len() {
+        if workspace_limit.is_some_and(|limit| key_idx >= limit) {
             break;
         }
 
         let project_name = projects::project_workspace_name(project);
         seen_workspaces.insert(project_name.clone());
-        let workspace_key = KEYS[key_idx];
+        let workspace_key = workspace_key_for_index(key_idx);
 
         let ws_id = workspaces
             .iter()
@@ -485,7 +517,7 @@ fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
                 workspace_ref: WorkspaceReferenceArg::Name(project_name),
                 workspace_key,
                 column_index: 2,
-                column_key: KEYS[0],
+                column_key: workspace_key_for_index(0),
                 app_label: "(empty)".to_string(),
                 window_title: None,
                 dir: Some(project.dir.clone()),
@@ -525,11 +557,11 @@ fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
     remaining.sort_by_key(|(idx, _, _, _)| *idx);
 
     for (_, ws_id, display_name, workspace_ref) in remaining {
-        if key_idx >= KEYS.len() {
+        if workspace_limit.is_some_and(|limit| key_idx >= limit) {
             break;
         }
 
-        let workspace_key = KEYS[key_idx];
+        let workspace_key = workspace_key_for_index(key_idx);
 
         add_workspace_entries(
             &mut entries,
@@ -547,6 +579,14 @@ fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
     }
 
     entries
+}
+
+fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
+    get_workspace_columns_with_cap(config, Some(KEYS.len()), false)
+}
+
+fn get_agent_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
+    get_workspace_columns_with_cap(config, None, true)
 }
 
 fn focus_workspace(reference: WorkspaceReferenceArg) {
@@ -822,11 +862,11 @@ fn agent_selection_key_for_index(index: usize) -> Option<char> {
 }
 
 fn same_workspace_entry(a: &WorkspaceColumn, b: &WorkspaceColumn) -> bool {
-    a.workspace_key == b.workspace_key
-        && a.column_key == b.column_key
+    a.workspace_name == b.workspace_name
         && a.column_index == b.column_index
         && a.window_id == b.window_id
-        && a.workspace_name == b.workspace_name
+        && a.static_workspace == b.static_workspace
+        && a.dir == b.dir
 }
 
 fn workspace_entries_changed(current: &[WorkspaceColumn], updated: &[WorkspaceColumn]) -> bool {
@@ -980,6 +1020,7 @@ fn build_ui(
     };
     let theme = themes::get(&config.theme);
     let entries = get_workspace_columns(&config);
+    let agent_entries = get_agent_workspace_columns(&config);
     let (agent_sessions, codex_bindings, codex_sessions) = overlay_snapshot_from_cache(&cache);
     let codex_aliases = projects::normalized_codex_aliases(&config.codex_aliases);
 
@@ -988,6 +1029,7 @@ fn build_ui(
         theme,
         codex_aliases,
         entries,
+        agent_entries,
         pending_key: None,
         agents_view: false,
         focused_at_open: None,
@@ -1041,7 +1083,7 @@ fn build_ui(
         if state.agents_view {
             build_agents_list(
                 main_box,
-                &state.entries,
+                &state.agent_entries,
                 &state.agent_sessions,
                 &state.codex_bindings,
                 &state.codex_sessions,
@@ -1072,6 +1114,7 @@ fn build_ui(
     let main_box_clone = main_box.clone();
     let outer_box_clone = outer_box.clone();
     let scroller_clone = scroller.clone();
+    let tx_for_keys = tx.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
         let input_char = input_char_for_key(keyval);
@@ -1132,6 +1175,8 @@ fn build_ui(
             state.pending_key = None;
             rebuild_current_view(&main_box_clone, &state, false);
             let wide_agents_layout = uses_wide_agents_layout(&state);
+            let config = state.config.clone();
+            let agents_only = state.agents_view;
             drop(state);
             reset_overlay_scroll(&scroller_clone);
             update_overlay_size(
@@ -1142,13 +1187,15 @@ fn build_ui(
             );
             let state = state_clone.borrow();
             rebuild_current_view(&main_box_clone, &state, true);
+            drop(state);
+            request_workspace_refresh(tx_for_keys.clone(), config, agents_only);
             return glib::Propagation::Stop;
         }
 
         if key == "space" && state_clone.borrow().agents_view {
             let state = state_clone.borrow();
             if let Some(target) = find_smart_jump_target(
-                &state.entries,
+                &state.agent_entries,
                 &state.agent_sessions,
                 &state.codex_bindings,
                 &state.codex_sessions,
@@ -1170,7 +1217,7 @@ fn build_ui(
             if state_clone.borrow().agents_view {
                 let state = state_clone.borrow();
                 if let Some(target) = find_agent_entry_for_selection_key(
-                    &state.entries,
+                    &state.agent_entries,
                     &state.agent_sessions,
                     &state.codex_bindings,
                     &state.codex_sessions,
@@ -1281,8 +1328,11 @@ fn build_ui(
                         state.pending_key = None;
                         state.agents_view = false;
                     } else {
+                        let open_start = Instant::now();
+                        let snapshot_start = Instant::now();
                         let (agent_sessions, codex_bindings, codex_sessions) =
                             overlay_snapshot_from_cache(&cache_for_poll);
+                        let snapshot_elapsed = snapshot_start.elapsed();
 
                         let mut state = state_for_poll.borrow_mut();
                         state.agent_sessions = agent_sessions;
@@ -1292,24 +1342,40 @@ fn build_ui(
                         state.agents_view = is_agents;
                         state.focused_at_open = *focused_window_for_poll.lock().unwrap();
                         // First pass: natural label widths for size computation
+                        let first_rebuild_start = Instant::now();
                         rebuild_for_poll(&main_box_for_poll, &state, false);
+                        let first_rebuild_elapsed = first_rebuild_start.elapsed();
                         let wide_agents_layout = uses_wide_agents_layout(&state);
                         drop(state);
                         reset_overlay_scroll(&scroller_for_poll);
+                        let resize_start = Instant::now();
                         update_overlay_size(
                             &window_for_poll,
                             &scroller_for_poll,
                             &outer_box_for_poll,
                             wide_agents_layout,
                         );
+                        let resize_elapsed = resize_start.elapsed();
                         // Second pass: locked label widths
                         let state = state_for_poll.borrow();
+                        let second_rebuild_start = Instant::now();
                         rebuild_for_poll(&main_box_for_poll, &state, true);
+                        let second_rebuild_elapsed = second_rebuild_start.elapsed();
                         drop(state);
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
+                        let total_elapsed = open_start.elapsed();
+                        log::info!(
+                            "overlay open: {}ms agents_only={} snapshot={}ms rebuild1={}ms resize={}ms rebuild2={}ms",
+                            total_elapsed.as_millis(),
+                            is_agents,
+                            snapshot_elapsed.as_millis(),
+                            first_rebuild_elapsed.as_millis(),
+                            resize_elapsed.as_millis(),
+                            second_rebuild_elapsed.as_millis(),
+                        );
                         let config = state_for_poll.borrow().config.clone();
-                        request_workspace_refresh(tx_for_poll.clone(), config);
+                        request_workspace_refresh(tx_for_poll.clone(), config, is_agents);
                     }
                 }
                 NiriMessage::ReloadConfig => {
@@ -1350,15 +1416,33 @@ fn build_ui(
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                         reset_overlay_scroll(&scroller_for_poll);
                         drop(state);
-                        request_workspace_refresh(tx_for_poll.clone(), config);
+                        request_workspace_refresh(
+                            tx_for_poll.clone(),
+                            config,
+                            state_for_poll.borrow().agents_view,
+                        );
                     }
                 }
-                NiriMessage::WorkspaceColumns(entries) => {
+                NiriMessage::WorkspaceColumns {
+                    entries,
+                    agents_only,
+                } => {
                     let mut state = state_for_poll.borrow_mut();
+                    let current_entries = if agents_only {
+                        &state.agent_entries
+                    } else {
+                        &state.entries
+                    };
                     let needs_rebuild = window_for_poll.is_visible()
-                        && workspace_entries_changed(&state.entries, &entries);
-                    state.entries = entries;
+                        && state.agents_view == agents_only
+                        && workspace_entries_changed(current_entries, &entries);
+                    if agents_only {
+                        state.agent_entries = entries;
+                    } else {
+                        state.entries = entries;
+                    }
                     if needs_rebuild {
+                        let apply_start = Instant::now();
                         rebuild_for_poll(&main_box_for_poll, &state, false);
                         let wide_agents_layout = uses_wide_agents_layout(&state);
                         drop(state);
@@ -1370,6 +1454,17 @@ fn build_ui(
                         );
                         let state = state_for_poll.borrow();
                         rebuild_for_poll(&main_box_for_poll, &state, true);
+                        let elapsed = apply_start.elapsed();
+                        log::debug!(
+                            "workspace refresh apply: {}ms agents_only={} entries={}",
+                            elapsed.as_millis(),
+                            agents_only,
+                            if agents_only {
+                                state.agent_entries.len()
+                            } else {
+                                state.entries.len()
+                            },
+                        );
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::SessionsChanged) => {
@@ -2204,6 +2299,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     }
     let theme = themes::get(&config.theme);
     let entries = mock_workspace_columns();
+    let agent_entries = entries.clone();
     let agent_sessions = mock_agent_sessions(&entries, 0);
 
     let state = Rc::new(RefCell::new(AppState {
@@ -2211,6 +2307,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         theme,
         codex_aliases: vec![],
         entries,
+        agent_entries,
         pending_key: None,
         agents_view: false,
         focused_at_open: None,
@@ -2955,6 +3052,49 @@ dir = "~/code/wayvoice"
             .and_then(|entry| entry.window_id),
             Some(4)
         );
+    }
+
+    #[test]
+    fn sorted_agent_entries_include_overflow_workspaces_without_normal_keys() {
+        let entries = vec![
+            workspace_entry("agent-switch", 'a', 'h', 1),
+            workspace_entry("quotabar", '\0', '\0', 2),
+        ];
+        let now = state::now();
+        let agent_sessions = HashMap::from([
+            (
+                1,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Responding,
+                    cwd: Some("/tmp/agent-switch".to_string()),
+                    state_updated: now - 30.0,
+                },
+            ),
+            (
+                2,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Responding,
+                    cwd: Some("/tmp/quotabar".to_string()),
+                    state_updated: now - 60.0,
+                },
+            ),
+        ]);
+
+        let sorted = sorted_agent_entries(
+            &entries,
+            &agent_sessions,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+        let ids: Vec<_> = sorted
+            .into_iter()
+            .filter_map(|entry| entry.window_id)
+            .collect();
+
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]

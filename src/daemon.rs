@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const CODEX_MAX_AGE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0; // 7 days
@@ -1670,6 +1670,12 @@ fn maybe_clear_stale_question_waiting(session: &mut state::Session) -> bool {
     let Some(transcript_path) = session.transcript_path.as_deref() else {
         return false;
     };
+    let Some(modified_at) = transcript_modified_at(transcript_path) else {
+        return false;
+    };
+    if modified_at <= session.state_updated {
+        return false;
+    }
     if ends_with_question(transcript_path) {
         return false;
     }
@@ -1679,17 +1685,36 @@ fn maybe_clear_stale_question_waiting(session: &mut state::Session) -> bool {
 }
 
 pub fn refresh_transcript_derived_states(store: &mut state::SessionStore) -> bool {
+    let refresh_start = Instant::now();
     let mut changed = false;
+    let mut permission_candidates = 0usize;
+    let mut question_candidates = 0usize;
     for session in store.sessions.values_mut() {
+        if session.state == state::SessionState::Waiting {
+            match session.waiting_reason {
+                Some(state::WaitingReason::PermissionPrompt) => permission_candidates += 1,
+                None => question_candidates += 1,
+            }
+        }
         changed |= maybe_clear_permission_prompt_waiting(session);
         changed |= maybe_clear_stale_question_waiting(session);
     }
+    let elapsed = refresh_start.elapsed();
+    debug!(
+        "transcript refresh: {}ms sessions={} permission_candidates={} question_candidates={} changed={}",
+        elapsed.as_millis(),
+        store.sessions.len(),
+        permission_candidates,
+        question_candidates,
+        changed,
+    );
     changed
 }
 
 fn ends_with_question(transcript_path: &str) -> bool {
     use std::process::Command;
 
+    let check_start = Instant::now();
     let output = match Command::new("tail")
         .args(["-n", "120", transcript_path])
         .output()
@@ -1735,6 +1760,13 @@ fn ends_with_question(transcript_path: &str) -> bool {
             }
         }
     }
+
+    let elapsed = check_start.elapsed();
+    debug!(
+        "transcript question check: {}ms path={}",
+        elapsed.as_millis(),
+        transcript_path
+    );
 
     awaiting_user_response
 }
@@ -2224,6 +2256,56 @@ mod tests {
         assert_eq!(
             store.sessions.get("148").map(|session| session.state),
             Some(state::SessionState::Idle)
+        );
+    }
+
+    #[test]
+    fn refresh_transcript_derived_states_keeps_question_waiting_without_new_transcript_activity() {
+        let transcript_path = write_test_transcript(
+            "question-waiting-needs-new-activity",
+            &[
+                json_line(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "Done. Want me to commit both changes?" }
+                        ]
+                    }
+                })),
+                json_line(serde_json::json!({
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "/gc" }
+                        ]
+                    }
+                })),
+            ]
+            .join("\n"),
+        );
+        let modified_at = transcript_modified_at(&transcript_path).unwrap_or(0.0);
+        let mut store = state::SessionStore::default();
+        store.sessions.insert(
+            "148".to_string(),
+            state::Session {
+                agent: "claude".to_string(),
+                session_id: "session-148".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: state::SessionState::Waiting,
+                state_updated: modified_at + 5.0,
+                waiting_reason: None,
+                transcript_path: Some(transcript_path),
+                window: state::WindowId {
+                    tmux_id: None,
+                    niri_id: Some("148".to_string()),
+                },
+            },
+        );
+
+        assert!(!refresh_transcript_derived_states(&mut store));
+        assert_eq!(
+            store.sessions.get("148").map(|session| session.state),
+            Some(state::SessionState::Waiting)
         );
     }
 
