@@ -141,6 +141,7 @@ fn overlay_snapshot_from_cache(
 ) {
     let mut cache = cache.lock().unwrap();
     cache.refresh_dynamic_agent_states();
+    cache.refresh_dynamic_codex_states();
     (
         agent_sessions_from_store(&cache.store),
         codex_bindings_from_store(&cache.store),
@@ -3033,6 +3034,31 @@ dir = "~/code/wayvoice"
         assert_eq!(
             agent_sessions.get(&42).map(|session| session.state),
             Some(AgentState::Responding)
+        );
+    }
+
+    #[test]
+    fn overlay_snapshot_cools_stale_codex_responding_sessions() {
+        let cache = Arc::new(Mutex::new(SessionCache::new()));
+        let stale_at = state::now() - 60.0;
+        {
+            let mut cache = cache.lock().unwrap();
+            cache.codex_sessions.insert(
+                "session-1".to_string(),
+                CodexSession::new(
+                    "session-1".to_string(),
+                    "/tmp/project".to_string(),
+                    AgentState::Responding,
+                    stale_at,
+                ),
+            );
+        }
+
+        let (_, _, codex_sessions) = overlay_snapshot_from_cache(&cache);
+
+        assert_eq!(
+            codex_sessions.get("session-1").map(|session| session.state),
+            Some(AgentState::Unknown)
         );
     }
 }

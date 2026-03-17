@@ -1358,11 +1358,14 @@ pub fn run_headless() {
 fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, state_path: &Path) {
     let agent = event.agent.as_deref().unwrap_or("claude");
     let session_id = &event.session_id;
-    let focused_niri_id = event
+    let explicit_niri_id = event
         .niri_id
         .as_deref()
-        .and_then(|id| id.parse::<u64>().ok())
-        .or(focused_niri_id);
+        .and_then(|id| id.parse::<u64>().ok());
+    let focused_niri_id = explicit_niri_id.or(match event.event {
+        TrackEventKind::SessionStart => None,
+        _ => focused_niri_id,
+    });
 
     if let Err(err) = state::with_locked_store_at_path(state_path, |store| {
         if agent == "codex" {
@@ -2015,6 +2018,55 @@ mod tests {
             Some("session-1")
         );
         assert!(store.sessions.contains_key("219"));
+    }
+
+    #[test]
+    fn session_start_without_explicit_niri_id_does_not_bind_focused_window() {
+        let state_path = test_state_path("session-start-no-focused-fallback");
+        let session_id = "session-1";
+
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::SessionStart,
+                session_id: session_id.to_string(),
+                agent: Some("claude".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                transcript_path: None,
+                notification_type: None,
+                tmux_id: None,
+                niri_id: None,
+            },
+            Some(19),
+            &state_path,
+        );
+
+        let store =
+            state::load_from_path(&state_path).expect("state should load after session-start");
+        assert!(store.sessions.is_empty());
+
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::PromptSubmit,
+                session_id: session_id.to_string(),
+                agent: Some("claude".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                transcript_path: None,
+                notification_type: None,
+                tmux_id: None,
+                niri_id: Some("47".to_string()),
+            },
+            Some(19),
+            &state_path,
+        );
+
+        let store =
+            state::load_from_path(&state_path).expect("state should load after prompt-submit");
+        let session = store
+            .sessions
+            .get("47")
+            .expect("prompt-submit should backfill the actual niri window");
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.window.niri_id.as_deref(), Some("47"));
     }
 
     #[test]
