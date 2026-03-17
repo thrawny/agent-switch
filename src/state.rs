@@ -206,10 +206,6 @@ impl Drop for StateLock {
     }
 }
 
-pub fn load() -> Result<SessionStore> {
-    load_from_path(&state_file())
-}
-
 pub fn with_locked_store<T, F>(mutate: F) -> Result<T>
 where
     F: FnOnce(&mut SessionStore) -> Result<T>,
@@ -377,7 +373,7 @@ fn retain_window_binding(
     window.tmux_id.is_some() || window.niri_id.is_some()
 }
 
-fn with_locked_store_at_path<T, F>(path: &Path, mutate: F) -> Result<T>
+pub(crate) fn with_locked_store_at_path<T, F>(path: &Path, mutate: F) -> Result<T>
 where
     F: FnOnce(&mut SessionStore) -> Result<T>,
 {
@@ -388,7 +384,7 @@ where
     Ok(output)
 }
 
-fn load_from_path(path: &Path) -> Result<SessionStore> {
+pub(crate) fn load_from_path(path: &Path) -> Result<SessionStore> {
     match fs::read_to_string(path) {
         Ok(content) => serde_json::from_str(&content).map_err(|source| StateError::Parse {
             path: path.to_path_buf(),

@@ -1,7 +1,6 @@
 use crate::daemon;
-use serde::{Deserialize, Serialize};
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use serde::Deserialize;
+use std::io::{self, Read};
 use std::process::Command;
 use std::str::FromStr;
 
@@ -12,18 +11,6 @@ struct HookInput {
     cwd: Option<String>,
     transcript_path: Option<String>,
     notification_type: Option<String>,
-    niri_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct TrackMessage {
-    event: daemon::TrackEventKind,
-    session_id: String,
-    agent: Option<String>,
-    cwd: Option<String>,
-    transcript_path: Option<String>,
-    notification_type: Option<String>,
-    tmux_id: Option<String>,
     niri_id: Option<String>,
 }
 
@@ -98,7 +85,7 @@ pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
         }
     };
 
-    let msg = TrackMessage {
+    let msg = daemon::TrackEvent {
         event,
         session_id,
         agent: agent_override.map(str::to_string).or(hook.agent),
@@ -109,45 +96,10 @@ pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
         niri_id: hook.niri_id.or_else(get_niri_window_id),
     };
 
-    let json = match serde_json::to_string(&msg) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("Failed to serialize message: {}", e);
-            return false;
-        }
-    };
-
-    let mut stream = match UnixStream::connect(daemon::socket_path()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Daemon not running: {}", e);
-            return false;
-        }
-    };
-
-    let cmd = format!("track {}", json);
-    if let Err(e) = stream.write_all(cmd.as_bytes()) {
-        eprintln!("Failed to send command: {}", e);
-        return false;
-    }
-
-    let mut response = [0u8; 64];
-    match stream.read(&mut response) {
-        Ok(n) if n > 0 => {
-            let resp = String::from_utf8_lossy(&response[..n]);
-            if resp.trim() == "ok" {
-                true
-            } else {
-                eprintln!("Daemon error: {}", resp.trim());
-                false
-            }
-        }
-        Ok(_) => {
-            eprintln!("Empty response from daemon");
-            false
-        }
-        Err(e) => {
-            eprintln!("Failed to read response: {}", e);
+    match daemon::send_track_request(&msg) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("Failed to send track event to daemon: {}", err);
             false
         }
     }

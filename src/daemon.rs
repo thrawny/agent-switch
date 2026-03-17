@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const CODEX_MAX_AGE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0; // 7 days
 const CODEX_RESPONDING_GRACE_SECS: f64 = 30.0;
+const SOCKET_IO_TIMEOUT_SECS: u64 = 2;
+const SOCKET_MAX_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,7 +162,7 @@ impl std::str::FromStr for TrackEventKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackEvent {
     pub event: TrackEventKind,
     #[serde(default)]
@@ -176,6 +178,25 @@ pub struct TrackEvent {
     pub tmux_id: Option<String>,
     #[serde(default)]
     pub niri_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub(crate) enum SocketRequest {
+    Toggle,
+    ToggleAgents,
+    List,
+    Ping,
+    Track { event: TrackEvent },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub(crate) enum SocketResponse {
+    Ok,
+    Pong { pid: u32 },
+    List { response: ListResponse },
+    Error { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -269,7 +290,11 @@ impl SessionCache {
     }
 
     pub fn reload_agent_sessions(&mut self) {
-        let store = match state::load() {
+        self.reload_agent_sessions_from_path(&state::state_file());
+    }
+
+    fn reload_agent_sessions_from_path(&mut self, path: &Path) {
+        let store = match state::load_from_path(path) {
             Ok(store) => store,
             Err(err) => {
                 error!("Failed to load state: {}", err);
@@ -340,6 +365,121 @@ fn daemon_runtime_paths() -> DaemonRuntimePaths {
     }
 }
 
+fn socket_io_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(SOCKET_IO_TIMEOUT_SECS)
+}
+
+fn configure_socket_timeouts(stream: &UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(socket_io_timeout()))?;
+    stream.set_write_timeout(Some(socket_io_timeout()))
+}
+
+fn parse_socket_frame<T>(line: &str, context: &'static str) -> io::Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_str(line.trim_end()).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {context}: {err}"),
+        )
+    })
+}
+
+fn read_socket_frame<T>(stream: &mut UnixStream, context: &'static str) -> io::Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line)?;
+    if bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("empty {context} frame"),
+        ));
+    }
+    if bytes > SOCKET_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} frame exceeds {SOCKET_MAX_FRAME_BYTES} bytes"),
+        ));
+    }
+    parse_socket_frame(&line, context)
+}
+
+fn write_socket_frame<T>(
+    stream: &mut UnixStream,
+    value: &T,
+    context: &'static str,
+) -> io::Result<()>
+where
+    T: Serialize,
+{
+    serde_json::to_writer(&mut *stream, value).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("serialize {context}: {err}"),
+        )
+    })?;
+    stream.write_all(b"\n")
+}
+
+pub(crate) fn send_socket_request(request: &SocketRequest) -> io::Result<SocketResponse> {
+    send_socket_request_to_path(&socket_path(), request)
+}
+
+pub(crate) fn send_socket_request_to_path(
+    path: &Path,
+    request: &SocketRequest,
+) -> io::Result<SocketResponse> {
+    let mut stream = UnixStream::connect(path)?;
+    configure_socket_timeouts(&stream)?;
+    write_socket_frame(&mut stream, request, "request")?;
+    read_socket_frame(&mut stream, "response")
+}
+
+pub(crate) fn query_daemon_list() -> io::Result<ListResponse> {
+    match send_socket_request(&SocketRequest::List)? {
+        SocketResponse::List { response } => Ok(response),
+        SocketResponse::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected list response: {other:?}"),
+        )),
+    }
+}
+
+#[cfg_attr(not(feature = "niri"), allow(dead_code))]
+pub(crate) fn send_toggle_request(agents_only: bool) -> io::Result<()> {
+    let request = if agents_only {
+        SocketRequest::ToggleAgents
+    } else {
+        SocketRequest::Toggle
+    };
+    match send_socket_request(&request)? {
+        SocketResponse::Ok => Ok(()),
+        SocketResponse::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected toggle response: {other:?}"),
+        )),
+    }
+}
+
+pub(crate) fn send_track_request(event: &TrackEvent) -> io::Result<()> {
+    match send_socket_request(&SocketRequest::Track {
+        event: event.clone(),
+    })? {
+        SocketResponse::Ok => Ok(()),
+        SocketResponse::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected track response: {other:?}"),
+        )),
+    }
+}
+
 fn write_daemon_metadata(lock_file: &mut fs::File, socket_path: &Path) -> io::Result<()> {
     lock_file.set_len(0)?;
     lock_file.rewind()?;
@@ -407,78 +547,95 @@ fn acquire_daemon_instance(paths: &DaemonRuntimePaths) -> io::Result<DaemonInsta
     })
 }
 
-pub fn start_socket_listener(
+fn handle_socket_request(
+    request: SocketRequest,
+    tx: &mpsc::Sender<DaemonMessage>,
+    cache: &Arc<Mutex<SessionCache>>,
+) -> SocketResponse {
+    match request {
+        SocketRequest::Toggle => match tx.send(DaemonMessage::Toggle) {
+            Ok(()) => SocketResponse::Ok,
+            Err(err) => SocketResponse::Error {
+                message: format!("daemon not responding: {err}"),
+            },
+        },
+        SocketRequest::ToggleAgents => match tx.send(DaemonMessage::ToggleAgents) {
+            Ok(()) => SocketResponse::Ok,
+            Err(err) => SocketResponse::Error {
+                message: format!("daemon not responding: {err}"),
+            },
+        },
+        SocketRequest::Ping => SocketResponse::Pong {
+            pid: std::process::id(),
+        },
+        SocketRequest::List => {
+            let (resp_tx, resp_rx) = mpsc::channel();
+            if tx.send(DaemonMessage::List(resp_tx)).is_ok() {
+                match resp_rx.recv_timeout(socket_io_timeout()) {
+                    Ok(response) => SocketResponse::List { response },
+                    Err(_) => {
+                        let mut cache = cache.lock().unwrap();
+                        SocketResponse::List {
+                            response: cache.build_list_response(),
+                        }
+                    }
+                }
+            } else {
+                SocketResponse::Error {
+                    message: "daemon not responding".to_string(),
+                }
+            }
+        }
+        SocketRequest::Track { event } => {
+            info!(
+                "track {} agent={} session={} tmux={:?} niri={:?} cwd={:?}",
+                event.event,
+                event.agent.as_deref().unwrap_or("claude"),
+                event.session_id,
+                event.tmux_id,
+                event.niri_id,
+                event.cwd
+            );
+            match tx.send(DaemonMessage::Track(event)) {
+                Ok(()) => SocketResponse::Ok,
+                Err(err) => SocketResponse::Error {
+                    message: format!("daemon not responding: {err}"),
+                },
+            }
+        }
+    }
+}
+
+fn start_socket_listener_at_paths(
     tx: mpsc::Sender<DaemonMessage>,
     cache: Arc<Mutex<SessionCache>>,
+    paths: &DaemonRuntimePaths,
 ) -> io::Result<DaemonInstanceGuard> {
-    let paths = daemon_runtime_paths();
-    let guard = acquire_daemon_instance(&paths)?;
+    let guard = acquire_daemon_instance(paths)?;
     let listener = UnixListener::bind(&paths.socket_path)?;
 
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut stream) => {
-                    let mut buf = [0u8; 4096];
-                    if let Ok(count) = stream.read(&mut buf)
-                        && count > 0
+                    if let Err(err) = configure_socket_timeouts(&stream) {
+                        error!("Socket timeout setup failed: {}", err);
+                        continue;
+                    }
+
+                    let response = match read_socket_frame::<SocketRequest>(&mut stream, "request")
                     {
-                        let cmd = String::from_utf8_lossy(&buf[..count]);
-                        let cmd = cmd.trim();
-                        if cmd == "toggle" {
-                            debug!("toggle");
-                            let _ = tx.send(DaemonMessage::Toggle);
-                            let _ = stream.write_all(b"ok");
-                        } else if cmd == "toggle-agents" {
-                            debug!("toggle-agents");
-                            let _ = tx.send(DaemonMessage::ToggleAgents);
-                            let _ = stream.write_all(b"ok");
-                        } else if cmd == "list" {
-                            let (resp_tx, resp_rx) = mpsc::channel();
-                            if tx.send(DaemonMessage::List(resp_tx)).is_ok() {
-                                if let Ok(response) = resp_rx.recv() {
-                                    if let Ok(json) = serde_json::to_string(&response) {
-                                        let _ = stream.write_all(json.as_bytes());
-                                    } else {
-                                        let _ = stream.write_all(b"error: serialization failed");
-                                    }
-                                } else {
-                                    // Daemon busy or shutting down, read cache directly
-                                    let mut cache = cache.lock().unwrap();
-                                    let response = cache.build_list_response();
-                                    if let Ok(json) = serde_json::to_string(&response) {
-                                        let _ = stream.write_all(json.as_bytes());
-                                    } else {
-                                        let _ = stream.write_all(b"error: serialization failed");
-                                    }
-                                }
-                            } else {
-                                let _ = stream.write_all(b"error: daemon not responding");
+                        Ok(request) => handle_socket_request(request, &tx, &cache),
+                        Err(err) => {
+                            warn!("socket request error: {}", err);
+                            SocketResponse::Error {
+                                message: err.to_string(),
                             }
-                        } else if let Some(json) = cmd.strip_prefix("track ") {
-                            match serde_json::from_str::<TrackEvent>(json) {
-                                Ok(event) => {
-                                    info!(
-                                        "track {} agent={} session={} tmux={:?} niri={:?} cwd={:?}",
-                                        event.event,
-                                        event.agent.as_deref().unwrap_or("claude"),
-                                        event.session_id,
-                                        event.tmux_id,
-                                        event.niri_id,
-                                        event.cwd
-                                    );
-                                    let _ = tx.send(DaemonMessage::Track(event));
-                                    let _ = stream.write_all(b"ok");
-                                }
-                                Err(e) => {
-                                    warn!("track parse error: {}", e);
-                                    let _ = stream.write_all(format!("error: {}", e).as_bytes());
-                                }
-                            }
-                        } else {
-                            warn!("unknown command: {}", cmd);
-                            let _ = stream.write_all(b"unknown command");
                         }
+                    };
+
+                    if let Err(err) = write_socket_frame(&mut stream, &response, "response") {
+                        error!("Socket write error: {}", err);
                     }
                 }
                 Err(e) => {
@@ -489,6 +646,14 @@ pub fn start_socket_listener(
     });
 
     Ok(guard)
+}
+
+pub fn start_socket_listener(
+    tx: mpsc::Sender<DaemonMessage>,
+    cache: Arc<Mutex<SessionCache>>,
+) -> io::Result<DaemonInstanceGuard> {
+    let paths = daemon_runtime_paths();
+    start_socket_listener_at_paths(tx, cache, &paths)
 }
 
 pub fn start_sessions_watcher(tx: mpsc::Sender<DaemonMessage>) {
@@ -1190,7 +1355,7 @@ pub fn run_headless() {
     }
 }
 
-pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64>) {
+fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, state_path: &Path) {
     let agent = event.agent.as_deref().unwrap_or("claude");
     let session_id = &event.session_id;
     let focused_niri_id = event
@@ -1199,7 +1364,7 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
         .and_then(|id| id.parse::<u64>().ok())
         .or(focused_niri_id);
 
-    if let Err(err) = state::with_locked_store(|store| {
+    if let Err(err) = state::with_locked_store_at_path(state_path, |store| {
         if agent == "codex" {
             match event.event {
                 TrackEventKind::SessionStart => {
@@ -1388,6 +1553,10 @@ pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64
             event.event, agent, session_id, err
         );
     }
+}
+
+pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64>) {
+    handle_track_event_at_path(event, focused_niri_id, &state::state_file());
 }
 
 fn remove_other_session_bindings(
@@ -1610,6 +1779,59 @@ mod tests {
             socket_path: dir.join("agent-switch.sock"),
             lock_path: dir.join("agent-switch.lock"),
         }
+    }
+
+    fn test_state_path(test_name: &str) -> PathBuf {
+        test_codex_root(test_name)
+            .join("state")
+            .join("agent-switch")
+            .join("sessions.json")
+    }
+
+    fn spawn_test_socket_daemon(
+        test_name: &str,
+    ) -> (
+        DaemonRuntimePaths,
+        PathBuf,
+        mpsc::Sender<DaemonMessage>,
+        thread::JoinHandle<()>,
+        DaemonInstanceGuard,
+    ) {
+        let paths = test_runtime_paths(test_name);
+        let state_path = test_state_path(test_name);
+        let (tx, rx) = mpsc::channel();
+        let cache = Arc::new(Mutex::new(SessionCache::new()));
+        let guard = start_socket_listener_at_paths(tx.clone(), cache.clone(), &paths)
+            .expect("test socket listener should start");
+        let worker_state_path = state_path.clone();
+        let worker_cache = cache.clone();
+
+        let worker = thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    DaemonMessage::Track(event) => {
+                        handle_track_event_at_path(&event, None, &worker_state_path);
+                        let mut cache = worker_cache.lock().unwrap();
+                        cache.reload_agent_sessions_from_path(&worker_state_path);
+                    }
+                    DaemonMessage::List(resp_tx) => {
+                        let mut cache = worker_cache.lock().unwrap();
+                        let response = cache.build_list_response();
+                        let _ = resp_tx.send(response);
+                    }
+                    DaemonMessage::SessionsChanged => {
+                        let mut cache = worker_cache.lock().unwrap();
+                        cache.reload_agent_sessions_from_path(&worker_state_path);
+                    }
+                    DaemonMessage::Toggle
+                    | DaemonMessage::ToggleAgents
+                    | DaemonMessage::CodexChanged => {}
+                    DaemonMessage::Shutdown => break,
+                }
+            }
+        });
+
+        (paths, state_path, tx, worker, guard)
     }
 
     fn write_test_transcript(test_name: &str, contents: &str) -> String {
@@ -2163,5 +2385,85 @@ mod tests {
         let session = sessions.get("session-1").expect("session should be loaded");
 
         assert_eq!(session.state, AgentState::Waiting);
+    }
+
+    #[test]
+    fn socket_protocol_ping_returns_pid() {
+        let (paths, _state_path, tx, worker, guard) = spawn_test_socket_daemon("socket-ping");
+
+        let response = send_socket_request_to_path(&paths.socket_path, &SocketRequest::Ping)
+            .expect("ping should succeed");
+
+        assert!(matches!(
+            response,
+            SocketResponse::Pong { pid } if pid == std::process::id()
+        ));
+
+        let _ = tx.send(DaemonMessage::Shutdown);
+        drop(guard);
+        worker.join().expect("worker should exit cleanly");
+    }
+
+    #[test]
+    fn socket_protocol_handles_large_track_request_and_list_round_trip() {
+        let (paths, _state_path, tx, worker, guard) =
+            spawn_test_socket_daemon("socket-large-track");
+        let event = TrackEvent {
+            event: TrackEventKind::PromptSubmit,
+            agent: Some("claude".to_string()),
+            session_id: "session-large".to_string(),
+            cwd: Some(format!("/tmp/{}", "deep-project/".repeat(512))),
+            transcript_path: None,
+            notification_type: None,
+            tmux_id: Some("@999".to_string()),
+            niri_id: None,
+        };
+
+        let response = send_socket_request_to_path(
+            &paths.socket_path,
+            &SocketRequest::Track {
+                event: event.clone(),
+            },
+        )
+        .expect("large track request should succeed");
+        assert!(matches!(response, SocketResponse::Ok));
+
+        let response = send_socket_request_to_path(&paths.socket_path, &SocketRequest::List)
+            .expect("list request should succeed");
+        let SocketResponse::List { response } = response else {
+            panic!("expected list response");
+        };
+
+        assert!(
+            response
+                .claude
+                .iter()
+                .any(|entry| entry.session_id == event.session_id
+                    && entry.tmux_id.as_deref() == Some("@999")
+                    && entry.cwd.as_deref() == event.cwd.as_deref())
+        );
+
+        let _ = tx.send(DaemonMessage::Shutdown);
+        drop(guard);
+        worker.join().expect("worker should exit cleanly");
+    }
+
+    #[test]
+    fn socket_protocol_returns_structured_error_for_malformed_request() {
+        let (paths, _state_path, tx, worker, guard) = spawn_test_socket_daemon("socket-malformed");
+        let mut stream =
+            UnixStream::connect(&paths.socket_path).expect("test socket should accept connections");
+        configure_socket_timeouts(&stream).expect("socket timeouts should be configured");
+        stream
+            .write_all(b"{not-json}\n")
+            .expect("malformed request should be sent");
+
+        let response = read_socket_frame::<SocketResponse>(&mut stream, "response")
+            .expect("daemon should return a structured error");
+        assert!(matches!(response, SocketResponse::Error { .. }));
+
+        let _ = tx.send(DaemonMessage::Shutdown);
+        drop(guard);
+        worker.join().expect("worker should exit cleanly");
     }
 }

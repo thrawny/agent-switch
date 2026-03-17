@@ -6,7 +6,6 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -17,12 +16,7 @@ const KEYS: [char; 12] = ['h', 'j', 'k', 'l', 'u', 'i', 'o', 'p', 'n', 'm', ',',
 
 /// Query daemon for cached sessions (instant, includes Codex)
 fn query_daemon_sessions() -> Option<ListResponse> {
-    let socket = daemon::socket_path();
-    let mut stream = UnixStream::connect(&socket).ok()?;
-    stream.write_all(b"list").ok()?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
-    serde_json::from_str(&response).ok()
+    daemon::query_daemon_list().ok()
 }
 
 /// Get Codex session for a pane's current path

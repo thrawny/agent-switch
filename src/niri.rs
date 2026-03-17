@@ -14,8 +14,6 @@ use niri_ipc::{
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -630,12 +628,8 @@ fn switch_to_entry(entry: &WorkspaceColumn) {
     focus_column(entry.column_index);
 }
 
-fn send_command(cmd: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let path = daemon::socket_path();
-    let mut stream = UnixStream::connect(&path)?;
-    stream.write_all(cmd)?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+fn send_toggle_request(agents_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+    daemon::send_toggle_request(agents_only)?;
     Ok(())
 }
 
@@ -2384,7 +2378,7 @@ pub fn run_demo(theme_override: Option<&str>) -> glib::ExitCode {
 /// Legacy run function for backward compatibility (`niri --toggle` and standalone daemon)
 pub fn run(toggle: bool) -> glib::ExitCode {
     if toggle {
-        if let Err(e) = send_command(b"toggle") {
+        if let Err(e) = send_toggle_request(false) {
             log::error!("Failed to toggle: {} (is daemon running?)", e);
             std::process::exit(1);
         }
@@ -2396,7 +2390,7 @@ pub fn run(toggle: bool) -> glib::ExitCode {
 }
 
 pub fn run_toggle_agents() -> glib::ExitCode {
-    if let Err(e) = send_command(b"toggle-agents") {
+    if let Err(e) = send_toggle_request(true) {
         log::error!("Failed to toggle agents: {} (is daemon running?)", e);
         std::process::exit(1);
     }
