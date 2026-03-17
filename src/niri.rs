@@ -235,31 +235,38 @@ fn named_pi_title(title: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+fn title_duplicates_workspace(title: &str, workspace_name: &str) -> bool {
+    title.trim().eq_ignore_ascii_case(workspace_name.trim())
+}
+
 fn named_title_for_agent(entry: &WorkspaceColumn, agent: &str) -> Option<String> {
     let title = entry.window_title.as_deref()?;
-    match agent {
+    let title = match agent {
         "claude" => named_claude_title(title),
         "pi" => named_pi_title(title),
         _ => None,
-    }
+    }?;
+    (!title_duplicates_workspace(&title, &entry.workspace_name)).then_some(title)
 }
 
 fn agent_fallback_from_window_title(entry: &WorkspaceColumn) -> Option<AgentInfo> {
     let title = entry.window_title.as_deref()?;
     if let Some(title) = named_claude_title(title) {
+        let title = (!title_duplicates_workspace(&title, &entry.workspace_name)).then_some(title);
         return Some(AgentInfo {
             agent: "claude".to_string(),
             state: AgentState::Idle,
             state_updated: None,
-            title: Some(title),
+            title,
         });
     }
     if let Some(title) = named_pi_title(title) {
+        let title = (!title_duplicates_workspace(&title, &entry.workspace_name)).then_some(title);
         return Some(AgentInfo {
             agent: "pi".to_string(),
             state: AgentState::Idle,
             state_updated: None,
-            title: Some(title),
+            title,
         });
     }
     None
@@ -1747,6 +1754,7 @@ fn build_agents_list(
     let grid = Grid::new();
     grid.set_column_spacing(14);
     grid.set_row_spacing(6);
+    grid.set_halign(gtk4::Align::Start);
 
     for (row, entry) in agent_entries.iter().enumerate() {
         let row = row as i32;
@@ -1794,7 +1802,6 @@ fn build_agents_list(
                 let title_label = Label::new(Some(&title_text));
                 title_label.add_css_class("agent-title");
                 title_label.set_xalign(0.0);
-                title_label.set_hexpand(true);
                 title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
                 title_label.set_max_width_chars(40);
                 grid.attach(&title_label, 3, row, 1, 1);
@@ -2587,6 +2594,40 @@ ignore = ["web"]
 
         assert_eq!(info.agent, "claude");
         assert_eq!(info.title.as_deref(), Some("debug-helium-launch-issues"));
+    }
+
+    #[test]
+    fn agent_info_hides_redundant_title_matching_workspace_name() {
+        let entry =
+            workspace_entry_with_window("dotfiles", 'a', 'h', 292, "dotfiles", "✳ dotfiles");
+        let agent_sessions = HashMap::from([(
+            292,
+            AgentSession {
+                agent: "claude".to_string(),
+                state: AgentState::Responding,
+                cwd: Some("/tmp/dotfiles".to_string()),
+                state_updated: 42.0,
+            },
+        )]);
+
+        let info = agent_info_for_entry(
+            &entry,
+            &agent_sessions,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        )
+        .expect("tracked claude session should be detected");
+
+        assert_eq!(info.agent, "claude");
+        assert_eq!(info.title, None);
+        assert!(!agents_view_has_titles(
+            std::slice::from_ref(&entry),
+            &agent_sessions,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        ));
     }
 
     #[test]

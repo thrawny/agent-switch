@@ -308,8 +308,14 @@ impl SessionCache {
         self.codex_sessions = load_codex_sessions();
     }
 
+    pub fn refresh_dynamic_codex_states(&mut self) {
+        apply_codex_recent_activity_grace(&mut self.codex_sessions);
+        apply_codex_stale_timeout(&mut self.codex_sessions);
+    }
+
     pub fn build_list_response(&mut self) -> ListResponse {
         self.refresh_dynamic_agent_states();
+        self.refresh_dynamic_codex_states();
         let claude: Vec<ClaudeListEntry> = self
             .store
             .sessions
@@ -683,11 +689,6 @@ pub fn start_sessions_watcher(tx: mpsc::Sender<DaemonMessage>) {
                     } else if is_codex_file {
                         match event.kind {
                             notify::EventKind::Modify(_) | notify::EventKind::Create(_) => {
-                                debug!(
-                                    "codex file changed: {:?} ({:?})",
-                                    event.paths.first().and_then(|p| p.file_name()),
-                                    event.kind
-                                );
                                 let _ = tx_clone.send(DaemonMessage::CodexChanged);
                             }
                             _ => {}
@@ -752,7 +753,6 @@ pub fn start_codex_poller(tx: mpsc::Sender<DaemonMessage>) {
             }
 
             if changed {
-                debug!("codex poll: file size changed");
                 let _ = tx.send(DaemonMessage::CodexChanged);
             }
         }
@@ -2051,6 +2051,30 @@ mod tests {
         assert_eq!(session.state, state::SessionState::Responding);
         assert_eq!(session.waiting_reason, None);
         assert!(session.state_updated >= modified_at);
+    }
+
+    #[test]
+    fn build_list_response_cools_stale_codex_responding_sessions() {
+        let mut cache = SessionCache::new();
+        let stale_at = state::now() - (CODEX_RESPONDING_GRACE_SECS + 10.0);
+        cache.codex_sessions.insert(
+            "session-1".to_string(),
+            CodexSession::new(
+                "session-1".to_string(),
+                "/tmp/project".to_string(),
+                AgentState::Responding,
+                stale_at,
+            ),
+        );
+
+        let response = cache.build_list_response();
+        let session = cache
+            .codex_sessions
+            .get("session-1")
+            .expect("session should remain in cache");
+
+        assert_eq!(response.codex[0].state, AgentState::Unknown);
+        assert_eq!(session.state, AgentState::Unknown);
     }
 
     #[test]
