@@ -46,6 +46,7 @@ const WAITING_PRIORITY_WINDOW_SECS: f64 = 30.0 * 60.0;
 enum NiriMessage {
     Daemon(DaemonMessage),
     ReloadConfig,
+    WorkspaceColumns(Vec<WorkspaceColumn>),
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +203,13 @@ fn process_daemon_message(
             Some(NiriMessage::Daemon(DaemonMessage::CodexChanged))
         }
     }
+}
+
+fn request_workspace_refresh(tx: mpsc::Sender<NiriMessage>, config: projects::Config) {
+    thread::spawn(move || {
+        let entries = get_workspace_columns(&config);
+        let _ = tx.send(NiriMessage::WorkspaceColumns(entries));
+    });
 }
 
 fn window_title_matches_codex_aliases(title: &str, aliases: &[String]) -> bool {
@@ -821,6 +829,14 @@ fn same_workspace_entry(a: &WorkspaceColumn, b: &WorkspaceColumn) -> bool {
         && a.workspace_name == b.workspace_name
 }
 
+fn workspace_entries_changed(current: &[WorkspaceColumn], updated: &[WorkspaceColumn]) -> bool {
+    current.len() != updated.len()
+        || current
+            .iter()
+            .zip(updated.iter())
+            .any(|(left, right)| !same_workspace_entry(left, right))
+}
+
 fn update_overlay_size(
     window: &ApplicationWindow,
     scroller: &ScrolledWindow,
@@ -937,6 +953,7 @@ fn load_overlay_css(theme: &themes::Theme) -> gtk4::CssProvider {
 fn build_ui(
     app: &Application,
     rx: mpsc::Receiver<NiriMessage>,
+    tx: mpsc::Sender<NiriMessage>,
     focused_window: Arc<Mutex<Option<u64>>>,
     cache: Arc<Mutex<SessionCache>>,
 ) {
@@ -1248,6 +1265,7 @@ fn build_ui(
     let focused_window_for_poll = focused_window.clone();
     let cache_for_poll = cache.clone();
     let css_provider_for_poll = css_provider.clone();
+    let tx_for_poll = tx.clone();
 
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
         while let Ok(msg) = rx.try_recv() {
@@ -1267,7 +1285,6 @@ fn build_ui(
                             overlay_snapshot_from_cache(&cache_for_poll);
 
                         let mut state = state_for_poll.borrow_mut();
-                        state.entries = get_workspace_columns(&state.config);
                         state.agent_sessions = agent_sessions;
                         state.codex_bindings = codex_bindings;
                         state.codex_sessions = codex_sessions;
@@ -1291,6 +1308,8 @@ fn build_ui(
                         drop(state);
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
+                        let config = state_for_poll.borrow().config.clone();
+                        request_workspace_refresh(tx_for_poll.clone(), config);
                     }
                 }
                 NiriMessage::ReloadConfig => {
@@ -1300,7 +1319,6 @@ fn build_ui(
                             state.theme = themes::get(&config.theme);
                             apply_theme_css(&css_provider_for_poll, state.theme);
                             state.config = config;
-                            state.entries = get_workspace_columns(&state.config);
                             state.codex_aliases =
                                 projects::normalized_codex_aliases(&state.config.codex_aliases);
                             state.last_config_error = None;
@@ -1320,6 +1338,7 @@ fn build_ui(
                     if reloaded && window_for_poll.is_visible() {
                         rebuild_for_poll(&main_box_for_poll, &state, false);
                         let wide_agents_layout = uses_wide_agents_layout(&state);
+                        let config = state.config.clone();
                         drop(state);
                         update_overlay_size(
                             &window_for_poll,
@@ -1330,6 +1349,27 @@ fn build_ui(
                         let state = state_for_poll.borrow();
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                         reset_overlay_scroll(&scroller_for_poll);
+                        drop(state);
+                        request_workspace_refresh(tx_for_poll.clone(), config);
+                    }
+                }
+                NiriMessage::WorkspaceColumns(entries) => {
+                    let mut state = state_for_poll.borrow_mut();
+                    let needs_rebuild = window_for_poll.is_visible()
+                        && workspace_entries_changed(&state.entries, &entries);
+                    state.entries = entries;
+                    if needs_rebuild {
+                        rebuild_for_poll(&main_box_for_poll, &state, false);
+                        let wide_agents_layout = uses_wide_agents_layout(&state);
+                        drop(state);
+                        update_overlay_size(
+                            &window_for_poll,
+                            &scroller_for_poll,
+                            &outer_box_for_poll,
+                            wide_agents_layout,
+                        );
+                        let state = state_for_poll.borrow();
+                        rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
                 NiriMessage::Daemon(DaemonMessage::SessionsChanged) => {
@@ -2056,7 +2096,7 @@ pub fn run_with_daemon() -> glib::ExitCode {
             focused_clone.borrow_mut().take(),
             cache_clone.borrow_mut().take(),
         ) {
-            build_ui(app, rx, focused, cache);
+            build_ui(app, rx, niri_tx.clone(), focused, cache);
         }
     });
 
