@@ -810,6 +810,18 @@ fn selection_key_for_input(keyval: gtk4::gdk::Key) -> Option<char> {
     input_char_for_key(keyval).filter(|ch| KEYS.contains(ch))
 }
 
+fn agent_selection_key_for_index(index: usize) -> Option<char> {
+    KEYS.get(index).copied()
+}
+
+fn same_workspace_entry(a: &WorkspaceColumn, b: &WorkspaceColumn) -> bool {
+    a.workspace_key == b.workspace_key
+        && a.column_key == b.column_key
+        && a.column_index == b.column_index
+        && a.window_id == b.window_id
+        && a.workspace_name == b.workspace_name
+}
+
 fn update_overlay_size(
     window: &ApplicationWindow,
     scroller: &ScrolledWindow,
@@ -1139,6 +1151,28 @@ fn build_ui(
         }
 
         if let Some(key_char) = selection_key {
+            if state_clone.borrow().agents_view {
+                let state = state_clone.borrow();
+                if let Some(target) = find_agent_entry_for_selection_key(
+                    &state.entries,
+                    &state.agent_sessions,
+                    &state.codex_bindings,
+                    &state.codex_sessions,
+                    &state.codex_aliases,
+                    state.focused_at_open,
+                    key_char,
+                ) {
+                    let target = target.clone();
+                    drop(state);
+                    window_clone.set_visible(false);
+                    let mut state = state_clone.borrow_mut();
+                    state.agents_view = false;
+                    drop(state);
+                    switch_to_entry(&target);
+                }
+                return glib::Propagation::Stop;
+            }
+
             let mut state = state_clone.borrow_mut();
 
             if let Some(first_key) = state.pending_key {
@@ -1722,6 +1756,7 @@ fn build_agents_list(
 
     for (row, entry) in agent_entries.iter().enumerate() {
         let row = row as i32;
+        let selection_key = agent_selection_key_for_entry(entry, &agent_entries, focused_window_id);
 
         let is_current = entry.window_id == focused_window_id;
         let is_jump_target = entry.window_id.is_some() && entry.window_id == jump_target_id;
@@ -1737,7 +1772,9 @@ fn build_agents_list(
         marker_label.add_css_class("key");
         grid.attach(&marker_label, 0, row, 1, 1);
 
-        let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
+        let key_text = selection_key
+            .map(|key| format!("[{key}]"))
+            .unwrap_or_else(|| "   ".to_string());
         let key_label = Label::new(Some(&key_text));
         key_label.add_css_class("key");
         grid.attach(&key_label, 1, row, 1, 1);
@@ -1872,6 +1909,48 @@ fn agent_sort_rank(info: &AgentInfo, state_updated: f64) -> u8 {
         AgentState::Waiting => 1,
         _ => 0,
     }
+}
+
+fn agent_selection_key_for_entry(
+    entry: &WorkspaceColumn,
+    sorted_entries: &[&WorkspaceColumn],
+    focused_window_id: Option<u64>,
+) -> Option<char> {
+    let jump_target_id = sorted_entries
+        .iter()
+        .find(|candidate| candidate.window_id != focused_window_id)
+        .and_then(|candidate| candidate.window_id);
+
+    sorted_entries
+        .iter()
+        .filter(|candidate| {
+            candidate.window_id != focused_window_id && candidate.window_id != jump_target_id
+        })
+        .position(|candidate| same_workspace_entry(candidate, entry))
+        .and_then(agent_selection_key_for_index)
+}
+
+fn find_agent_entry_for_selection_key<'a>(
+    entries: &'a [WorkspaceColumn],
+    agent_sessions: &HashMap<u64, AgentSession>,
+    codex_bindings: &HashMap<u64, String>,
+    codex_sessions: &HashMap<String, CodexSession>,
+    codex_aliases: &[String],
+    focused_window_id: Option<u64>,
+    key: char,
+) -> Option<&'a WorkspaceColumn> {
+    let sorted = sorted_agent_entries(
+        entries,
+        agent_sessions,
+        codex_bindings,
+        codex_sessions,
+        codex_aliases,
+    );
+
+    sorted
+        .iter()
+        .copied()
+        .find(|entry| agent_selection_key_for_entry(entry, &sorted, focused_window_id) == Some(key))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2699,6 +2778,108 @@ dir = "~/code/wayvoice"
             .collect();
 
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn agent_selection_keys_skip_current_and_space_target() {
+        let entries = vec![
+            workspace_entry("current", 'a', 'h', 1),
+            workspace_entry("space-target", 'b', 'j', 2),
+            workspace_entry("first-direct", 'c', 'k', 3),
+            workspace_entry("second-direct", 'd', 'l', 4),
+        ];
+        let now = state::now();
+        let agent_sessions = HashMap::from([
+            (
+                1,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Responding,
+                    cwd: Some("/tmp/current".to_string()),
+                    state_updated: now - 30.0,
+                },
+            ),
+            (
+                2,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Responding,
+                    cwd: Some("/tmp/space-target".to_string()),
+                    state_updated: now - 60.0,
+                },
+            ),
+            (
+                3,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Responding,
+                    cwd: Some("/tmp/first-direct".to_string()),
+                    state_updated: now - 90.0,
+                },
+            ),
+            (
+                4,
+                AgentSession {
+                    agent: "claude".to_string(),
+                    state: AgentState::Responding,
+                    cwd: Some("/tmp/second-direct".to_string()),
+                    state_updated: now - 120.0,
+                },
+            ),
+        ]);
+        let sorted = sorted_agent_entries(
+            &entries,
+            &agent_sessions,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+
+        assert_eq!(
+            agent_selection_key_for_entry(sorted[0], &sorted, Some(1)),
+            None,
+            "the focused window is not directly selectable"
+        );
+        assert_eq!(
+            agent_selection_key_for_entry(sorted[1], &sorted, Some(1)),
+            None,
+            "space owns the smart-jump target"
+        );
+        assert_eq!(
+            agent_selection_key_for_entry(sorted[2], &sorted, Some(1)),
+            Some('h')
+        );
+        assert_eq!(
+            agent_selection_key_for_entry(sorted[3], &sorted, Some(1)),
+            Some('j')
+        );
+
+        assert_eq!(
+            find_agent_entry_for_selection_key(
+                &entries,
+                &agent_sessions,
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+                Some(1),
+                'h',
+            )
+            .and_then(|entry| entry.window_id),
+            Some(3)
+        );
+        assert_eq!(
+            find_agent_entry_for_selection_key(
+                &entries,
+                &agent_sessions,
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+                Some(1),
+                'j',
+            )
+            .and_then(|entry| entry.window_id),
+            Some(4)
+        );
     }
 
     #[test]
