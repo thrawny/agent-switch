@@ -272,17 +272,21 @@ pub fn find_by_session_id_mut<'a>(
 
 /// Remove stale sessions (windows that no longer exist)
 pub fn cleanup_stale(store: &mut SessionStore) {
-    let valid_tmux = get_valid_tmux_windows();
-    let valid_niri = get_valid_niri_windows();
+    let valid_tmux = store_uses_tmux_windows(store).then(get_valid_tmux_windows);
+    let valid_niri = store_uses_niri_windows(store).then(get_valid_niri_windows);
 
-    if let Err(err) = &valid_tmux {
+    if let Some(Err(err)) = &valid_tmux {
         warn!("Skipping tmux stale cleanup: {}", err);
     }
-    if let Err(err) = &valid_niri {
+    if let Some(Err(err)) = &valid_niri {
         warn!("Skipping niri stale cleanup: {}", err);
     }
 
-    cleanup_stale_with_window_sets(store, valid_tmux.as_ref().ok(), valid_niri.as_ref().ok());
+    cleanup_stale_with_window_sets(
+        store,
+        valid_tmux.as_ref().and_then(|result| result.as_ref().ok()),
+        valid_niri.as_ref().and_then(|result| result.as_ref().ok()),
+    );
 
     // Also remove sessions older than 24h
     let cutoff = now() - 86400.0;
@@ -292,6 +296,28 @@ pub fn cleanup_stale(store: &mut SessionStore) {
     store
         .codex_bindings
         .retain(|_, binding| binding.updated_at > cutoff);
+}
+
+fn store_uses_tmux_windows(store: &SessionStore) -> bool {
+    store
+        .sessions
+        .values()
+        .any(|session| session.window.tmux_id.is_some())
+        || store
+            .codex_bindings
+            .values()
+            .any(|binding| binding.window.tmux_id.is_some())
+}
+
+fn store_uses_niri_windows(store: &SessionStore) -> bool {
+    store
+        .sessions
+        .values()
+        .any(|session| session.window.niri_id.is_some())
+        || store
+            .codex_bindings
+            .values()
+            .any(|binding| binding.window.niri_id.is_some())
 }
 
 fn cleanup_stale_with_window_sets(
@@ -610,6 +636,84 @@ mod tests {
         cleanup_stale_with_window_sets(&mut store, Some(&HashSet::new()), Some(&HashSet::new()));
 
         assert!(store.sessions.is_empty());
+    }
+
+    #[test]
+    fn store_uses_tmux_windows_checks_sessions_and_bindings() {
+        let mut store = SessionStore::default();
+        assert!(!store_uses_tmux_windows(&store));
+
+        store.sessions.insert(
+            "@9".to_string(),
+            Session {
+                agent: "claude".to_string(),
+                session_id: "session-9".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: SessionState::Idle,
+                state_updated: 1.0,
+                waiting_reason: None,
+                transcript_path: None,
+                window: WindowId {
+                    niri_id: None,
+                    tmux_id: Some("@9".to_string()),
+                },
+            },
+        );
+        assert!(store_uses_tmux_windows(&store));
+
+        store.sessions.clear();
+        store.codex_bindings.insert(
+            "codex".to_string(),
+            CodexBinding {
+                session_id: "codex".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                updated_at: 1.0,
+                window: WindowId {
+                    niri_id: None,
+                    tmux_id: Some("@10".to_string()),
+                },
+            },
+        );
+        assert!(store_uses_tmux_windows(&store));
+    }
+
+    #[test]
+    fn store_uses_niri_windows_checks_sessions_and_bindings() {
+        let mut store = SessionStore::default();
+        assert!(!store_uses_niri_windows(&store));
+
+        store.sessions.insert(
+            "42".to_string(),
+            Session {
+                agent: "claude".to_string(),
+                session_id: "session-42".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                state: SessionState::Idle,
+                state_updated: 1.0,
+                waiting_reason: None,
+                transcript_path: None,
+                window: WindowId {
+                    niri_id: Some("42".to_string()),
+                    tmux_id: None,
+                },
+            },
+        );
+        assert!(store_uses_niri_windows(&store));
+
+        store.sessions.clear();
+        store.codex_bindings.insert(
+            "codex".to_string(),
+            CodexBinding {
+                session_id: "codex".to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                updated_at: 1.0,
+                window: WindowId {
+                    niri_id: Some("43".to_string()),
+                    tmux_id: None,
+                },
+            },
+        );
+        assert!(store_uses_niri_windows(&store));
     }
 
     #[test]

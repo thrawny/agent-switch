@@ -161,25 +161,22 @@ fn replace_cache_store(cache: &Arc<Mutex<SessionCache>>, store: state::SessionSt
     cache.replace_store(store);
 }
 
-fn process_daemon_message_with_cleanup<F>(
-    msg: DaemonMessage,
-    cache: &Arc<Mutex<SessionCache>>,
-    focused_window: &Arc<Mutex<Option<u64>>>,
-    cleanup: F,
-) -> Option<NiriMessage>
+fn refresh_cache_after_cleanup<F>(cache: &Arc<Mutex<SessionCache>>, cleanup: F) -> state::Result<()>
 where
     F: FnOnce() -> state::Result<state::SessionStore>,
 {
+    let store = cleanup()?;
+    replace_cache_store(cache, store);
+    Ok(())
+}
+
+fn process_daemon_message(
+    msg: DaemonMessage,
+    cache: &Arc<Mutex<SessionCache>>,
+    focused_window: &Arc<Mutex<Option<u64>>>,
+) -> Option<NiriMessage> {
     match msg {
-        DaemonMessage::Toggle | DaemonMessage::ToggleAgents => {
-            match cleanup() {
-                Ok(store) => replace_cache_store(cache, store),
-                Err(err) => {
-                    log::error!("Failed to update state during overlay toggle: {}", err);
-                }
-            }
-            Some(NiriMessage::Daemon(msg))
-        }
+        DaemonMessage::Toggle | DaemonMessage::ToggleAgents => Some(NiriMessage::Daemon(msg)),
         DaemonMessage::Shutdown => Some(NiriMessage::Daemon(msg)),
         DaemonMessage::Track(event) => {
             let focused_id = *focused_window.lock().unwrap();
@@ -1976,14 +1973,6 @@ fn find_smart_jump_target<'a>(
         .find(|e| e.window_id != focused_window_id)
 }
 
-fn process_daemon_message(
-    msg: DaemonMessage,
-    cache: &Arc<Mutex<SessionCache>>,
-    focused_window: &Arc<Mutex<Option<u64>>>,
-) -> Option<NiriMessage> {
-    process_daemon_message_with_cleanup(msg, cache, focused_window, load_clean_store_after_cleanup)
-}
-
 /// Run the niri daemon with GTK overlay (new `serve --niri` mode)
 pub fn run_with_daemon() -> glib::ExitCode {
     let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonMessage>();
@@ -1991,7 +1980,6 @@ pub fn run_with_daemon() -> glib::ExitCode {
     let cache = Arc::new(Mutex::new(SessionCache::new()));
     let focused_window: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
 
-    // Initial load
     {
         let mut cache = cache.lock().unwrap();
         cache.reload_agent_sessions();
@@ -2011,15 +1999,12 @@ pub fn run_with_daemon() -> glib::ExitCode {
         daemon::socket_path()
     );
 
-    // Start daemon threads (socket listener, file watchers)
     daemon::start_sessions_watcher(daemon_tx.clone());
     daemon::start_codex_poller(daemon_tx.clone());
 
-    // Start niri-specific threads
     start_config_watcher(niri_tx.clone());
     start_focus_tracker(focused_window.clone());
 
-    // Bridge daemon messages to niri message channel
     let niri_tx_clone = niri_tx.clone();
     let cache_clone = cache.clone();
     let focused_window_for_bridge = focused_window.clone();
@@ -2029,12 +2014,26 @@ pub fn run_with_daemon() -> glib::ExitCode {
                 Ok(msg) => msg,
                 Err(_) => break,
             };
+            let is_toggle = matches!(msg, DaemonMessage::Toggle | DaemonMessage::ToggleAgents);
 
             if let Some(niri_msg) =
                 process_daemon_message(msg, &cache_clone, &focused_window_for_bridge)
                 && niri_tx_clone.send(niri_msg).is_err()
             {
                 break;
+            }
+
+            if is_toggle {
+                if let Err(err) =
+                    refresh_cache_after_cleanup(&cache_clone, load_clean_store_after_cleanup)
+                {
+                    log::error!("Failed to refresh state after overlay toggle: {}", err);
+                } else if niri_tx_clone
+                    .send(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
+                    .is_err()
+                {
+                    break;
+                }
             }
         }
     });
@@ -2940,12 +2939,8 @@ dir = "~/code/wayvoice"
         let focused_window = Arc::new(Mutex::new(None));
         let (resp_tx, resp_rx) = mpsc::channel();
 
-        let forwarded = process_daemon_message_with_cleanup(
-            DaemonMessage::List(resp_tx),
-            &cache,
-            &focused_window,
-            || Ok(state::SessionStore::default()),
-        );
+        let forwarded =
+            process_daemon_message(DaemonMessage::List(resp_tx), &cache, &focused_window);
 
         assert!(forwarded.is_none());
         let response = resp_rx.recv().expect("list response should be sent");
@@ -2984,12 +2979,7 @@ dir = "~/code/wayvoice"
         let cache = Arc::new(Mutex::new(SessionCache::new()));
         let focused_window = Arc::new(Mutex::new(None));
 
-        let forwarded = process_daemon_message_with_cleanup(
-            DaemonMessage::Toggle,
-            &cache,
-            &focused_window,
-            || Ok(state::SessionStore::default()),
-        );
+        let forwarded = process_daemon_message(DaemonMessage::Toggle, &cache, &focused_window);
 
         assert!(matches!(
             forwarded,
@@ -2998,9 +2988,8 @@ dir = "~/code/wayvoice"
     }
 
     #[test]
-    fn process_daemon_message_refreshes_cache_before_toggle_reaches_gtk() {
+    fn refresh_cache_after_cleanup_updates_cache() {
         let cache = Arc::new(Mutex::new(SessionCache::new()));
-        let focused_window = Arc::new(Mutex::new(None));
         let mut refreshed_store = state::SessionStore::default();
         refreshed_store.sessions.insert(
             "42".to_string(),
@@ -3019,17 +3008,8 @@ dir = "~/code/wayvoice"
             },
         );
 
-        let forwarded = process_daemon_message_with_cleanup(
-            DaemonMessage::ToggleAgents,
-            &cache,
-            &focused_window,
-            || Ok(refreshed_store),
-        );
-
-        assert!(matches!(
-            forwarded,
-            Some(NiriMessage::Daemon(DaemonMessage::ToggleAgents))
-        ));
+        refresh_cache_after_cleanup(&cache, || Ok(refreshed_store))
+            .expect("cleanup refresh should succeed");
         let (agent_sessions, _, _) = overlay_snapshot_from_cache(&cache);
         assert_eq!(
             agent_sessions.get(&42).map(|session| session.state),
