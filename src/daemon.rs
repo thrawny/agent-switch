@@ -16,6 +16,7 @@ use std::time::UNIX_EPOCH;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const CODEX_MAX_AGE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0; // 7 days
+const CODEX_RESPONDING_GRACE_SECS: f64 = 30.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,15 +29,6 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "waiting" => Self::Waiting,
-            "responding" => Self::Responding,
-            "idle" => Self::Idle,
-            _ => Self::Unknown,
-        }
-    }
-
     /// Get display label for the state (used by niri GTK overlay)
     #[cfg_attr(not(feature = "niri"), allow(dead_code))]
     pub fn icon(&self) -> &'static str {
@@ -82,6 +74,29 @@ pub struct CodexSession {
     pub cwd: String,
     pub state: AgentState,
     pub state_updated: f64,
+    #[serde(skip_serializing)]
+    last_active_at: f64,
+    #[serde(skip_serializing)]
+    last_idle_at: Option<f64>,
+}
+
+impl CodexSession {
+    pub fn new(session_id: String, cwd: String, state: AgentState, state_updated: f64) -> Self {
+        let (last_active_at, last_idle_at) = match state {
+            AgentState::Responding => (state_updated, None),
+            AgentState::Idle => (0.0, Some(state_updated)),
+            AgentState::Waiting | AgentState::Unknown => (0.0, None),
+        };
+
+        Self {
+            session_id,
+            cwd,
+            state,
+            state_updated,
+            last_active_at,
+            last_idle_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -701,26 +716,31 @@ fn update_codex_session(
     codex: &mut HashMap<String, CodexSession>,
     session_id: &str,
     cwd: Option<&str>,
-    state: &str,
+    state: AgentState,
     state_updated: Option<f64>,
 ) {
-    let new_state = AgentState::from_str(state);
-    let entry = codex.entry(session_id.to_string()).or_insert(CodexSession {
-        session_id: session_id.to_string(),
-        cwd: String::new(),
-        state: new_state,
-        state_updated: 0.0,
-    });
+    let entry = codex
+        .entry(session_id.to_string())
+        .or_insert_with(|| CodexSession::new(session_id.to_string(), String::new(), state, 0.0));
 
     if entry.cwd.is_empty()
         && let Some(value) = cwd
     {
         entry.cwd = value.to_string();
     }
-    entry.state = new_state;
-    // Only update timestamp if we have one from the record
+    entry.state = state;
     if let Some(ts) = state_updated {
         entry.state_updated = ts;
+        match state {
+            AgentState::Responding => {
+                entry.last_active_at = entry.last_active_at.max(ts);
+                entry.last_idle_at = None;
+            }
+            AgentState::Idle => {
+                entry.last_idle_at = Some(ts);
+            }
+            AgentState::Waiting | AgentState::Unknown => {}
+        }
     }
 }
 
@@ -775,7 +795,7 @@ fn handle_codex_record(
                 .get("cwd")
                 .and_then(|v| v.as_str())
                 .or(file_cwd);
-            update_codex_session(codex, session_id, cwd, "idle", record_ts);
+            update_codex_session(codex, session_id, cwd, AgentState::Idle, record_ts);
         }
         "event_msg" => {
             let event_type = record
@@ -797,16 +817,27 @@ fn handle_codex_record(
             };
             match event_type {
                 "user_message" => {
-                    update_codex_session(codex, session_id, file_cwd, "responding", record_ts);
+                    update_codex_session(
+                        codex,
+                        session_id,
+                        file_cwd,
+                        AgentState::Responding,
+                        record_ts,
+                    );
                     update_last_message(last_message, session_id, "user", "", ts);
                 }
                 "agent_message" => {
-                    update_codex_session(codex, session_id, file_cwd, "idle", record_ts);
-                    update_last_message(last_message, session_id, "assistant", "", ts);
+                    update_codex_session(codex, session_id, file_cwd, AgentState::Idle, record_ts);
                 }
                 // Agent is actively thinking/reasoning
                 "agent_reasoning" => {
-                    update_codex_session(codex, session_id, file_cwd, "responding", record_ts);
+                    update_codex_session(
+                        codex,
+                        session_id,
+                        file_cwd,
+                        AgentState::Responding,
+                        record_ts,
+                    );
                 }
                 _ => {}
             }
@@ -836,7 +867,13 @@ fn handle_codex_record(
                 || item_type == "reasoning"
                 || item_type == "function_call_output"
             {
-                update_codex_session(codex, session_id, file_cwd, "responding", record_ts);
+                update_codex_session(
+                    codex,
+                    session_id,
+                    file_cwd,
+                    AgentState::Responding,
+                    record_ts,
+                );
             }
             // Capture assistant message text for "waiting" detection (ends with ?)
             if role == "assistant" && item_type == "message" {
@@ -936,8 +973,9 @@ fn load_codex_sessions_from_root(root: &Path) -> HashMap<String, CodexSession> {
         }
     }
 
-    apply_codex_stale_timeout(&mut codex);
     apply_codex_waiting(&mut codex, &last_message);
+    apply_codex_recent_activity_grace(&mut codex);
+    apply_codex_stale_timeout(&mut codex);
 
     let now = state::now();
     codex.retain(|_, entry| {
@@ -979,8 +1017,9 @@ fn parse_rfc3339_epoch(value: &str) -> Option<f64> {
 fn apply_codex_stale_timeout(codex: &mut HashMap<String, CodexSession>) {
     let now = state::now();
     for entry in codex.values_mut() {
-        // If "responding" but no updates for 10s, we don't know the actual state
-        if entry.state == AgentState::Responding && now - entry.state_updated > 10.0 {
+        if entry.state == AgentState::Responding
+            && now - entry.state_updated > CODEX_RESPONDING_GRACE_SECS
+        {
             entry.state = AgentState::Unknown;
         }
     }
@@ -999,6 +1038,26 @@ fn apply_codex_waiting(
             && message.text.trim_end().ends_with('?')
         {
             entry.state = AgentState::Waiting;
+            entry.state_updated = message.timestamp;
+        }
+    }
+}
+
+fn apply_codex_recent_activity_grace(codex: &mut HashMap<String, CodexSession>) {
+    let now = state::now();
+    for entry in codex.values_mut() {
+        let Some(idle_at) = entry.last_idle_at else {
+            continue;
+        };
+        if entry.state != AgentState::Idle || entry.last_active_at <= 0.0 {
+            continue;
+        }
+        if idle_at < entry.last_active_at {
+            continue;
+        }
+        if now - idle_at <= CODEX_RESPONDING_GRACE_SECS {
+            entry.state = AgentState::Responding;
+            entry.state_updated = idle_at;
         }
     }
 }
@@ -1919,12 +1978,12 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "session-123".to_string(),
-            CodexSession {
-                session_id: "session-123".to_string(),
-                cwd: "/Users/jonas/code/project".to_string(),
-                state: AgentState::Idle,
-                state_updated: 1.0,
-            },
+            CodexSession::new(
+                "session-123".to_string(),
+                "/Users/jonas/code/project".to_string(),
+                AgentState::Idle,
+                1.0,
+            ),
         );
 
         let matched = match_codex_by_dir("/Users/jonas/code/project/src", &entries)
@@ -1995,5 +2054,114 @@ mod tests {
         assert_eq!(parent.state, AgentState::Responding);
         assert!(parent.state_updated > child.state_updated);
         assert_eq!(child.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn load_codex_sessions_keeps_recent_completed_turn_responding() {
+        let root = test_codex_root("codex-responding-grace");
+        let day_dir = root.join("2026").join("03").join("17");
+        fs::create_dir_all(&day_dir).expect("test day dir should be created");
+
+        write_rollout(
+            &day_dir.join("rollout-grace.jsonl"),
+            &[
+                json_line(serde_json::json!({
+                    "timestamp": ts(4),
+                    "type": "session_meta",
+                    "payload": { "id": "session-1", "cwd": "/tmp/project" }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(3),
+                    "type": "response_item",
+                    "payload": { "session_id": "session-1", "type": "function_call" }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(1),
+                    "type": "event_msg",
+                    "payload": { "session_id": "session-1", "type": "agent_message" }
+                })),
+            ],
+        );
+
+        let sessions = load_codex_sessions_from_root(root.as_path());
+        let session = sessions.get("session-1").expect("session should be loaded");
+
+        assert_eq!(session.state, AgentState::Responding);
+    }
+
+    #[test]
+    fn load_codex_sessions_leaves_old_completed_turn_idle() {
+        let root = test_codex_root("codex-old-completed-turn");
+        let day_dir = root.join("2026").join("03").join("17");
+        fs::create_dir_all(&day_dir).expect("test day dir should be created");
+
+        write_rollout(
+            &day_dir.join("rollout-idle.jsonl"),
+            &[
+                json_line(serde_json::json!({
+                    "timestamp": ts(60),
+                    "type": "session_meta",
+                    "payload": { "id": "session-1", "cwd": "/tmp/project" }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(50),
+                    "type": "response_item",
+                    "payload": { "session_id": "session-1", "type": "function_call" }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(40),
+                    "type": "event_msg",
+                    "payload": { "session_id": "session-1", "type": "agent_message" }
+                })),
+            ],
+        );
+
+        let sessions = load_codex_sessions_from_root(root.as_path());
+        let session = sessions.get("session-1").expect("session should be loaded");
+
+        assert_eq!(session.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn load_codex_sessions_marks_recent_questions_waiting_immediately() {
+        let root = test_codex_root("codex-recent-question");
+        let day_dir = root.join("2026").join("03").join("17");
+        fs::create_dir_all(&day_dir).expect("test day dir should be created");
+
+        write_rollout(
+            &day_dir.join("rollout-waiting.jsonl"),
+            &[
+                json_line(serde_json::json!({
+                    "timestamp": ts(4),
+                    "type": "session_meta",
+                    "payload": { "id": "session-1", "cwd": "/tmp/project" }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(3),
+                    "type": "response_item",
+                    "payload": { "session_id": "session-1", "type": "function_call" }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(1),
+                    "type": "response_item",
+                    "payload": {
+                        "session_id": "session-1",
+                        "role": "assistant",
+                        "type": "message",
+                        "content": [{ "type": "text", "text": "Need approval?" }]
+                    }
+                })),
+                json_line(serde_json::json!({
+                    "timestamp": ts(1),
+                    "type": "event_msg",
+                    "payload": { "session_id": "session-1", "type": "agent_message" }
+                })),
+            ],
+        );
+
+        let sessions = load_codex_sessions_from_root(root.as_path());
+        let session = sessions.get("session-1").expect("session should be loaded");
+
+        assert_eq!(session.state, AgentState::Waiting);
     }
 }

@@ -653,12 +653,12 @@ pub fn run() {
             let mut by_session_id = HashMap::new();
 
             for entry in resp.codex {
-                let session = CodexSession {
-                    session_id: entry.session_id,
-                    cwd: entry.cwd,
-                    state: entry.state,
-                    state_updated: entry.state_updated,
-                };
+                let session = CodexSession::new(
+                    entry.session_id,
+                    entry.cwd,
+                    entry.state,
+                    entry.state_updated,
+                );
 
                 if let Some(tmux_id) = entry.tmux_id {
                     by_tmux_id.insert(tmux_id, session.clone());
