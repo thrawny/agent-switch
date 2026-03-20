@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const STALE_SESSION_MAX_AGE_SECS: f64 = 24.0 * 60.0 * 60.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowId {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,12 +60,22 @@ pub struct CodexBinding {
     pub window: WindowId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexSession {
+    pub session_id: String,
+    pub cwd: String,
+    pub state: SessionState,
+    pub state_updated: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionStore {
     #[serde(default)]
     pub sessions: HashMap<String, Session>,
     #[serde(default)]
     pub codex_bindings: HashMap<String, CodexBinding>,
+    #[serde(default)]
+    pub codex_sessions: HashMap<String, CodexSession>,
 }
 
 pub type Result<T> = std::result::Result<T, StateError>;
@@ -272,6 +284,8 @@ pub fn find_by_session_id_mut<'a>(
 
 /// Remove stale sessions (windows that no longer exist)
 pub fn cleanup_stale(store: &mut SessionStore) {
+    let previously_bound_codex_sessions: HashSet<String> =
+        store.codex_bindings.keys().cloned().collect();
     let valid_tmux = store_uses_tmux_windows(store).then(get_valid_tmux_windows);
     let valid_niri = store_uses_niri_windows(store).then(get_valid_niri_windows);
 
@@ -288,14 +302,14 @@ pub fn cleanup_stale(store: &mut SessionStore) {
         valid_niri.as_ref().and_then(|result| result.as_ref().ok()),
     );
 
-    // Also remove sessions older than 24h
-    let cutoff = now() - 86400.0;
+    let cutoff = now() - STALE_SESSION_MAX_AGE_SECS;
     store
         .sessions
         .retain(|_, session| session.state_updated > cutoff);
     store
         .codex_bindings
         .retain(|_, binding| binding.updated_at > cutoff);
+    cleanup_unbound_codex_sessions(store, &previously_bound_codex_sessions, cutoff);
 }
 
 fn store_uses_tmux_windows(store: &SessionStore) -> bool {
@@ -332,6 +346,23 @@ fn cleanup_stale_with_window_sets(
     store
         .codex_bindings
         .retain(|_, binding| retain_window_binding(&mut binding.window, &valid_tmux, &valid_niri));
+}
+
+fn cleanup_unbound_codex_sessions(
+    store: &mut SessionStore,
+    previously_bound_session_ids: &HashSet<String>,
+    cutoff: f64,
+) {
+    let still_bound_session_ids: HashSet<String> = store.codex_bindings.keys().cloned().collect();
+    store.codex_sessions.retain(|session_id, session| {
+        if still_bound_session_ids.contains(session_id) {
+            return true;
+        }
+        if previously_bound_session_ids.contains(session_id) {
+            return false;
+        }
+        session.state_updated > cutoff
+    });
 }
 
 fn get_valid_tmux_windows() -> std::result::Result<HashSet<String>, WindowProbeError> {
@@ -636,6 +667,72 @@ mod tests {
         cleanup_stale_with_window_sets(&mut store, Some(&HashSet::new()), Some(&HashSet::new()));
 
         assert!(store.sessions.is_empty());
+    }
+
+    #[test]
+    fn cleanup_unbound_codex_sessions_drops_session_that_lost_binding() {
+        let mut store = SessionStore::default();
+        store.codex_sessions.insert(
+            "codex-1".to_string(),
+            CodexSession {
+                session_id: "codex-1".to_string(),
+                cwd: "/tmp/project".to_string(),
+                state: SessionState::Idle,
+                state_updated: now(),
+            },
+        );
+
+        cleanup_unbound_codex_sessions(
+            &mut store,
+            &HashSet::from(["codex-1".to_string()]),
+            now() - STALE_SESSION_MAX_AGE_SECS,
+        );
+
+        assert!(store.codex_sessions.is_empty());
+    }
+
+    #[test]
+    fn cleanup_unbound_codex_sessions_keeps_recent_unbound_session() {
+        let mut store = SessionStore::default();
+        store.codex_sessions.insert(
+            "codex-1".to_string(),
+            CodexSession {
+                session_id: "codex-1".to_string(),
+                cwd: "/tmp/project".to_string(),
+                state: SessionState::Idle,
+                state_updated: now(),
+            },
+        );
+
+        cleanup_unbound_codex_sessions(
+            &mut store,
+            &HashSet::new(),
+            now() - STALE_SESSION_MAX_AGE_SECS,
+        );
+
+        assert!(store.codex_sessions.contains_key("codex-1"));
+    }
+
+    #[test]
+    fn cleanup_unbound_codex_sessions_drops_old_unbound_session() {
+        let mut store = SessionStore::default();
+        store.codex_sessions.insert(
+            "codex-1".to_string(),
+            CodexSession {
+                session_id: "codex-1".to_string(),
+                cwd: "/tmp/project".to_string(),
+                state: SessionState::Idle,
+                state_updated: now() - STALE_SESSION_MAX_AGE_SECS - 1.0,
+            },
+        );
+
+        cleanup_unbound_codex_sessions(
+            &mut store,
+            &HashSet::new(),
+            now() - STALE_SESSION_MAX_AGE_SECS,
+        );
+
+        assert!(store.codex_sessions.is_empty());
     }
 
     #[test]

@@ -98,7 +98,6 @@ struct PendingOverlayFrame {
 #[derive(Default)]
 struct UiDirtyState {
     sessions_dirty: AtomicBool,
-    codex_dirty: AtomicBool,
 }
 
 impl UiDirtyState {
@@ -106,21 +105,12 @@ impl UiDirtyState {
         self.sessions_dirty.store(true, Ordering::Release);
     }
 
-    fn mark_codex(&self) {
-        self.codex_dirty.store(true, Ordering::Release);
-    }
-
     fn take_sessions(&self) -> bool {
         self.sessions_dirty.swap(false, Ordering::AcqRel)
     }
 
-    fn take_codex(&self) -> bool {
-        self.codex_dirty.swap(false, Ordering::AcqRel)
-    }
-
     fn clear_all(&self) {
         self.sessions_dirty.store(false, Ordering::Release);
-        self.codex_dirty.store(false, Ordering::Release);
     }
 }
 
@@ -253,13 +243,6 @@ fn process_daemon_message(
             cache.reload_agent_sessions();
             Some(NiriMessage::Daemon {
                 msg: DaemonMessage::SessionsChanged,
-                enqueued_at: Instant::now(),
-            })
-        }
-        DaemonMessage::CodexChanged => {
-            daemon::reload_codex_sessions_shared(cache);
-            Some(NiriMessage::Daemon {
-                msg: DaemonMessage::CodexChanged,
                 enqueued_at: Instant::now(),
             })
         }
@@ -1693,33 +1676,6 @@ fn build_ui(
                     }
                 }
                 NiriMessage::Daemon {
-                    msg: DaemonMessage::CodexChanged,
-                    enqueued_at,
-                } => {
-                    log::debug!(
-                        "codex-changed queue delay: {}ms",
-                        enqueued_at.elapsed().as_millis(),
-                    );
-                    let mut state = state_for_poll.borrow_mut();
-                    state.codex_sessions = {
-                        let cache = cache_for_poll.lock().unwrap();
-                        cache.codex_sessions.clone()
-                    };
-                    if window_for_poll.is_visible() {
-                        rebuild_for_poll(&main_box_for_poll, &state, false);
-                        let wide_agents_layout = uses_wide_agents_layout(&state);
-                        drop(state);
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
-                            wide_agents_layout,
-                        );
-                        let state = state_for_poll.borrow();
-                        rebuild_for_poll(&main_box_for_poll, &state, true);
-                    }
-                }
-                NiriMessage::Daemon {
                     msg: DaemonMessage::Track(_),
                     ..
                 }
@@ -1739,39 +1695,21 @@ fn build_ui(
 
         if window_for_poll.is_visible() {
             let sessions_dirty = dirty_state_for_poll.take_sessions();
-            let codex_dirty = dirty_state_for_poll.take_codex();
-            if sessions_dirty || codex_dirty {
+            if sessions_dirty {
                 let refresh_start = Instant::now();
                 let mut state = state_for_poll.borrow_mut();
 
-                if sessions_dirty {
-                    let snapshot_start = Instant::now();
-                    let (agent_sessions, codex_bindings, codex_sessions) =
-                        overlay_snapshot_from_cache(&cache_for_poll);
-                    let snapshot_elapsed = snapshot_start.elapsed();
-                    state.agent_sessions = agent_sessions;
-                    state.codex_bindings = codex_bindings;
-                    if codex_dirty {
-                        state.codex_sessions = codex_sessions;
-                    }
-                    log::debug!(
-                        "dirty refresh snapshot: {}ms sessions_dirty={} codex_dirty={}",
-                        snapshot_elapsed.as_millis(),
-                        sessions_dirty,
-                        codex_dirty,
-                    );
-                } else if codex_dirty {
-                    let codex_refresh_start = Instant::now();
-                    state.codex_sessions = {
-                        let mut cache = cache_for_poll.lock().unwrap();
-                        cache.refresh_dynamic_codex_states();
-                        cache.codex_sessions.clone()
-                    };
-                    log::debug!(
-                        "dirty refresh codex clone: {}ms codex_dirty=true",
-                        codex_refresh_start.elapsed().as_millis(),
-                    );
-                }
+                let snapshot_start = Instant::now();
+                let (agent_sessions, codex_bindings, codex_sessions) =
+                    overlay_snapshot_from_cache(&cache_for_poll);
+                let snapshot_elapsed = snapshot_start.elapsed();
+                state.agent_sessions = agent_sessions;
+                state.codex_bindings = codex_bindings;
+                state.codex_sessions = codex_sessions;
+                log::debug!(
+                    "dirty refresh snapshot: {}ms sessions_dirty=true",
+                    snapshot_elapsed.as_millis(),
+                );
 
                 rebuild_for_poll(&main_box_for_poll, &state, false);
                 let wide_agents_layout = uses_wide_agents_layout(&state);
@@ -1785,10 +1723,8 @@ fn build_ui(
                 let state = state_for_poll.borrow();
                 rebuild_for_poll(&main_box_for_poll, &state, true);
                 log::debug!(
-                    "dirty refresh apply: {}ms sessions_dirty={} codex_dirty={}",
+                    "dirty refresh apply: {}ms sessions_dirty=true",
                     refresh_start.elapsed().as_millis(),
-                    sessions_dirty,
-                    codex_dirty,
                 );
             }
         }
@@ -2397,7 +2333,6 @@ pub fn run_with_daemon() -> glib::ExitCode {
         let mut cache = cache.lock().unwrap();
         cache.reload_agent_sessions();
     }
-    daemon::reload_codex_sessions_shared(&cache);
 
     let _daemon_instance = match daemon::start_socket_listener(daemon_tx.clone(), cache.clone()) {
         Ok(guard) => guard,
@@ -2413,7 +2348,6 @@ pub fn run_with_daemon() -> glib::ExitCode {
     );
 
     daemon::start_sessions_watcher(daemon_tx.clone());
-    daemon::start_codex_poller(daemon_tx.clone());
 
     start_config_watcher(niri_tx.clone());
     start_focus_tracker(focused_window.clone());
@@ -2434,11 +2368,6 @@ pub fn run_with_daemon() -> glib::ExitCode {
                 DaemonMessage::Track(_) | DaemonMessage::SessionsChanged => {
                     let _ = process_daemon_message(msg, &cache_clone, &focused_window_for_bridge);
                     dirty_state_for_bridge.mark_sessions();
-                    None
-                }
-                DaemonMessage::CodexChanged => {
-                    let _ = process_daemon_message(msg, &cache_clone, &focused_window_for_bridge);
-                    dirty_state_for_bridge.mark_codex();
                     None
                 }
                 other => process_daemon_message(other, &cache_clone, &focused_window_for_bridge),
@@ -3466,21 +3395,16 @@ dir = "~/code/wayvoice"
     fn ui_dirty_state_coalesces_updates_until_taken() {
         let dirty = UiDirtyState::default();
 
-        dirty.mark_codex();
-        dirty.mark_codex();
+        dirty.mark_sessions();
         dirty.mark_sessions();
 
         assert!(dirty.take_sessions());
-        assert!(dirty.take_codex());
         assert!(!dirty.take_sessions());
-        assert!(!dirty.take_codex());
 
         dirty.mark_sessions();
-        dirty.mark_codex();
         dirty.clear_all();
 
         assert!(!dirty.take_sessions());
-        assert!(!dirty.take_codex());
     }
 
     #[test]
