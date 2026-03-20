@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -41,15 +42,21 @@ const NIRI_OVERLAY_MARGIN: i32 = 80;
 const NIRI_OVERLAY_STEP_SCROLL: f64 = 64.0;
 const NIRI_OVERLAY_PAGE_SCROLL: f64 = 320.0;
 const WAITING_PRIORITY_WINDOW_SECS: f64 = 30.0 * 60.0;
+const GTK_MAIN_LOOP_HEARTBEAT_MS: u64 = 100;
+const GTK_MAIN_LOOP_STALL_WARN_MS: u128 = 200;
 
 // Use DaemonMessage as base, add niri-specific ReloadConfig
 #[derive(Debug)]
 enum NiriMessage {
-    Daemon(DaemonMessage),
+    Daemon {
+        msg: DaemonMessage,
+        enqueued_at: Instant,
+    },
     ReloadConfig,
     WorkspaceColumns {
         entries: Vec<WorkspaceColumn>,
         agents_only: bool,
+        enqueued_at: Instant,
     },
 }
 
@@ -80,6 +87,41 @@ struct AppState {
     codex_bindings: HashMap<u64, String>,
     codex_sessions: HashMap<String, CodexSession>,
     last_config_error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingOverlayFrame {
+    presented_at: Instant,
+    agents_only: bool,
+}
+
+#[derive(Default)]
+struct UiDirtyState {
+    sessions_dirty: AtomicBool,
+    codex_dirty: AtomicBool,
+}
+
+impl UiDirtyState {
+    fn mark_sessions(&self) {
+        self.sessions_dirty.store(true, Ordering::Release);
+    }
+
+    fn mark_codex(&self) {
+        self.codex_dirty.store(true, Ordering::Release);
+    }
+
+    fn take_sessions(&self) -> bool {
+        self.sessions_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_codex(&self) -> bool {
+        self.codex_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    fn clear_all(&self) {
+        self.sessions_dirty.store(false, Ordering::Release);
+        self.codex_dirty.store(false, Ordering::Release);
+    }
 }
 
 fn notify_config_error(message: &str) {
@@ -182,14 +224,23 @@ fn process_daemon_message(
     focused_window: &Arc<Mutex<Option<u64>>>,
 ) -> Option<NiriMessage> {
     match msg {
-        DaemonMessage::Toggle | DaemonMessage::ToggleAgents => Some(NiriMessage::Daemon(msg)),
-        DaemonMessage::Shutdown => Some(NiriMessage::Daemon(msg)),
+        DaemonMessage::Toggle | DaemonMessage::ToggleAgents => Some(NiriMessage::Daemon {
+            msg,
+            enqueued_at: Instant::now(),
+        }),
+        DaemonMessage::Shutdown => Some(NiriMessage::Daemon {
+            msg,
+            enqueued_at: Instant::now(),
+        }),
         DaemonMessage::Track(event) => {
             let focused_id = *focused_window.lock().unwrap();
             daemon::handle_track_event(&event, focused_id);
             let mut cache = cache.lock().unwrap();
             cache.reload_agent_sessions();
-            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
+            Some(NiriMessage::Daemon {
+                msg: DaemonMessage::SessionsChanged,
+                enqueued_at: Instant::now(),
+            })
         }
         DaemonMessage::List(resp_tx) => {
             let mut cache = cache.lock().unwrap();
@@ -200,12 +251,17 @@ fn process_daemon_message(
         DaemonMessage::SessionsChanged => {
             let mut cache = cache.lock().unwrap();
             cache.reload_agent_sessions();
-            Some(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
+            Some(NiriMessage::Daemon {
+                msg: DaemonMessage::SessionsChanged,
+                enqueued_at: Instant::now(),
+            })
         }
         DaemonMessage::CodexChanged => {
-            let mut cache = cache.lock().unwrap();
-            cache.reload_codex_sessions();
-            Some(NiriMessage::Daemon(DaemonMessage::CodexChanged))
+            daemon::reload_codex_sessions_shared(cache);
+            Some(NiriMessage::Daemon {
+                msg: DaemonMessage::CodexChanged,
+                enqueued_at: Instant::now(),
+            })
         }
     }
 }
@@ -232,6 +288,7 @@ fn request_workspace_refresh(
         let _ = tx.send(NiriMessage::WorkspaceColumns {
             entries,
             agents_only,
+            enqueued_at: Instant::now(),
         });
     });
 }
@@ -325,10 +382,46 @@ fn codex_state_for_entry(
 }
 
 fn niri_request(request: Request) -> Option<Response> {
-    let mut socket = Socket::connect().ok()?;
-    match socket.send(request) {
+    let request_name = niri_request_name(&request);
+    let request_start = Instant::now();
+    let mut socket = match Socket::connect() {
+        Ok(socket) => socket,
+        Err(err) => {
+            log::debug!("niri request: {} connect failed: {}", request_name, err);
+            return None;
+        }
+    };
+    let response = match socket.send(request) {
         Ok(Ok(response)) => Some(response),
-        _ => None,
+        Ok(Err(err)) => {
+            log::debug!("niri request: {} failed: {}", request_name, err);
+            None
+        }
+        Err(err) => {
+            log::debug!("niri request: {} send failed: {}", request_name, err);
+            None
+        }
+    };
+    log::debug!(
+        "niri request: {} {}ms success={}",
+        request_name,
+        request_start.elapsed().as_millis(),
+        response.is_some(),
+    );
+    response
+}
+
+fn niri_request_name(request: &Request) -> &'static str {
+    match request {
+        Request::Windows => "windows",
+        Request::Workspaces => "workspaces",
+        Request::Action(Action::FocusWindow { .. }) => "action.focus-window",
+        Request::Action(Action::FocusWorkspace { .. }) => "action.focus-workspace",
+        Request::Action(Action::FocusColumn { .. }) => "action.focus-column",
+        Request::Action(Action::SetWorkspaceName { .. }) => "action.set-workspace-name",
+        Request::Action(Action::Spawn { .. }) => "action.spawn",
+        Request::Action(_) => "action.other",
+        _ => "other",
     }
 }
 
@@ -658,27 +751,75 @@ fn create_workspace(name: &str, dir: Option<&str>) {
 }
 
 fn switch_to_entry(entry: &WorkspaceColumn) {
-    if let Some(window_id) = entry.window_id
-        && focus_window(window_id)
-    {
-        return;
+    let switch_start = Instant::now();
+    if let Some(window_id) = entry.window_id {
+        let focus_window_start = Instant::now();
+        if focus_window(window_id) {
+            log::info!(
+                "switch_to_entry: {}ms path=focus-window workspace={} window_id={} focus_window={}ms",
+                switch_start.elapsed().as_millis(),
+                entry.workspace_name,
+                window_id,
+                focus_window_start.elapsed().as_millis(),
+            );
+            return;
+        }
     }
 
+    let mut path = "workspace";
+    let mut spawn_elapsed_ms = None;
     if entry.static_workspace {
+        let focus_workspace_start = Instant::now();
         focus_workspace(entry.workspace_ref.clone());
+        let focus_workspace_elapsed = focus_workspace_start.elapsed().as_millis();
         if entry.app_label == "(empty)"
             && let Some(ref dir) = entry.dir
         {
+            let spawn_start = Instant::now();
             spawn_terminals(dir);
+            spawn_elapsed_ms = Some(spawn_start.elapsed().as_millis());
+            path = "static-empty";
         }
+        log::debug!(
+            "switch_to_entry workspace phase: workspace={} static=true focus_workspace={}ms spawn={}ms",
+            entry.workspace_name,
+            focus_workspace_elapsed,
+            spawn_elapsed_ms.unwrap_or(0),
+        );
     } else {
         if entry.app_label == "(empty)" {
+            let create_workspace_start = Instant::now();
             create_workspace(&entry.workspace_name, entry.dir.as_deref());
+            spawn_elapsed_ms = Some(create_workspace_start.elapsed().as_millis());
+            path = "create-workspace";
+        } else {
+            path = "focus-workspace";
         }
+        let focus_workspace_start = Instant::now();
         focus_workspace(entry.workspace_ref.clone());
+        log::debug!(
+            "switch_to_entry workspace phase: workspace={} static=false focus_workspace={}ms create_workspace={}ms",
+            entry.workspace_name,
+            focus_workspace_start.elapsed().as_millis(),
+            spawn_elapsed_ms.unwrap_or(0),
+        );
     }
+    let sleep_start = Instant::now();
     std::thread::sleep(std::time::Duration::from_millis(100));
+    let sleep_elapsed = sleep_start.elapsed().as_millis();
+    let focus_column_start = Instant::now();
     focus_column(entry.column_index);
+    let focus_column_elapsed = focus_column_start.elapsed().as_millis();
+    log::info!(
+        "switch_to_entry: {}ms path={} workspace={} column={} sleep={}ms focus_column={}ms workspace_phase={}ms",
+        switch_start.elapsed().as_millis(),
+        path,
+        entry.workspace_name,
+        entry.column_index,
+        sleep_elapsed,
+        focus_column_elapsed,
+        spawn_elapsed_ms.unwrap_or(0),
+    );
 }
 
 fn send_toggle_request(agents_only: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -996,6 +1137,7 @@ fn build_ui(
     tx: mpsc::Sender<NiriMessage>,
     focused_window: Arc<Mutex<Option<u64>>>,
     cache: Arc<Mutex<SessionCache>>,
+    dirty_state: Arc<UiDirtyState>,
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -1041,6 +1183,7 @@ fn build_ui(
 
     let outer_box = GtkBox::new(Orientation::Vertical, 0);
     outer_box.add_css_class("outer");
+    let pending_overlay_frame = Rc::new(RefCell::new(None::<PendingOverlayFrame>));
 
     let scroller = ScrolledWindow::new();
     scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
@@ -1077,6 +1220,17 @@ fn build_ui(
     let css_provider = load_overlay_css(theme);
 
     window.set_child(Some(&outer_box));
+    let pending_overlay_frame_for_tick = pending_overlay_frame.clone();
+    window.add_tick_callback(move |_, _| {
+        if let Some(pending) = pending_overlay_frame_for_tick.borrow_mut().take() {
+            log::info!(
+                "overlay first frame: {}ms agents_only={}",
+                pending.presented_at.elapsed().as_millis(),
+                pending.agents_only,
+            );
+        }
+        glib::ControlFlow::Continue
+    });
 
     // Helper: rebuild the current view (normal or agents)
     let rebuild_current_view = |main_box: &GtkBox, state: &AppState, lock_label_widths: bool| {
@@ -1313,17 +1467,49 @@ fn build_ui(
     let cache_for_poll = cache.clone();
     let css_provider_for_poll = css_provider.clone();
     let tx_for_poll = tx.clone();
+    let dirty_state_for_poll = dirty_state.clone();
+    let pending_overlay_frame_for_poll = pending_overlay_frame.clone();
+    let main_loop_last_tick = Rc::new(RefCell::new(Instant::now()));
+    let main_loop_last_tick_for_monitor = main_loop_last_tick.clone();
+
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(GTK_MAIN_LOOP_HEARTBEAT_MS),
+        move || {
+            let now = Instant::now();
+            let mut last_tick = main_loop_last_tick_for_monitor.borrow_mut();
+            let elapsed = now.duration_since(*last_tick);
+            let stall_ms = elapsed
+                .as_millis()
+                .saturating_sub(GTK_MAIN_LOOP_HEARTBEAT_MS as u128);
+            if stall_ms >= GTK_MAIN_LOOP_STALL_WARN_MS {
+                log::warn!(
+                    "gtk main loop stalled: {}ms elapsed={}ms",
+                    stall_ms,
+                    elapsed.as_millis(),
+                );
+            }
+            *last_tick = now;
+            glib::ControlFlow::Continue
+        },
+    );
 
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                NiriMessage::Daemon(
-                    inner @ (DaemonMessage::Toggle | DaemonMessage::ToggleAgents),
-                ) => {
+                NiriMessage::Daemon {
+                    msg: inner @ (DaemonMessage::Toggle | DaemonMessage::ToggleAgents),
+                    enqueued_at,
+                } => {
                     let is_agents = matches!(inner, DaemonMessage::ToggleAgents);
+                    log::info!(
+                        "toggle queue delay: {}ms agents_only={}",
+                        enqueued_at.elapsed().as_millis(),
+                        is_agents,
+                    );
                     let is_visible = window_for_poll.is_visible();
                     if is_visible {
                         window_for_poll.set_visible(false);
+                        pending_overlay_frame_for_poll.borrow_mut().take();
                         let mut state = state_for_poll.borrow_mut();
                         state.pending_key = None;
                         state.agents_view = false;
@@ -1333,6 +1519,7 @@ fn build_ui(
                         let (agent_sessions, codex_bindings, codex_sessions) =
                             overlay_snapshot_from_cache(&cache_for_poll);
                         let snapshot_elapsed = snapshot_start.elapsed();
+                        dirty_state_for_poll.clear_all();
 
                         let mut state = state_for_poll.borrow_mut();
                         state.agent_sessions = agent_sessions;
@@ -1362,6 +1549,10 @@ fn build_ui(
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                         let second_rebuild_elapsed = second_rebuild_start.elapsed();
                         drop(state);
+                        *pending_overlay_frame_for_poll.borrow_mut() = Some(PendingOverlayFrame {
+                            presented_at: Instant::now(),
+                            agents_only: is_agents,
+                        });
                         window_for_poll.set_visible(true);
                         window_for_poll.present();
                         let total_elapsed = open_start.elapsed();
@@ -1426,7 +1617,14 @@ fn build_ui(
                 NiriMessage::WorkspaceColumns {
                     entries,
                     agents_only,
+                    enqueued_at,
                 } => {
+                    log::debug!(
+                        "workspace refresh queue delay: {}ms agents_only={} entries={}",
+                        enqueued_at.elapsed().as_millis(),
+                        agents_only,
+                        entries.len(),
+                    );
                     let mut state = state_for_poll.borrow_mut();
                     let current_entries = if agents_only {
                         &state.agent_entries
@@ -1467,7 +1665,14 @@ fn build_ui(
                         );
                     }
                 }
-                NiriMessage::Daemon(DaemonMessage::SessionsChanged) => {
+                NiriMessage::Daemon {
+                    msg: DaemonMessage::SessionsChanged,
+                    enqueued_at,
+                } => {
+                    log::debug!(
+                        "sessions-changed queue delay: {}ms",
+                        enqueued_at.elapsed().as_millis(),
+                    );
                     let (agent_sessions, codex_bindings, _) =
                         overlay_snapshot_from_cache(&cache_for_poll);
                     let mut state = state_for_poll.borrow_mut();
@@ -1487,7 +1692,14 @@ fn build_ui(
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
-                NiriMessage::Daemon(DaemonMessage::CodexChanged) => {
+                NiriMessage::Daemon {
+                    msg: DaemonMessage::CodexChanged,
+                    enqueued_at,
+                } => {
+                    log::debug!(
+                        "codex-changed queue delay: {}ms",
+                        enqueued_at.elapsed().as_millis(),
+                    );
                     let mut state = state_for_poll.borrow_mut();
                     state.codex_sessions = {
                         let cache = cache_for_poll.lock().unwrap();
@@ -1507,12 +1719,77 @@ fn build_ui(
                         rebuild_for_poll(&main_box_for_poll, &state, true);
                     }
                 }
-                NiriMessage::Daemon(DaemonMessage::Track(_))
-                | NiriMessage::Daemon(DaemonMessage::List(_)) => {}
-                NiriMessage::Daemon(DaemonMessage::Shutdown) => {
+                NiriMessage::Daemon {
+                    msg: DaemonMessage::Track(_),
+                    ..
+                }
+                | NiriMessage::Daemon {
+                    msg: DaemonMessage::List(_),
+                    ..
+                } => {}
+                NiriMessage::Daemon {
+                    msg: DaemonMessage::Shutdown,
+                    ..
+                } => {
                     // Exit GTK app
                     std::process::exit(0);
                 }
+            }
+        }
+
+        if window_for_poll.is_visible() {
+            let sessions_dirty = dirty_state_for_poll.take_sessions();
+            let codex_dirty = dirty_state_for_poll.take_codex();
+            if sessions_dirty || codex_dirty {
+                let refresh_start = Instant::now();
+                let mut state = state_for_poll.borrow_mut();
+
+                if sessions_dirty {
+                    let snapshot_start = Instant::now();
+                    let (agent_sessions, codex_bindings, codex_sessions) =
+                        overlay_snapshot_from_cache(&cache_for_poll);
+                    let snapshot_elapsed = snapshot_start.elapsed();
+                    state.agent_sessions = agent_sessions;
+                    state.codex_bindings = codex_bindings;
+                    if codex_dirty {
+                        state.codex_sessions = codex_sessions;
+                    }
+                    log::debug!(
+                        "dirty refresh snapshot: {}ms sessions_dirty={} codex_dirty={}",
+                        snapshot_elapsed.as_millis(),
+                        sessions_dirty,
+                        codex_dirty,
+                    );
+                } else if codex_dirty {
+                    let codex_refresh_start = Instant::now();
+                    state.codex_sessions = {
+                        let mut cache = cache_for_poll.lock().unwrap();
+                        cache.refresh_dynamic_codex_states();
+                        cache.codex_sessions.clone()
+                    };
+                    log::debug!(
+                        "dirty refresh codex clone: {}ms codex_dirty=true",
+                        codex_refresh_start.elapsed().as_millis(),
+                    );
+                }
+
+                rebuild_for_poll(&main_box_for_poll, &state, false);
+                let wide_agents_layout = uses_wide_agents_layout(&state);
+                drop(state);
+                update_overlay_size(
+                    &window_for_poll,
+                    &scroller_for_poll,
+                    &outer_box_for_poll,
+                    wide_agents_layout,
+                );
+                let state = state_for_poll.borrow();
+                rebuild_for_poll(&main_box_for_poll, &state, true);
+                log::debug!(
+                    "dirty refresh apply: {}ms sessions_dirty={} codex_dirty={}",
+                    refresh_start.elapsed().as_millis(),
+                    sessions_dirty,
+                    codex_dirty,
+                );
             }
         }
         glib::ControlFlow::Continue
@@ -2114,12 +2391,13 @@ pub fn run_with_daemon() -> glib::ExitCode {
     let (niri_tx, niri_rx) = mpsc::channel::<NiriMessage>();
     let cache = Arc::new(Mutex::new(SessionCache::new()));
     let focused_window: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let dirty_state = Arc::new(UiDirtyState::default());
 
     {
         let mut cache = cache.lock().unwrap();
         cache.reload_agent_sessions();
-        cache.reload_codex_sessions();
     }
+    daemon::reload_codex_sessions_shared(&cache);
 
     let _daemon_instance = match daemon::start_socket_listener(daemon_tx.clone(), cache.clone()) {
         Ok(guard) => guard,
@@ -2143,6 +2421,7 @@ pub fn run_with_daemon() -> glib::ExitCode {
     let niri_tx_clone = niri_tx.clone();
     let cache_clone = cache.clone();
     let focused_window_for_bridge = focused_window.clone();
+    let dirty_state_for_bridge = dirty_state.clone();
     thread::spawn(move || {
         loop {
             let msg = match daemon_rx.recv() {
@@ -2151,8 +2430,21 @@ pub fn run_with_daemon() -> glib::ExitCode {
             };
             let is_toggle = matches!(msg, DaemonMessage::Toggle | DaemonMessage::ToggleAgents);
 
-            if let Some(niri_msg) =
-                process_daemon_message(msg, &cache_clone, &focused_window_for_bridge)
+            let forwarded = match msg {
+                DaemonMessage::Track(_) | DaemonMessage::SessionsChanged => {
+                    let _ = process_daemon_message(msg, &cache_clone, &focused_window_for_bridge);
+                    dirty_state_for_bridge.mark_sessions();
+                    None
+                }
+                DaemonMessage::CodexChanged => {
+                    let _ = process_daemon_message(msg, &cache_clone, &focused_window_for_bridge);
+                    dirty_state_for_bridge.mark_codex();
+                    None
+                }
+                other => process_daemon_message(other, &cache_clone, &focused_window_for_bridge),
+            };
+
+            if let Some(niri_msg) = forwarded
                 && niri_tx_clone.send(niri_msg).is_err()
             {
                 break;
@@ -2163,11 +2455,8 @@ pub fn run_with_daemon() -> glib::ExitCode {
                     refresh_cache_after_cleanup(&cache_clone, load_clean_store_after_cleanup)
                 {
                     log::error!("Failed to refresh state after overlay toggle: {}", err);
-                } else if niri_tx_clone
-                    .send(NiriMessage::Daemon(DaemonMessage::SessionsChanged))
-                    .is_err()
-                {
-                    break;
+                } else {
+                    dirty_state_for_bridge.mark_sessions();
                 }
             }
         }
@@ -2176,6 +2465,7 @@ pub fn run_with_daemon() -> glib::ExitCode {
     let rx = Rc::new(RefCell::new(Some(niri_rx)));
     let focused_window_rc = Rc::new(RefCell::new(Some(focused_window)));
     let cache_rc = Rc::new(RefCell::new(Some(cache)));
+    let dirty_state_rc = Rc::new(RefCell::new(Some(dirty_state)));
 
     let app = Application::builder()
         .application_id(APP_ID)
@@ -2185,13 +2475,15 @@ pub fn run_with_daemon() -> glib::ExitCode {
     let rx_clone = rx.clone();
     let focused_clone = focused_window_rc.clone();
     let cache_clone = cache_rc.clone();
+    let dirty_clone = dirty_state_rc.clone();
     app.connect_activate(move |app| {
-        if let (Some(rx), Some(focused), Some(cache)) = (
+        if let (Some(rx), Some(focused), Some(cache), Some(dirty_state)) = (
             rx_clone.borrow_mut().take(),
             focused_clone.borrow_mut().take(),
             cache_clone.borrow_mut().take(),
+            dirty_clone.borrow_mut().take(),
         ) {
-            build_ui(app, rx, niri_tx.clone(), focused, cache);
+            build_ui(app, rx, niri_tx.clone(), focused, cache, dirty_state);
         }
     });
 
@@ -3163,8 +3455,32 @@ dir = "~/code/wayvoice"
 
         assert!(matches!(
             forwarded,
-            Some(NiriMessage::Daemon(DaemonMessage::Toggle))
+            Some(NiriMessage::Daemon {
+                msg: DaemonMessage::Toggle,
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn ui_dirty_state_coalesces_updates_until_taken() {
+        let dirty = UiDirtyState::default();
+
+        dirty.mark_codex();
+        dirty.mark_codex();
+        dirty.mark_sessions();
+
+        assert!(dirty.take_sessions());
+        assert!(dirty.take_codex());
+        assert!(!dirty.take_sessions());
+        assert!(!dirty.take_codex());
+
+        dirty.mark_sessions();
+        dirty.mark_codex();
+        dirty.clear_all();
+
+        assert!(!dirty.take_sessions());
+        assert!(!dirty.take_codex());
     }
 
     #[test]

@@ -183,11 +183,19 @@ pub struct TrackEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum SocketRequest {
-    Toggle,
-    ToggleAgents,
+    Toggle {
+        #[serde(default)]
+        requested_at_ms: Option<u64>,
+    },
+    ToggleAgents {
+        #[serde(default)]
+        requested_at_ms: Option<u64>,
+    },
     List,
     Ping,
-    Track { event: TrackEvent },
+    Track {
+        event: TrackEvent,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -304,8 +312,8 @@ impl SessionCache {
         self.replace_store(store);
     }
 
-    pub fn reload_codex_sessions(&mut self) {
-        self.codex_sessions = load_codex_sessions();
+    pub fn replace_codex_sessions(&mut self, sessions: HashMap<String, CodexSession>) {
+        self.codex_sessions = sessions;
     }
 
     pub fn refresh_dynamic_codex_states(&mut self) {
@@ -459,9 +467,13 @@ pub(crate) fn query_daemon_list() -> io::Result<ListResponse> {
 #[cfg_attr(not(feature = "niri"), allow(dead_code))]
 pub(crate) fn send_toggle_request(agents_only: bool) -> io::Result<()> {
     let request = if agents_only {
-        SocketRequest::ToggleAgents
+        SocketRequest::ToggleAgents {
+            requested_at_ms: Some(unix_now_ms()),
+        }
     } else {
-        SocketRequest::Toggle
+        SocketRequest::Toggle {
+            requested_at_ms: Some(unix_now_ms()),
+        }
     };
     match send_socket_request(&request)? {
         SocketResponse::Ok => Ok(()),
@@ -559,18 +571,24 @@ fn handle_socket_request(
     cache: &Arc<Mutex<SessionCache>>,
 ) -> SocketResponse {
     match request {
-        SocketRequest::Toggle => match tx.send(DaemonMessage::Toggle) {
-            Ok(()) => SocketResponse::Ok,
-            Err(err) => SocketResponse::Error {
-                message: format!("daemon not responding: {err}"),
-            },
-        },
-        SocketRequest::ToggleAgents => match tx.send(DaemonMessage::ToggleAgents) {
-            Ok(()) => SocketResponse::Ok,
-            Err(err) => SocketResponse::Error {
-                message: format!("daemon not responding: {err}"),
-            },
-        },
+        SocketRequest::Toggle { requested_at_ms } => {
+            log_toggle_request_delay(requested_at_ms, false);
+            match tx.send(DaemonMessage::Toggle) {
+                Ok(()) => SocketResponse::Ok,
+                Err(err) => SocketResponse::Error {
+                    message: format!("daemon not responding: {err}"),
+                },
+            }
+        }
+        SocketRequest::ToggleAgents { requested_at_ms } => {
+            log_toggle_request_delay(requested_at_ms, true);
+            match tx.send(DaemonMessage::ToggleAgents) {
+                Ok(()) => SocketResponse::Ok,
+                Err(err) => SocketResponse::Error {
+                    message: format!("daemon not responding: {err}"),
+                },
+            }
+        }
         SocketRequest::Ping => SocketResponse::Pong {
             pid: std::process::id(),
         },
@@ -610,6 +628,26 @@ fn handle_socket_request(
             }
         }
     }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn log_toggle_request_delay(requested_at_ms: Option<u64>, agents_only: bool) {
+    let Some(requested_at_ms) = requested_at_ms else {
+        return;
+    };
+    let now_ms = unix_now_ms();
+    let delay_ms = now_ms.saturating_sub(requested_at_ms);
+    debug!(
+        "toggle request delay: {}ms agents_only={}",
+        delay_ms, agents_only
+    );
 }
 
 fn start_socket_listener_at_paths(
@@ -1154,6 +1192,12 @@ pub fn load_codex_sessions() -> HashMap<String, CodexSession> {
     load_codex_sessions_from_root(root.as_path())
 }
 
+pub fn reload_codex_sessions_shared(cache: &Arc<Mutex<SessionCache>>) {
+    let sessions = load_codex_sessions();
+    let mut cache = cache.lock().unwrap();
+    cache.replace_codex_sessions(sessions);
+}
+
 // Note: We previously had apply_codex_recent_activity() that used file mtime
 // to guess "responding" state, but this caused issues when agent_message
 // correctly set state to "idle" but the recent mtime overrode it.
@@ -1297,8 +1341,8 @@ pub fn run_headless() {
     {
         let mut cache = cache.lock().unwrap();
         cache.reload_agent_sessions();
-        cache.reload_codex_sessions();
     }
+    reload_codex_sessions_shared(&cache);
 
     let _daemon_instance = match start_socket_listener(tx.clone(), cache.clone()) {
         Ok(guard) => guard,
@@ -1338,8 +1382,8 @@ pub fn run_headless() {
                 cache.reload_agent_sessions();
             }
             DaemonMessage::CodexChanged => {
-                let mut cache = cache.lock().unwrap();
-                cache.reload_codex_sessions();
+                reload_codex_sessions_shared(&cache);
+                let cache = cache.lock().unwrap();
                 for entry in cache.codex_sessions.values() {
                     debug!(
                         "codex session: cwd={} state={:?} state_updated={}",
