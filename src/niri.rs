@@ -8,6 +8,7 @@ use gtk4::{
     ScrolledWindow, Separator, glib,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use log::debug;
 use niri_ipc::{
     Action, Event, Request, Response, Window, Workspace, WorkspaceReferenceArg, socket::Socket,
 };
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const APP_ID: &str = "com.thrawny.agent-switch";
 const KEYS: [char; 12] = ['h', 'j', 'k', 'l', 'u', 'i', 'o', 'p', 'n', 'm', ',', '.'];
@@ -820,6 +821,7 @@ fn start_config_watcher(tx: mpsc::Sender<NiriMessage>) {
     thread::spawn(move || {
         let tx_clone = tx.clone();
         let watched_paths = watched_paths.clone();
+        let last_sent = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
 
         let mut watcher = match RecommendedWatcher::new(
             move |res: Result<notify::Event, notify::Error>| {
@@ -831,7 +833,11 @@ fn start_config_watcher(tx: mpsc::Sender<NiriMessage>) {
                     if dominated_by_config {
                         match event.kind {
                             notify::EventKind::Modify(_) | notify::EventKind::Create(_) => {
-                                let _ = tx_clone.send(NiriMessage::ReloadConfig);
+                                let mut last = last_sent.lock().unwrap();
+                                if last.elapsed() >= Duration::from_millis(250) {
+                                    *last = Instant::now();
+                                    let _ = tx_clone.send(NiriMessage::ReloadConfig);
+                                }
                             }
                             _ => {}
                         }
@@ -1562,6 +1568,7 @@ fn build_ui(
                             state.codex_aliases =
                                 projects::normalized_codex_aliases(&state.config.codex_aliases);
                             state.last_config_error = None;
+                            debug!("config reloaded");
                             true
                         }
                         Err(err) => {
