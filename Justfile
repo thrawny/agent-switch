@@ -25,8 +25,8 @@ watch-tmux:
     -zmx kill agent-switch-tmux
     cargo build
     touch {{ _build_stamp }}
-    zmx run agent-switch-build "watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build && touch {{ _build_stamp }}'"
-    zmx run agent-switch-tmux 'RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve'
+    zmx run agent-switch-build watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build && touch {{ _build_stamp }}'
+    zmx run agent-switch-tmux env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve
     zmx attach agent-switch-tmux
 
 # Watch niri daemon with build-gated restart (old process stays alive on compile errors)
@@ -35,8 +35,8 @@ watch-niri:
     -zmx kill agent-switch-niri
     cargo build --features niri
     touch {{ _build_stamp }}
-    zmx run agent-switch-build "watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build --features niri && touch {{ _build_stamp }}'"
-    zmx run agent-switch-niri 'RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve --niri'
+    zmx run agent-switch-build watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build --features niri && touch {{ _build_stamp }}'
+    zmx run agent-switch-niri env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve --niri
     zmx attach agent-switch-niri
 
 # Install to ~/.cargo/bin
