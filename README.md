@@ -112,7 +112,6 @@ Example:
 ignore = ["games", "web"]
 ignoreUnnamedWorkspaces = true
 ignoreNumericSessions = true
-codexAliases = ["cx", "cxy"]
 
 [[project]]
 dir = "~/dotfiles"
@@ -129,7 +128,6 @@ dir = "~/code/agent-switch" # name inferred from folder if omitted
 Notes:
 - `ignoreUnnamedWorkspaces` defaults to `true` (niri)
 - `ignoreNumericSessions` defaults to `false` and works for both niri + tmux
-- `codexAliases` adds extra names (for example `cx`, `cxy`) to detect Codex windows in tmux + niri
 - `ignore` works for discovered niri workspaces and tmux sessions
 - if `project.name` is omitted, name is inferred from `dir` basename
 - `static_workspace = true` means “focus existing workspace, don’t auto-create”
@@ -148,14 +146,14 @@ Configure hooks in **`~/.claude/settings.json`**:
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "agent-switch track stop" }
+          { "type": "command", "command": "agent-switch track stop --agent claude" }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "agent-switch track prompt-submit" }
+          { "type": "command", "command": "agent-switch track prompt-submit --agent claude" }
         ]
       }
     ],
@@ -163,21 +161,21 @@ Configure hooks in **`~/.claude/settings.json`**:
       {
         "matcher": "permission_prompt",
         "hooks": [
-          { "type": "command", "command": "agent-switch track notification" }
+          { "type": "command", "command": "agent-switch track notification --agent claude" }
         ]
       }
     ],
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "agent-switch track session-start" }
+          { "type": "command", "command": "agent-switch track session-start --agent claude" }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "agent-switch track session-end" }
+          { "type": "command", "command": "agent-switch track session-end --agent claude" }
         ]
       }
     ]
@@ -190,14 +188,15 @@ Configure hooks in **`~/.claude/settings.json`**:
 - `agent-switch` must be on `PATH` for Claude
 - daemon should be running (`agent-switch serve` or `agent-switch serve --niri`)
 - run Claude inside tmux if you want tmux window IDs captured
+- every hook must identify the agent, either via `--agent claude` or an `agent` field in the hook payload
 
 ---
 
 ## Codex hook setup
 
-Codex rollout watching is enough for live state, but it cannot reliably distinguish multiple
-Codex sessions in the same repo by itself. Add a `SessionStart` hook so `agent-switch` can bind
-the Codex `session_id` to the current tmux or niri window.
+Codex now uses the same tracked-session path as other agents. Hooks still provide the agent name,
+session identity, and current window binding, while rollout watching continues to drive
+transcript-derived live state.
 
 Enable Codex hooks in **`~/.codex/config.toml`**:
 
@@ -231,7 +230,7 @@ Notes:
 - daemon should be running (`agent-switch serve` or `agent-switch serve --niri`)
 - run Codex inside tmux if you want tmux window IDs captured
 - on niri, `agent-switch track` also captures the currently focused window ID automatically
-- you still want rollout watching: the hook binds identity, the rollout files provide live state
+- every hook must identify the agent, either via `--agent codex` or an `agent` field in the hook payload
 
 ---
 

@@ -2,7 +2,7 @@ use crate::state::{self, SessionStore};
 use log::{debug, error, info, warn};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, Write};
@@ -14,8 +14,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, UNIX_EPOCH};
 
-const CODEX_MAX_AGE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0; // 7 days
-const CODEX_RESPONDING_GRACE_SECS: f64 = 30.0;
 const SOCKET_IO_TIMEOUT_SECS: u64 = 2;
 const SOCKET_MAX_FRAME_BYTES: usize = 256 * 1024;
 
@@ -59,36 +57,6 @@ pub struct AgentSession {
     pub state: AgentState,
     pub cwd: Option<String>,
     pub state_updated: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CodexSession {
-    pub session_id: String,
-    pub cwd: String,
-    pub state: AgentState,
-    pub state_updated: f64,
-}
-
-impl CodexSession {
-    pub fn new(session_id: String, cwd: String, state: AgentState, state_updated: f64) -> Self {
-        Self {
-            session_id,
-            cwd,
-            state,
-            state_updated,
-        }
-    }
-}
-
-impl From<&state::CodexSession> for CodexSession {
-    fn from(value: &state::CodexSession) -> Self {
-        Self {
-            session_id: value.session_id.clone(),
-            cwd: value.cwd.clone(),
-            state: value.state.into(),
-            state_updated: value.state_updated,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -191,12 +159,11 @@ pub(crate) enum SocketResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListResponse {
-    pub claude: Vec<ClaudeListEntry>,
-    pub codex: Vec<CodexListEntry>,
+    pub sessions: Vec<ListEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClaudeListEntry {
+pub struct ListEntry {
     pub session_id: String,
     pub agent: String,
     pub cwd: Option<String>,
@@ -209,22 +176,8 @@ pub struct ClaudeListEntry {
     pub niri_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CodexListEntry {
-    pub session_id: String,
-    pub cwd: String,
-    pub state: AgentState,
-    pub state_updated: f64,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tmux_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub niri_id: Option<String>,
-}
-
 #[derive(Debug, Default)]
 pub struct SessionCache {
-    pub agent_sessions: HashMap<String, AgentSession>,
-    pub codex_sessions: HashMap<String, CodexSession>,
     pub store: SessionStore,
 }
 
@@ -251,42 +204,13 @@ impl SessionCache {
         Self::default()
     }
 
-    fn sync_agent_sessions_from_store(&mut self) {
-        self.agent_sessions.clear();
-
-        for (key, session) in self.store.sessions.iter() {
-            self.agent_sessions.insert(
-                key.clone(),
-                AgentSession {
-                    agent: session.agent.clone(),
-                    state: session.state.into(),
-                    cwd: session.cwd.clone(),
-                    state_updated: session.state_updated,
-                },
-            );
-        }
-    }
-
-    fn sync_codex_sessions_from_store(&mut self) {
-        self.codex_sessions = self
-            .store
-            .codex_sessions
-            .values()
-            .map(|session| (session.session_id.clone(), CodexSession::from(session)))
-            .collect();
-    }
-
     pub fn replace_store(&mut self, mut store: SessionStore) {
         refresh_transcript_derived_states(&mut store);
         self.store = store;
-        self.sync_agent_sessions_from_store();
-        self.sync_codex_sessions_from_store();
     }
 
     pub fn refresh_dynamic_agent_states(&mut self) {
-        if refresh_transcript_derived_states(&mut self.store) {
-            self.sync_agent_sessions_from_store();
-        }
+        refresh_transcript_derived_states(&mut self.store);
     }
 
     pub fn reload_agent_sessions(&mut self) {
@@ -304,22 +228,13 @@ impl SessionCache {
         self.replace_store(store);
     }
 
-    pub fn refresh_dynamic_codex_states(&mut self) {
-        apply_codex_stale_timeout(&mut self.codex_sessions);
-        let now = state::now();
-        self.codex_sessions.retain(|_, entry| {
-            !entry.cwd.is_empty() && now - entry.state_updated <= CODEX_MAX_AGE_SECS
-        });
-    }
-
     pub fn build_list_response(&mut self) -> ListResponse {
         self.refresh_dynamic_agent_states();
-        self.refresh_dynamic_codex_states();
-        let claude: Vec<ClaudeListEntry> = self
+        let sessions: Vec<ListEntry> = self
             .store
             .sessions
             .iter()
-            .map(|(key, session)| ClaudeListEntry {
+            .map(|(key, session)| ListEntry {
                 session_id: session.session_id.clone(),
                 agent: session.agent.clone(),
                 cwd: session.cwd.clone(),
@@ -331,23 +246,7 @@ impl SessionCache {
             })
             .collect();
 
-        let codex: Vec<CodexListEntry> = self
-            .codex_sessions
-            .values()
-            .map(|session| {
-                let binding = self.store.codex_bindings.get(&session.session_id);
-                CodexListEntry {
-                    session_id: session.session_id.clone(),
-                    cwd: session.cwd.clone(),
-                    state: session.state,
-                    state_updated: session.state_updated,
-                    tmux_id: binding.and_then(|entry| entry.window.tmux_id.clone()),
-                    niri_id: binding.and_then(|entry| entry.window.niri_id.clone()),
-                }
-            })
-            .collect();
-
-        ListResponse { claude, codex }
+        ListResponse { sessions }
     }
 }
 
@@ -442,17 +341,6 @@ pub(crate) fn send_socket_request_to_path(
     configure_socket_timeouts(&stream)?;
     write_socket_frame(&mut stream, request, "request")?;
     read_socket_frame(&mut stream, "response")
-}
-
-pub(crate) fn query_daemon_list() -> io::Result<ListResponse> {
-    match send_socket_request(&SocketRequest::List)? {
-        SocketResponse::List { response } => Ok(response),
-        SocketResponse::Error { message } => Err(io::Error::other(message)),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected list response: {other:?}"),
-        )),
-    }
 }
 
 #[cfg_attr(not(feature = "niri"), allow(dead_code))]
@@ -827,163 +715,6 @@ fn tmux_socket_dirs(uid: u32) -> Vec<PathBuf> {
         .collect()
 }
 
-fn prune_stored_codex_sessions(store: &mut state::SessionStore) {
-    let now = state::now();
-    store.codex_sessions.retain(|_, session| {
-        !session.cwd.is_empty() && now - session.state_updated <= CODEX_MAX_AGE_SECS
-    });
-}
-
-fn update_stored_codex_session(
-    store: &mut state::SessionStore,
-    session_id: &str,
-    cwd: Option<&str>,
-    state: state::SessionState,
-    state_updated: f64,
-) {
-    let entry = store
-        .codex_sessions
-        .entry(session_id.to_string())
-        .or_insert_with(|| state::CodexSession {
-            session_id: session_id.to_string(),
-            cwd: cwd.unwrap_or_default().to_string(),
-            state,
-            state_updated,
-        });
-
-    if entry.cwd.is_empty()
-        && let Some(value) = cwd
-    {
-        entry.cwd = value.to_string();
-    }
-    entry.state = state;
-    entry.state_updated = state_updated;
-}
-
-fn set_codex_binding_if_missing(
-    store: &mut state::SessionStore,
-    session_id: &str,
-    cwd: Option<&str>,
-    tmux_id: Option<&str>,
-    niri_id: Option<u64>,
-) {
-    let Some(window) = codex_window_from_ids(tmux_id, niri_id) else {
-        return;
-    };
-
-    if let Some(binding) = store.codex_bindings.get_mut(session_id) {
-        if binding.cwd.is_none() {
-            binding.cwd = cwd.map(str::to_string);
-        }
-        binding.updated_at = state::now();
-        return;
-    }
-
-    state::upsert_codex_binding(
-        store,
-        state::CodexBinding {
-            session_id: session_id.to_string(),
-            cwd: cwd.map(str::to_string),
-            updated_at: state::now(),
-            window,
-        },
-    );
-}
-
-fn replace_codex_binding(
-    store: &mut state::SessionStore,
-    session_id: &str,
-    cwd: Option<&str>,
-    tmux_id: Option<&str>,
-    niri_id: Option<u64>,
-) {
-    let Some(window) = codex_window_from_ids(tmux_id, niri_id) else {
-        return;
-    };
-
-    state::upsert_codex_binding(
-        store,
-        state::CodexBinding {
-            session_id: session_id.to_string(),
-            cwd: cwd.map(str::to_string),
-            updated_at: state::now(),
-            window,
-        },
-    );
-}
-
-fn codex_window_from_ids(tmux_id: Option<&str>, niri_id: Option<u64>) -> Option<state::WindowId> {
-    match (tmux_id, niri_id) {
-        (Some(tmux), niri) => Some(state::WindowId {
-            tmux_id: Some(tmux.to_string()),
-            niri_id: niri.map(|n| n.to_string()),
-        }),
-        (None, Some(niri)) => Some(state::WindowId {
-            tmux_id: None,
-            niri_id: Some(niri.to_string()),
-        }),
-        (None, None) => None,
-    }
-}
-
-fn apply_codex_stale_timeout(codex: &mut HashMap<String, CodexSession>) {
-    let now = state::now();
-    for entry in codex.values_mut() {
-        if entry.state == AgentState::Responding
-            && now - entry.state_updated > CODEX_RESPONDING_GRACE_SECS
-        {
-            entry.state = AgentState::Unknown;
-        }
-    }
-}
-
-/// Codex directory matching helpers (for tmux picker)
-pub fn match_codex_by_dir<'a>(
-    entry_dir: &str,
-    entries: &'a HashMap<String, CodexSession>,
-) -> Option<&'a CodexSession> {
-    let mut best: Option<(&CodexSession, usize)> = None;
-    for entry in entries.values() {
-        if !should_match_dir(entry_dir, &entry.cwd) {
-            continue;
-        }
-        let depth = path_depth(&entry.cwd);
-        if best
-            .as_ref()
-            .map(|(current, current_depth)| {
-                depth > *current_depth
-                    || (depth == *current_depth && entry.state_updated > current.state_updated)
-            })
-            .unwrap_or(true)
-        {
-            best = Some((entry, depth));
-        }
-    }
-    best.map(|(entry, _)| entry)
-}
-
-fn should_match_dir(entry_dir: &str, cwd: &str) -> bool {
-    if cwd.is_empty() || cwd == "/" {
-        return false;
-    }
-    if let Some(home) = dirs::home_dir()
-        && cwd == home.to_string_lossy()
-    {
-        return false;
-    }
-    // Match if entry_dir is equal to or a subdirectory of cwd
-    let entry_path = Path::new(entry_dir);
-    let cwd_path = Path::new(cwd);
-    entry_path.starts_with(cwd_path)
-}
-
-fn path_depth(path: &str) -> usize {
-    Path::new(path)
-        .components()
-        .filter(|c| !matches!(c, std::path::Component::RootDir))
-        .count()
-}
-
 /// Run the headless daemon
 pub fn run_headless() {
     let (tx, rx) = mpsc::channel();
@@ -1040,7 +771,13 @@ pub fn run_headless() {
 }
 
 fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, state_path: &Path) {
-    let agent = event.agent.as_deref().unwrap_or("claude");
+    let Some(agent) = event.agent.as_deref() else {
+        error!(
+            "Rejecting track event {} for session={}: missing agent",
+            event.event, event.session_id
+        );
+        return;
+    };
     let session_id = &event.session_id;
     let explicit_niri_id = event
         .niri_id
@@ -1052,68 +789,6 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
     });
 
     if let Err(err) = state::with_locked_store_at_path(state_path, |store| {
-        prune_stored_codex_sessions(store);
-
-        if agent == "codex" {
-            let now = state::now();
-            match event.event {
-                TrackEventKind::SessionStart => {
-                    replace_codex_binding(
-                        store,
-                        session_id,
-                        event.cwd.as_deref(),
-                        event.tmux_id.as_deref(),
-                        focused_niri_id,
-                    );
-                    update_stored_codex_session(
-                        store,
-                        session_id,
-                        event.cwd.as_deref(),
-                        state::SessionState::Idle,
-                        now,
-                    );
-                }
-                TrackEventKind::SessionEnd => {
-                    store.codex_bindings.remove(session_id);
-                    store.codex_sessions.remove(session_id);
-                }
-                TrackEventKind::PromptSubmit => {
-                    set_codex_binding_if_missing(
-                        store,
-                        session_id,
-                        event.cwd.as_deref(),
-                        event.tmux_id.as_deref(),
-                        focused_niri_id,
-                    );
-                    update_stored_codex_session(
-                        store,
-                        session_id,
-                        event.cwd.as_deref(),
-                        state::SessionState::Responding,
-                        now,
-                    );
-                }
-                TrackEventKind::Stop => {
-                    set_codex_binding_if_missing(
-                        store,
-                        session_id,
-                        event.cwd.as_deref(),
-                        event.tmux_id.as_deref(),
-                        focused_niri_id,
-                    );
-                    update_stored_codex_session(
-                        store,
-                        session_id,
-                        event.cwd.as_deref(),
-                        state::SessionState::Idle,
-                        now,
-                    );
-                }
-                TrackEventKind::Notification => {}
-            }
-            return Ok(());
-        }
-
         // Determine window key and IDs - prefer tmux_id, fall back to niri_id
         let (window_key, window_id) = match (&event.tmux_id, focused_niri_id) {
             (Some(tmux), niri) => (
@@ -1413,9 +1088,6 @@ pub fn refresh_transcript_derived_states(store: &mut state::SessionStore) -> boo
         changed |= maybe_clear_permission_prompt_waiting(session);
         changed |= maybe_clear_stale_question_waiting(session);
     }
-    let codex_before = store.codex_sessions.len();
-    prune_stored_codex_sessions(store);
-    changed |= store.codex_sessions.len() != codex_before;
     let elapsed = refresh_start.elapsed();
     debug!(
         "transcript refresh: {}ms sessions={} permission_candidates={} question_candidates={} changed={}",
@@ -1834,38 +1506,14 @@ mod tests {
             .get("148")
             .expect("session should remain in cache");
 
-        assert_eq!(response.claude[0].state, AgentState::Responding);
+        assert_eq!(response.sessions[0].state, AgentState::Responding);
         assert_eq!(session.state, state::SessionState::Responding);
         assert_eq!(session.waiting_reason, None);
         assert!(session.state_updated >= modified_at);
     }
 
     #[test]
-    fn build_list_response_cools_stale_codex_responding_sessions() {
-        let mut cache = SessionCache::new();
-        let stale_at = state::now() - (CODEX_RESPONDING_GRACE_SECS + 10.0);
-        cache.codex_sessions.insert(
-            "session-1".to_string(),
-            CodexSession::new(
-                "session-1".to_string(),
-                "/tmp/project".to_string(),
-                AgentState::Responding,
-                stale_at,
-            ),
-        );
-
-        let response = cache.build_list_response();
-        let session = cache
-            .codex_sessions
-            .get("session-1")
-            .expect("session should remain in cache");
-
-        assert_eq!(response.codex[0].state, AgentState::Unknown);
-        assert_eq!(session.state, AgentState::Unknown);
-    }
-
-    #[test]
-    fn codex_hooks_persist_live_state_and_binding() {
+    fn agent_hooks_persist_live_state_and_binding() {
         let state_path = test_state_path("codex-hooks-persist");
         let session_id = "codex-session-1";
 
@@ -1916,22 +1564,19 @@ mod tests {
 
         let store =
             state::load_from_path(&state_path).expect("state should load after codex hooks");
-        let binding = store
-            .codex_bindings
-            .get(session_id)
-            .expect("codex binding should be persisted");
         let session = store
-            .codex_sessions
-            .get(session_id)
-            .expect("codex session should be persisted");
+            .sessions
+            .get("47")
+            .expect("session should be persisted at the original window");
 
-        assert_eq!(binding.window.niri_id.as_deref(), Some("47"));
-        assert_eq!(session.cwd, "/tmp/project");
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.window.niri_id.as_deref(), Some("47"));
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(session.state, state::SessionState::Idle);
     }
 
     #[test]
-    fn codex_prompt_submit_backfills_binding_when_missing() {
+    fn prompt_submit_backfills_binding_when_missing() {
         let state_path = test_state_path("codex-backfill-binding");
         let session_id = "codex-session-1";
 
@@ -1967,21 +1612,18 @@ mod tests {
 
         let store =
             state::load_from_path(&state_path).expect("state should load after prompt-submit");
-        let binding = store
-            .codex_bindings
-            .get(session_id)
-            .expect("prompt-submit should create missing binding");
         let session = store
-            .codex_sessions
-            .get(session_id)
+            .sessions
+            .get("47")
             .expect("prompt-submit should create missing session");
 
-        assert_eq!(binding.window.niri_id.as_deref(), Some("47"));
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.window.niri_id.as_deref(), Some("47"));
         assert_eq!(session.state, state::SessionState::Responding);
     }
 
     #[test]
-    fn cache_reload_loads_codex_sessions_from_state_file() {
+    fn cache_reload_loads_sessions_from_state_file() {
         let state_path = test_state_path("codex-cache-reload");
         let session_id = "codex-session-1";
 
@@ -2004,11 +1646,13 @@ mod tests {
         cache.reload_agent_sessions_from_path(&state_path);
 
         let session = cache
-            .codex_sessions
-            .get(session_id)
-            .expect("cache should load codex session from state");
-        assert_eq!(session.state, AgentState::Responding);
-        assert_eq!(session.cwd, "/tmp/project");
+            .store
+            .sessions
+            .get("47")
+            .expect("cache should load session from state");
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.state, state::SessionState::Responding);
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
     }
 
     #[test]
@@ -2160,68 +1804,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_match_dir_exact_match() {
-        assert!(should_match_dir(
-            "/Users/jonas/code/project",
-            "/Users/jonas/code/project"
-        ));
-    }
-
-    #[test]
-    fn test_should_match_dir_rejects_parent() {
-        // Entry in parent dir should NOT match codex session in child
-        assert!(!should_match_dir(
-            "/Users/jonas/code",
-            "/Users/jonas/code/project"
-        ));
-    }
-
-    #[test]
-    fn test_should_match_dir_allows_subdirectory() {
-        // Entry in subdirectory SHOULD match codex session in parent
-        assert!(should_match_dir(
-            "/Users/jonas/code/project/src",
-            "/Users/jonas/code/project"
-        ));
-    }
-
-    #[test]
-    fn test_should_match_dir_rejects_empty() {
-        assert!(!should_match_dir("/Users/jonas/code", ""));
-    }
-
-    #[test]
-    fn test_should_match_dir_rejects_root() {
-        assert!(!should_match_dir("/Users/jonas/code", "/"));
-    }
-
-    #[test]
-    fn test_should_match_dir_rejects_sibling() {
-        assert!(!should_match_dir(
-            "/Users/jonas/code/other",
-            "/Users/jonas/code/project"
-        ));
-    }
-
-    #[test]
-    fn match_codex_by_dir_uses_entry_cwd_not_map_key() {
-        let mut entries = HashMap::new();
-        entries.insert(
-            "session-123".to_string(),
-            CodexSession::new(
-                "session-123".to_string(),
-                "/Users/jonas/code/project".to_string(),
-                AgentState::Idle,
-                1.0,
-            ),
-        );
-
-        let matched = match_codex_by_dir("/Users/jonas/code/project/src", &entries)
-            .expect("entry should match by cwd");
-        assert_eq!(matched.session_id, "session-123");
-    }
-
-    #[test]
     fn socket_protocol_ping_returns_pid() {
         let (paths, _state_path, tx, worker, guard) = spawn_test_socket_daemon("socket-ping");
 
@@ -2270,7 +1852,7 @@ mod tests {
 
         assert!(
             response
-                .claude
+                .sessions
                 .iter()
                 .any(|entry| entry.session_id == event.session_id
                     && entry.tmux_id.as_deref() == Some("@999")

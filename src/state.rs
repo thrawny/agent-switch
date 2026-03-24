@@ -1,7 +1,6 @@
-use crate::projects;
 use log::warn;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -52,31 +51,10 @@ pub struct Session {
     pub window: WindowId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexBinding {
-    pub session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    pub updated_at: f64,
-    pub window: WindowId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexSession {
-    pub session_id: String,
-    pub cwd: String,
-    pub state: SessionState,
-    pub state_updated: f64,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionStore {
     #[serde(default)]
     pub sessions: HashMap<String, Session>,
-    #[serde(default)]
-    pub codex_bindings: HashMap<String, CodexBinding>,
-    #[serde(default)]
-    pub codex_sessions: HashMap<String, CodexSession>,
 }
 
 pub type Result<T> = std::result::Result<T, StateError>;
@@ -102,15 +80,10 @@ struct WindowProbeError {
 }
 
 #[derive(Debug, Clone, Default)]
-struct TmuxWindowInfo {
-    title: String,
-    command: Option<String>,
-}
+struct TmuxWindowInfo;
 
 #[derive(Debug, Clone, Default)]
-struct NiriWindowInfo {
-    title: Option<String>,
-}
+struct NiriWindowInfo;
 
 impl WindowProbeError {
     fn command_error(backend: &'static str, source: io::Error) -> Self {
@@ -237,31 +210,6 @@ where
     with_locked_store_at_path(&state_file(), mutate)
 }
 
-pub fn upsert_codex_binding(store: &mut SessionStore, binding: CodexBinding) {
-    let tmux_id = binding.window.tmux_id.clone();
-    let niri_id = binding.window.niri_id.clone();
-
-    store.codex_bindings.retain(|existing_id, existing| {
-        if existing_id == &binding.session_id {
-            return false;
-        }
-
-        if tmux_id.is_some() && existing.window.tmux_id == tmux_id {
-            return false;
-        }
-
-        if niri_id.is_some() && existing.window.niri_id == niri_id {
-            return false;
-        }
-
-        true
-    });
-
-    store
-        .codex_bindings
-        .insert(binding.session_id.clone(), binding);
-}
-
 pub fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -296,9 +244,6 @@ pub fn find_by_session_id_mut<'a>(
 
 /// Remove stale sessions (windows that no longer exist)
 pub fn cleanup_stale(store: &mut SessionStore) {
-    let previously_bound_codex_sessions: HashSet<String> =
-        store.codex_bindings.keys().cloned().collect();
-    let codex_aliases = load_codex_aliases();
     let live_tmux_windows = store_uses_tmux_windows(store).then(get_live_tmux_windows);
     let live_niri_windows = store_uses_niri_windows(store).then(get_live_niri_windows);
 
@@ -317,17 +262,12 @@ pub fn cleanup_stale(store: &mut SessionStore) {
         live_niri_windows
             .as_ref()
             .and_then(|result| result.as_ref().ok()),
-        &codex_aliases,
     );
 
     let cutoff = now() - STALE_SESSION_MAX_AGE_SECS;
     store
         .sessions
         .retain(|_, session| session.state_updated > cutoff);
-    store
-        .codex_bindings
-        .retain(|_, binding| binding.updated_at > cutoff);
-    cleanup_unbound_codex_sessions(store, &previously_bound_codex_sessions, cutoff);
 }
 
 fn store_uses_tmux_windows(store: &SessionStore) -> bool {
@@ -335,10 +275,6 @@ fn store_uses_tmux_windows(store: &SessionStore) -> bool {
         .sessions
         .values()
         .any(|session| session.window.tmux_id.is_some())
-        || store
-            .codex_bindings
-            .values()
-            .any(|binding| binding.window.tmux_id.is_some())
 }
 
 fn store_uses_niri_windows(store: &SessionStore) -> bool {
@@ -346,50 +282,15 @@ fn store_uses_niri_windows(store: &SessionStore) -> bool {
         .sessions
         .values()
         .any(|session| session.window.niri_id.is_some())
-        || store
-            .codex_bindings
-            .values()
-            .any(|binding| binding.window.niri_id.is_some())
 }
 
 fn cleanup_stale_with_window_snapshots(
     store: &mut SessionStore,
     live_tmux_windows: Option<&HashMap<String, TmuxWindowInfo>>,
     live_niri_windows: Option<&HashMap<String, NiriWindowInfo>>,
-    codex_aliases: &[String],
 ) {
     store.sessions.retain(|_, session| {
         retain_window_binding(&mut session.window, &live_tmux_windows, &live_niri_windows)
-    });
-
-    store.codex_bindings.retain(|_, binding| {
-        retain_window_binding(&mut binding.window, &live_tmux_windows, &live_niri_windows)
-    });
-
-    store.codex_bindings.retain(|_, binding| {
-        codex_binding_matches_live_window(
-            binding,
-            live_tmux_windows,
-            live_niri_windows,
-            codex_aliases,
-        )
-    });
-}
-
-fn cleanup_unbound_codex_sessions(
-    store: &mut SessionStore,
-    previously_bound_session_ids: &HashSet<String>,
-    cutoff: f64,
-) {
-    let still_bound_session_ids: HashSet<String> = store.codex_bindings.keys().cloned().collect();
-    store.codex_sessions.retain(|session_id, session| {
-        if still_bound_session_ids.contains(session_id) {
-            return true;
-        }
-        if previously_bound_session_ids.contains(session_id) {
-            return false;
-        }
-        session.state_updated > cutoff
     });
 }
 
@@ -413,13 +314,7 @@ fn get_live_tmux_windows() -> std::result::Result<HashMap<String, TmuxWindowInfo
         let mut parts = line.splitn(3, '\t');
         let id = parts.next().unwrap_or("").trim();
         if !id.is_empty() {
-            let title = parts.next().unwrap_or("").trim().to_string();
-            let command = parts
-                .next()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            windows.insert(id.to_string(), TmuxWindowInfo { title, command });
+            windows.insert(id.to_string(), TmuxWindowInfo);
         }
     }
 
@@ -441,13 +336,7 @@ fn get_live_niri_windows() -> std::result::Result<HashMap<String, NiriWindowInfo
         .map_err(|err| WindowProbeError::parse_error("niri", err))?;
     for window in parsed_windows {
         if let Some(id) = window.get("id").and_then(|v| v.as_u64()) {
-            let title = window
-                .get("title")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            windows.insert(id.to_string(), NiriWindowInfo { title });
+            windows.insert(id.to_string(), NiriWindowInfo);
         }
     }
 
@@ -476,57 +365,6 @@ fn retain_window_binding(
     }
 
     window.tmux_id.is_some() || window.niri_id.is_some()
-}
-
-fn load_codex_aliases() -> Vec<String> {
-    match projects::load_config() {
-        Ok(config) => projects::normalized_codex_aliases(&config.codex_aliases),
-        Err(err) => {
-            warn!("Failed to load config for Codex aliases: {}", err);
-            projects::normalized_codex_aliases(&[])
-        }
-    }
-}
-
-fn codex_binding_matches_live_window(
-    binding: &CodexBinding,
-    live_tmux_windows: Option<&HashMap<String, TmuxWindowInfo>>,
-    live_niri_windows: Option<&HashMap<String, NiriWindowInfo>>,
-    codex_aliases: &[String],
-) -> bool {
-    let tmux_checked = binding.window.tmux_id.is_some() && live_tmux_windows.is_some();
-    let tmux_matches = binding
-        .window
-        .tmux_id
-        .as_ref()
-        .and_then(|id| live_tmux_windows.and_then(|windows| windows.get(id)))
-        .is_some_and(|window| tmux_window_matches_codex_aliases(window, codex_aliases));
-
-    let niri_checked = binding.window.niri_id.is_some() && live_niri_windows.is_some();
-    let niri_matches = binding
-        .window
-        .niri_id
-        .as_ref()
-        .and_then(|id| live_niri_windows.and_then(|windows| windows.get(id)))
-        .is_some_and(|window| niri_window_matches_codex_aliases(window, codex_aliases));
-
-    let checked_any = tmux_checked || niri_checked;
-    !checked_any || tmux_matches || niri_matches
-}
-
-fn tmux_window_matches_codex_aliases(window: &TmuxWindowInfo, codex_aliases: &[String]) -> bool {
-    projects::contains_alias_token(&window.title, codex_aliases)
-        || window
-            .command
-            .as_deref()
-            .is_some_and(|command| projects::contains_alias_token(command, codex_aliases))
-}
-
-fn niri_window_matches_codex_aliases(window: &NiriWindowInfo, codex_aliases: &[String]) -> bool {
-    window
-        .title
-        .as_deref()
-        .is_some_and(|title| projects::contains_alias_token(title, codex_aliases))
 }
 
 pub(crate) fn with_locked_store_at_path<T, F>(path: &Path, mutate: F) -> Result<T>
@@ -644,10 +482,6 @@ mod tests {
         dir.join("sessions.json")
     }
 
-    fn codex_aliases() -> Vec<String> {
-        projects::normalized_codex_aliases(&["cx".to_string(), "cxy".to_string()])
-    }
-
     fn tmux_windows(ids: &[&str]) -> HashMap<String, TmuxWindowInfo> {
         ids.iter()
             .map(|id| (id.to_string(), TmuxWindowInfo::default()))
@@ -658,46 +492,6 @@ mod tests {
         ids.iter()
             .map(|id| (id.to_string(), NiriWindowInfo::default()))
             .collect()
-    }
-
-    #[test]
-    fn codex_binding_replaces_existing_binding_for_same_window() {
-        let mut store = SessionStore::default();
-
-        upsert_codex_binding(
-            &mut store,
-            CodexBinding {
-                session_id: "first".to_string(),
-                cwd: Some("/tmp/project".to_string()),
-                updated_at: 1.0,
-                window: WindowId {
-                    niri_id: Some("42".to_string()),
-                    tmux_id: None,
-                },
-            },
-        );
-
-        upsert_codex_binding(
-            &mut store,
-            CodexBinding {
-                session_id: "second".to_string(),
-                cwd: Some("/tmp/project".to_string()),
-                updated_at: 2.0,
-                window: WindowId {
-                    niri_id: Some("42".to_string()),
-                    tmux_id: None,
-                },
-            },
-        );
-
-        assert!(!store.codex_bindings.contains_key("first"));
-        assert_eq!(
-            store
-                .codex_bindings
-                .get("second")
-                .and_then(|binding| binding.window.niri_id.as_deref()),
-            Some("42")
-        );
     }
 
     #[test]
@@ -735,32 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_stale_keeps_codex_binding_when_niri_probe_fails() {
-        let mut store = SessionStore::default();
-        store.codex_bindings.insert(
-            "codex-1".to_string(),
-            CodexBinding {
-                session_id: "codex-1".to_string(),
-                cwd: Some("/tmp/project".to_string()),
-                updated_at: now(),
-                window: WindowId {
-                    niri_id: Some("42".to_string()),
-                    tmux_id: None,
-                },
-            },
-        );
-
-        let valid_tmux = tmux_windows(&[]);
-        cleanup_stale_with_window_snapshots(&mut store, Some(&valid_tmux), None, &codex_aliases());
-
-        let binding = store
-            .codex_bindings
-            .get("codex-1")
-            .expect("binding should be preserved when niri probe fails");
-        assert_eq!(binding.window.niri_id.as_deref(), Some("42"));
-    }
-
-    #[test]
     fn cleanup_stale_drops_session_when_known_window_ids_are_all_invalid() {
         let mut store = SessionStore::default();
         store.sessions.insert(
@@ -782,151 +550,13 @@ mod tests {
 
         let valid_tmux = tmux_windows(&[]);
         let valid_niri = niri_windows(&[]);
-        cleanup_stale_with_window_snapshots(
-            &mut store,
-            Some(&valid_tmux),
-            Some(&valid_niri),
-            &codex_aliases(),
-        );
+        cleanup_stale_with_window_snapshots(&mut store, Some(&valid_tmux), Some(&valid_niri));
 
         assert!(store.sessions.is_empty());
     }
 
     #[test]
-    fn cleanup_stale_drops_codex_binding_when_niri_title_no_longer_matches_alias() {
-        let mut store = SessionStore::default();
-        store.codex_bindings.insert(
-            "codex-1".to_string(),
-            CodexBinding {
-                session_id: "codex-1".to_string(),
-                cwd: Some("/tmp/project".to_string()),
-                updated_at: now(),
-                window: WindowId {
-                    niri_id: Some("42".to_string()),
-                    tmux_id: None,
-                },
-            },
-        );
-
-        let live_niri_windows = HashMap::from([(
-            "42".to_string(),
-            NiriWindowInfo {
-                title: Some("bash".to_string()),
-            },
-        )]);
-
-        cleanup_stale_with_window_snapshots(
-            &mut store,
-            None,
-            Some(&live_niri_windows),
-            &codex_aliases(),
-        );
-
-        assert!(store.codex_bindings.is_empty());
-    }
-
-    #[test]
-    fn cleanup_stale_keeps_codex_binding_when_tmux_command_matches_alias() {
-        let mut store = SessionStore::default();
-        store.codex_bindings.insert(
-            "codex-1".to_string(),
-            CodexBinding {
-                session_id: "codex-1".to_string(),
-                cwd: Some("/tmp/project".to_string()),
-                updated_at: now(),
-                window: WindowId {
-                    niri_id: None,
-                    tmux_id: Some("@9".to_string()),
-                },
-            },
-        );
-
-        let live_tmux_windows = HashMap::from([(
-            "@9".to_string(),
-            TmuxWindowInfo {
-                title: "shell".to_string(),
-                command: Some("cxy".to_string()),
-            },
-        )]);
-
-        cleanup_stale_with_window_snapshots(
-            &mut store,
-            Some(&live_tmux_windows),
-            None,
-            &codex_aliases(),
-        );
-
-        assert!(store.codex_bindings.contains_key("codex-1"));
-    }
-
-    #[test]
-    fn cleanup_unbound_codex_sessions_drops_session_that_lost_binding() {
-        let mut store = SessionStore::default();
-        store.codex_sessions.insert(
-            "codex-1".to_string(),
-            CodexSession {
-                session_id: "codex-1".to_string(),
-                cwd: "/tmp/project".to_string(),
-                state: SessionState::Idle,
-                state_updated: now(),
-            },
-        );
-
-        cleanup_unbound_codex_sessions(
-            &mut store,
-            &HashSet::from(["codex-1".to_string()]),
-            now() - STALE_SESSION_MAX_AGE_SECS,
-        );
-
-        assert!(store.codex_sessions.is_empty());
-    }
-
-    #[test]
-    fn cleanup_unbound_codex_sessions_keeps_recent_unbound_session() {
-        let mut store = SessionStore::default();
-        store.codex_sessions.insert(
-            "codex-1".to_string(),
-            CodexSession {
-                session_id: "codex-1".to_string(),
-                cwd: "/tmp/project".to_string(),
-                state: SessionState::Idle,
-                state_updated: now(),
-            },
-        );
-
-        cleanup_unbound_codex_sessions(
-            &mut store,
-            &HashSet::new(),
-            now() - STALE_SESSION_MAX_AGE_SECS,
-        );
-
-        assert!(store.codex_sessions.contains_key("codex-1"));
-    }
-
-    #[test]
-    fn cleanup_unbound_codex_sessions_drops_old_unbound_session() {
-        let mut store = SessionStore::default();
-        store.codex_sessions.insert(
-            "codex-1".to_string(),
-            CodexSession {
-                session_id: "codex-1".to_string(),
-                cwd: "/tmp/project".to_string(),
-                state: SessionState::Idle,
-                state_updated: now() - STALE_SESSION_MAX_AGE_SECS - 1.0,
-            },
-        );
-
-        cleanup_unbound_codex_sessions(
-            &mut store,
-            &HashSet::new(),
-            now() - STALE_SESSION_MAX_AGE_SECS,
-        );
-
-        assert!(store.codex_sessions.is_empty());
-    }
-
-    #[test]
-    fn store_uses_tmux_windows_checks_sessions_and_bindings() {
+    fn store_uses_tmux_windows_checks_sessions() {
         let mut store = SessionStore::default();
         assert!(!store_uses_tmux_windows(&store));
 
@@ -947,25 +577,10 @@ mod tests {
             },
         );
         assert!(store_uses_tmux_windows(&store));
-
-        store.sessions.clear();
-        store.codex_bindings.insert(
-            "codex".to_string(),
-            CodexBinding {
-                session_id: "codex".to_string(),
-                cwd: Some("/tmp/project".to_string()),
-                updated_at: 1.0,
-                window: WindowId {
-                    niri_id: None,
-                    tmux_id: Some("@10".to_string()),
-                },
-            },
-        );
-        assert!(store_uses_tmux_windows(&store));
     }
 
     #[test]
-    fn store_uses_niri_windows_checks_sessions_and_bindings() {
+    fn store_uses_niri_windows_checks_sessions() {
         let mut store = SessionStore::default();
         assert!(!store_uses_niri_windows(&store));
 
@@ -981,21 +596,6 @@ mod tests {
                 transcript_path: None,
                 window: WindowId {
                     niri_id: Some("42".to_string()),
-                    tmux_id: None,
-                },
-            },
-        );
-        assert!(store_uses_niri_windows(&store));
-
-        store.sessions.clear();
-        store.codex_bindings.insert(
-            "codex".to_string(),
-            CodexBinding {
-                session_id: "codex".to_string(),
-                cwd: Some("/tmp/project".to_string()),
-                updated_at: 1.0,
-                window: WindowId {
-                    niri_id: Some("43".to_string()),
                     tmux_id: None,
                 },
             },

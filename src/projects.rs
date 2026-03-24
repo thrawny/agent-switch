@@ -25,8 +25,6 @@ pub struct Config {
     pub project: Vec<Project>,
     #[serde(default)]
     pub ignore: Vec<String>,
-    #[serde(default, alias = "codexAliases", alias = "codex_aliases")]
-    pub codex_aliases: Vec<String>,
     #[serde(
         default = "default_ignore_unnamed_workspaces",
         alias = "ignoreUnnamedWorkspaces",
@@ -51,7 +49,6 @@ impl Default for Config {
         Self {
             project: Vec::new(),
             ignore: Vec::new(),
-            codex_aliases: Vec::new(),
             ignore_unnamed_workspaces: default_ignore_unnamed_workspaces(),
             ignore_numeric_sessions: default_ignore_numeric_sessions(),
             theme: default_theme(),
@@ -168,34 +165,6 @@ pub fn should_ignore_name(name: &str, config: &Config) -> bool {
         || (config.ignore_numeric_sessions && is_numeric_name(name))
 }
 
-pub fn normalized_codex_aliases(config_aliases: &[String]) -> Vec<String> {
-    let mut aliases = vec!["codex".to_string()];
-    for alias in config_aliases {
-        let trimmed = alias.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if aliases
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(trimmed))
-        {
-            continue;
-        }
-        aliases.push(trimmed.to_string());
-    }
-    aliases
-}
-
-pub fn contains_alias_token(text: &str, aliases: &[String]) -> bool {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            aliases
-                .iter()
-                .any(|alias| token.eq_ignore_ascii_case(alias))
-        })
-}
-
 fn load_config_from_path(path: &Path) -> Result<Option<Config>, String> {
     match fs::read_to_string(path) {
         Ok(content) => toml::from_str::<Config>(&content)
@@ -261,18 +230,5 @@ dir = "~/code/wayvoice"
             configured_project_names(&config),
             vec!["agent-switch", "main", "wayvoice"]
         );
-    }
-
-    #[test]
-    fn codex_aliases_are_normalized_and_matched_case_insensitively() {
-        let aliases = normalized_codex_aliases(&["cx".to_string(), "CXY".to_string()]);
-        assert_eq!(aliases, vec!["codex", "cx", "CXY"]);
-        assert!(contains_alias_token("codex", &aliases));
-        assert!(contains_alias_token("CX", &aliases));
-        assert!(contains_alias_token("cxy", &aliases));
-        assert!(contains_alias_token("cxy resume", &aliases));
-        assert!(contains_alias_token("/home/me/bin/cx", &aliases));
-        assert!(!contains_alias_token("claude", &aliases));
-        assert!(!contains_alias_token("execute", &aliases));
     }
 }

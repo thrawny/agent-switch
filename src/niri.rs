@@ -1,4 +1,4 @@
-use crate::daemon::{self, AgentSession, AgentState, CodexSession, DaemonMessage, SessionCache};
+use crate::daemon::{self, AgentSession, AgentState, DaemonMessage, SessionCache};
 use crate::projects;
 use crate::state;
 use crate::themes;
@@ -78,15 +78,12 @@ struct WorkspaceColumn {
 struct AppState {
     config: projects::Config,
     theme: &'static themes::Theme,
-    codex_aliases: Vec<String>,
     entries: Vec<WorkspaceColumn>,
     agent_entries: Vec<WorkspaceColumn>,
     pending_key: Option<char>,
     agents_view: bool,
     focused_at_open: Option<u64>,
     agent_sessions: HashMap<u64, AgentSession>,
-    codex_bindings: HashMap<u64, String>,
-    codex_sessions: HashMap<String, CodexSession>,
     last_config_error: Option<String>,
 }
 
@@ -156,36 +153,10 @@ fn session_niri_window_id(window_key: &str, session: &state::Session) -> Option<
         .and_then(|id| id.parse::<u64>().ok())
 }
 
-fn codex_bindings_from_store(store: &state::SessionStore) -> HashMap<u64, String> {
-    let mut bindings = HashMap::new();
-
-    for binding in store.codex_bindings.values() {
-        let window_id = match binding.window.niri_id.as_ref() {
-            Some(id) => id.parse::<u64>().ok(),
-            None => continue,
-        };
-        let Some(window_id) = window_id else { continue };
-        bindings.insert(window_id, binding.session_id.clone());
-    }
-
-    bindings
-}
-
-fn overlay_snapshot_from_cache(
-    cache: &Arc<Mutex<SessionCache>>,
-) -> (
-    HashMap<u64, AgentSession>,
-    HashMap<u64, String>,
-    HashMap<String, CodexSession>,
-) {
+fn overlay_snapshot_from_cache(cache: &Arc<Mutex<SessionCache>>) -> HashMap<u64, AgentSession> {
     let mut cache = cache.lock().unwrap();
     cache.refresh_dynamic_agent_states();
-    cache.refresh_dynamic_codex_states();
-    (
-        agent_sessions_from_store(&cache.store),
-        codex_bindings_from_store(&cache.store),
-        cache.codex_sessions.clone(),
-    )
+    agent_sessions_from_store(&cache.store)
 }
 
 fn load_clean_store_after_cleanup() -> state::Result<state::SessionStore> {
@@ -277,10 +248,6 @@ fn request_workspace_refresh(
     });
 }
 
-fn window_title_matches_codex_aliases(title: &str, aliases: &[String]) -> bool {
-    projects::contains_alias_token(title, aliases)
-}
-
 fn named_claude_title(title: &str) -> Option<String> {
     let name = title.trim().strip_prefix("✳ ")?.trim();
     if name.is_empty() || name.eq_ignore_ascii_case("Claude Code") {
@@ -341,28 +308,6 @@ fn agent_fallback_from_window_title(entry: &WorkspaceColumn) -> Option<AgentInfo
         });
     }
     None
-}
-
-fn codex_state_for_entry(
-    entry: &WorkspaceColumn,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
-) -> Option<(AgentState, f64)> {
-    if let Some(window_id) = entry.window_id
-        && let Some(session_id) = codex_bindings.get(&window_id)
-        && let Some(session) = codex_sessions.get(session_id)
-    {
-        return Some((session.state, session.state_updated));
-    }
-
-    let title = entry.window_title.as_deref()?.trim();
-    if !window_title_matches_codex_aliases(title, codex_aliases) {
-        return None;
-    }
-    let dir = entry.dir.as_deref()?;
-    let dir = shellexpand::tilde(dir).to_string();
-    daemon::match_codex_by_dir(&dir, codex_sessions).map(|s| (s.state, s.state_updated))
 }
 
 fn niri_request(request: Request) -> Option<Response> {
@@ -1152,21 +1097,17 @@ fn build_ui(
     let theme = themes::get(&config.theme);
     let entries = get_workspace_columns(&config);
     let agent_entries = get_agent_workspace_columns(&config);
-    let (agent_sessions, codex_bindings, codex_sessions) = overlay_snapshot_from_cache(&cache);
-    let codex_aliases = projects::normalized_codex_aliases(&config.codex_aliases);
+    let agent_sessions = overlay_snapshot_from_cache(&cache);
 
     let state = Rc::new(RefCell::new(AppState {
         config,
         theme,
-        codex_aliases,
         entries,
         agent_entries,
         pending_key: None,
         agents_view: false,
         focused_at_open: None,
         agent_sessions,
-        codex_bindings,
-        codex_sessions,
         last_config_error,
     }));
 
@@ -1197,9 +1138,6 @@ fn build_ui(
             &state_ref.entries,
             state_ref.pending_key,
             &state_ref.agent_sessions,
-            &state_ref.codex_bindings,
-            &state_ref.codex_sessions,
-            &state_ref.codex_aliases,
             false,
             state_ref.theme,
         );
@@ -1228,9 +1166,6 @@ fn build_ui(
                 main_box,
                 &state.agent_entries,
                 &state.agent_sessions,
-                &state.codex_bindings,
-                &state.codex_sessions,
-                &state.codex_aliases,
                 state.focused_at_open,
                 state.theme,
             );
@@ -1240,9 +1175,6 @@ fn build_ui(
                 &state.entries,
                 state.pending_key,
                 &state.agent_sessions,
-                &state.codex_bindings,
-                &state.codex_sessions,
-                &state.codex_aliases,
                 lock_label_widths,
                 state.theme,
             );
@@ -1340,9 +1272,6 @@ fn build_ui(
             if let Some(target) = find_smart_jump_target(
                 &state.agent_entries,
                 &state.agent_sessions,
-                &state.codex_bindings,
-                &state.codex_sessions,
-                &state.codex_aliases,
                 state.focused_at_open,
             ) {
                 let target = target.clone();
@@ -1362,9 +1291,6 @@ fn build_ui(
                 if let Some(target) = find_agent_entry_for_selection_key(
                     &state.agent_entries,
                     &state.agent_sessions,
-                    &state.codex_bindings,
-                    &state.codex_sessions,
-                    &state.codex_aliases,
                     state.focused_at_open,
                     key_char,
                 ) {
@@ -1396,9 +1322,6 @@ fn build_ui(
                     state.pending_key = None;
                     let entries = state.entries.clone();
                     let agent_sessions = state.agent_sessions.clone();
-                    let codex_bindings = state.codex_bindings.clone();
-                    let codex_sessions = state.codex_sessions.clone();
-                    let codex_aliases = state.codex_aliases.clone();
                     let theme = state.theme;
                     drop(state);
                     build_entry_list(
@@ -1406,9 +1329,6 @@ fn build_ui(
                         &entries,
                         None,
                         &agent_sessions,
-                        &codex_bindings,
-                        &codex_sessions,
-                        &codex_aliases,
                         true,
                         theme,
                     );
@@ -1418,9 +1338,6 @@ fn build_ui(
                 state.pending_key = Some(key_char);
                 let entries = state.entries.clone();
                 let agent_sessions = state.agent_sessions.clone();
-                let codex_bindings = state.codex_bindings.clone();
-                let codex_sessions = state.codex_sessions.clone();
-                let codex_aliases = state.codex_aliases.clone();
                 let theme = state.theme;
                 drop(state);
                 build_entry_list(
@@ -1428,9 +1345,6 @@ fn build_ui(
                     &entries,
                     Some(key_char),
                     &agent_sessions,
-                    &codex_bindings,
-                    &codex_sessions,
-                    &codex_aliases,
                     true,
                     theme,
                 );
@@ -1505,15 +1419,12 @@ fn build_ui(
                     } else {
                         let open_start = Instant::now();
                         let snapshot_start = Instant::now();
-                        let (agent_sessions, codex_bindings, codex_sessions) =
-                            overlay_snapshot_from_cache(&cache_for_poll);
+                        let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
                         let snapshot_elapsed = snapshot_start.elapsed();
                         dirty_state_for_poll.clear_all();
 
                         let mut state = state_for_poll.borrow_mut();
                         state.agent_sessions = agent_sessions;
-                        state.codex_bindings = codex_bindings;
-                        state.codex_sessions = codex_sessions;
                         state.pending_key = None;
                         state.agents_view = is_agents;
                         state.focused_at_open = *focused_window_for_poll.lock().unwrap();
@@ -1565,8 +1476,6 @@ fn build_ui(
                             state.theme = themes::get(&config.theme);
                             apply_theme_css(&css_provider_for_poll, state.theme);
                             state.config = config;
-                            state.codex_aliases =
-                                projects::normalized_codex_aliases(&state.config.codex_aliases);
                             state.last_config_error = None;
                             debug!("config reloaded");
                             true
@@ -1663,11 +1572,9 @@ fn build_ui(
                         "sessions-changed queue delay: {}ms",
                         enqueued_at.elapsed().as_millis(),
                     );
-                    let (agent_sessions, codex_bindings, _) =
-                        overlay_snapshot_from_cache(&cache_for_poll);
+                    let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
                     let mut state = state_for_poll.borrow_mut();
                     state.agent_sessions = agent_sessions;
-                    state.codex_bindings = codex_bindings;
                     if window_for_poll.is_visible() {
                         rebuild_for_poll(&main_box_for_poll, &state, false);
                         let wide_agents_layout = uses_wide_agents_layout(&state);
@@ -1707,12 +1614,9 @@ fn build_ui(
                 let mut state = state_for_poll.borrow_mut();
 
                 let snapshot_start = Instant::now();
-                let (agent_sessions, codex_bindings, codex_sessions) =
-                    overlay_snapshot_from_cache(&cache_for_poll);
+                let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
                 let snapshot_elapsed = snapshot_start.elapsed();
                 state.agent_sessions = agent_sessions;
-                state.codex_bindings = codex_bindings;
-                state.codex_sessions = codex_sessions;
                 log::debug!(
                     "dirty refresh snapshot: {}ms sessions_dirty=true",
                     snapshot_elapsed.as_millis(),
@@ -1788,30 +1692,16 @@ struct AgentInfo {
 fn agent_info_for_entry(
     entry: &WorkspaceColumn,
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
 ) -> Option<AgentInfo> {
-    if let Some(window_id) = entry.window_id {
-        if let Some(session) = agent_sessions.get(&window_id) {
-            return Some(AgentInfo {
-                agent: session.agent.clone(),
-                state: session.state,
-                state_updated: Some(session.state_updated),
-                title: named_title_for_agent(entry, &session.agent),
-            });
-        }
-
-        if let Some((state, state_updated)) =
-            codex_state_for_entry(entry, codex_bindings, codex_sessions, codex_aliases)
-        {
-            return Some(AgentInfo {
-                agent: "codex".to_string(),
-                state,
-                state_updated: Some(state_updated),
-                title: None,
-            });
-        }
+    if let Some(window_id) = entry.window_id
+        && let Some(session) = agent_sessions.get(&window_id)
+    {
+        return Some(AgentInfo {
+            agent: session.agent.clone(),
+            state: session.state,
+            state_updated: Some(session.state_updated),
+            title: named_title_for_agent(entry, &session.agent),
+        });
     }
 
     if let Some(info) = agent_fallback_from_window_title(entry) {
@@ -1833,18 +1723,9 @@ fn agent_info_for_entry(
 fn entry_markup(
     entry: &WorkspaceColumn,
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
     theme: &themes::Theme,
 ) -> String {
-    if let Some(info) = agent_info_for_entry(
-        entry,
-        agent_sessions,
-        codex_bindings,
-        codex_sessions,
-        codex_aliases,
-    ) {
+    if let Some(info) = agent_info_for_entry(entry, agent_sessions) {
         let agent = if let Some(title) = info.title.as_deref() {
             let title = glib::markup_escape_text(title);
             format!("{} {}", glib::markup_escape_text(&info.agent), title)
@@ -1867,9 +1748,6 @@ fn entry_markup(
 fn build_entry_row(
     entry: &WorkspaceColumn,
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
     lock_label_widths: bool,
     theme: &themes::Theme,
 ) -> GtkBox {
@@ -1882,14 +1760,7 @@ fn build_entry_row(
     row.append(&key_label);
 
     let name_label = Label::new(None);
-    name_label.set_markup(&entry_markup(
-        entry,
-        agent_sessions,
-        codex_bindings,
-        codex_sessions,
-        codex_aliases,
-        theme,
-    ));
+    name_label.set_markup(&entry_markup(entry, agent_sessions, theme));
     name_label.add_css_class("project");
     name_label.set_xalign(0.0);
     name_label.set_hexpand(true);
@@ -1903,9 +1774,6 @@ fn build_entry_row(
 fn build_workspace_group(
     entries: &[&WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
     lock_label_widths: bool,
     theme: &themes::Theme,
 ) -> GtkBox {
@@ -1923,9 +1791,6 @@ fn build_workspace_group(
         group.append(&build_entry_row(
             entry,
             agent_sessions,
-            codex_bindings,
-            codex_sessions,
-            codex_aliases,
             lock_label_widths,
             theme,
         ));
@@ -1940,9 +1805,6 @@ fn build_entry_list(
     entries: &[WorkspaceColumn],
     pending_key: Option<char>,
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
     lock_label_widths: bool,
     theme: &themes::Theme,
 ) {
@@ -1977,15 +1839,8 @@ fn build_entry_list(
             };
 
             let left_idx = pair_row * 2;
-            let group = build_workspace_group(
-                &groups[left_idx],
-                agent_sessions,
-                codex_bindings,
-                codex_sessions,
-                codex_aliases,
-                lock_label_widths,
-                theme,
-            );
+            let group =
+                build_workspace_group(&groups[left_idx], agent_sessions, lock_label_widths, theme);
             group.set_valign(gtk4::Align::Start);
             group.add_css_class("workspace-column-left");
             grid.attach(&group, 0, grid_row, 1, 1);
@@ -1995,9 +1850,6 @@ fn build_entry_list(
                 let group = build_workspace_group(
                     &groups[right_idx],
                     agent_sessions,
-                    codex_bindings,
-                    codex_sessions,
-                    codex_aliases,
                     lock_label_widths,
                     theme,
                 );
@@ -2018,9 +1870,6 @@ fn build_entry_list(
             container.append(&build_workspace_group(
                 group_entries,
                 agent_sessions,
-                codex_bindings,
-                codex_sessions,
-                codex_aliases,
                 lock_label_widths,
                 theme,
             ));
@@ -2031,39 +1880,16 @@ fn build_entry_list(
 fn agents_view_has_titles(
     entries: &[WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
 ) -> bool {
-    sorted_agent_entries(
-        entries,
-        agent_sessions,
-        codex_bindings,
-        codex_sessions,
-        codex_aliases,
-    )
-    .into_iter()
-    .any(|entry| {
-        agent_info_for_entry(
-            entry,
-            agent_sessions,
-            codex_bindings,
-            codex_sessions,
-            codex_aliases,
-        )
-        .is_some_and(|info| info.title.is_some())
-    })
+    sorted_agent_entries(entries, agent_sessions)
+        .into_iter()
+        .any(|entry| {
+            agent_info_for_entry(entry, agent_sessions).is_some_and(|info| info.title.is_some())
+        })
 }
 
 fn uses_wide_agents_layout(state: &AppState) -> bool {
-    state.agents_view
-        && agents_view_has_titles(
-            &state.entries,
-            &state.agent_sessions,
-            &state.codex_bindings,
-            &state.codex_sessions,
-            &state.codex_aliases,
-        )
+    state.agents_view && agents_view_has_titles(&state.entries, &state.agent_sessions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2071,9 +1897,6 @@ fn build_agents_list(
     container: &GtkBox,
     entries: &[WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
     focused_window_id: Option<u64>,
     theme: &themes::Theme,
 ) {
@@ -2081,27 +1904,14 @@ fn build_agents_list(
         container.remove(&child);
     }
 
-    let agent_entries = sorted_agent_entries(
-        entries,
-        agent_sessions,
-        codex_bindings,
-        codex_sessions,
-        codex_aliases,
-    );
+    let agent_entries = sorted_agent_entries(entries, agent_sessions);
 
     let jump_target_id = agent_entries
         .iter()
         .find(|e| e.window_id != focused_window_id)
         .and_then(|e| e.window_id);
     let show_title_column = agent_entries.iter().any(|entry| {
-        agent_info_for_entry(
-            entry,
-            agent_sessions,
-            codex_bindings,
-            codex_sessions,
-            codex_aliases,
-        )
-        .is_some_and(|info| info.title.is_some())
+        agent_info_for_entry(entry, agent_sessions).is_some_and(|info| info.title.is_some())
     });
 
     let grid = Grid::new();
@@ -2139,13 +1949,7 @@ fn build_agents_list(
         ws_label.set_xalign(0.0);
         grid.attach(&ws_label, 2, row, 1, 1);
 
-        if let Some(info) = agent_info_for_entry(
-            entry,
-            agent_sessions,
-            codex_bindings,
-            codex_sessions,
-            codex_aliases,
-        ) {
+        if let Some(info) = agent_info_for_entry(entry, agent_sessions) {
             let agent_column = if show_title_column { 4 } else { 3 };
             let icon_column = if show_title_column { 5 } else { 4 };
             let duration_column = if show_title_column { 6 } else { 5 };
@@ -2191,39 +1995,18 @@ fn build_agents_list(
 fn sorted_agent_entries<'a>(
     entries: &'a [WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
 ) -> Vec<&'a WorkspaceColumn> {
     let mut result: Vec<_> = entries
         .iter()
         .filter(|e| {
-            agent_info_for_entry(
-                e,
-                agent_sessions,
-                codex_bindings,
-                codex_sessions,
-                codex_aliases,
-            )
-            .is_some_and(|info| info.state_updated.is_some() || info.title.is_some())
+            agent_info_for_entry(e, agent_sessions)
+                .is_some_and(|info| info.state_updated.is_some() || info.title.is_some())
         })
         .collect();
 
     result.sort_by(|a, b| {
-        let info_a = agent_info_for_entry(
-            a,
-            agent_sessions,
-            codex_bindings,
-            codex_sessions,
-            codex_aliases,
-        );
-        let info_b = agent_info_for_entry(
-            b,
-            agent_sessions,
-            codex_bindings,
-            codex_sessions,
-            codex_aliases,
-        );
+        let info_a = agent_info_for_entry(a, agent_sessions);
+        let info_b = agent_info_for_entry(b, agent_sessions);
         let updated_a = info_a.as_ref().and_then(|i| i.state_updated).unwrap_or(0.0);
         let updated_b = info_b.as_ref().and_then(|i| i.state_updated).unwrap_or(0.0);
         let rank_a = info_a
@@ -2287,19 +2070,10 @@ fn agent_selection_key_for_entry(
 fn find_agent_entry_for_selection_key<'a>(
     entries: &'a [WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
     focused_window_id: Option<u64>,
     key: char,
 ) -> Option<&'a WorkspaceColumn> {
-    let sorted = sorted_agent_entries(
-        entries,
-        agent_sessions,
-        codex_bindings,
-        codex_sessions,
-        codex_aliases,
-    );
+    let sorted = sorted_agent_entries(entries, agent_sessions);
 
     sorted
         .iter()
@@ -2311,18 +2085,9 @@ fn find_agent_entry_for_selection_key<'a>(
 fn find_smart_jump_target<'a>(
     entries: &'a [WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
-    codex_bindings: &HashMap<u64, String>,
-    codex_sessions: &HashMap<String, CodexSession>,
-    codex_aliases: &[String],
     focused_window_id: Option<u64>,
 ) -> Option<&'a WorkspaceColumn> {
-    let sorted = sorted_agent_entries(
-        entries,
-        agent_sessions,
-        codex_bindings,
-        codex_sessions,
-        codex_aliases,
-    );
+    let sorted = sorted_agent_entries(entries, agent_sessions);
     sorted
         .into_iter()
         .find(|e| e.window_id != focused_window_id)
@@ -2533,15 +2298,12 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     let state = Rc::new(RefCell::new(AppState {
         config,
         theme,
-        codex_aliases: vec![],
         entries,
         agent_entries,
         pending_key: None,
         agents_view: false,
         focused_at_open: None,
         agent_sessions,
-        codex_bindings: HashMap::new(),
-        codex_sessions: HashMap::new(),
         last_config_error: None,
     }));
 
@@ -2571,9 +2333,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
             &s.entries,
             s.pending_key,
             &s.agent_sessions,
-            &s.codex_bindings,
-            &s.codex_sessions,
-            &s.codex_aliases,
             false,
             s.theme,
         );
@@ -2607,9 +2366,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
                 s.pending_key = None;
                 let entries = s.entries.clone();
                 let agent_sessions = s.agent_sessions.clone();
-                let codex_bindings = s.codex_bindings.clone();
-                let codex_sessions = s.codex_sessions.clone();
-                let codex_aliases = s.codex_aliases.clone();
                 let theme = s.theme;
                 drop(s);
                 build_entry_list(
@@ -2617,9 +2373,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
                     &entries,
                     None,
                     &agent_sessions,
-                    &codex_bindings,
-                    &codex_sessions,
-                    &codex_aliases,
                     true,
                     theme,
                 );
@@ -2637,9 +2390,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
                 s.pending_key = None;
                 let entries = s.entries.clone();
                 let agent_sessions = s.agent_sessions.clone();
-                let codex_bindings = s.codex_bindings.clone();
-                let codex_sessions = s.codex_sessions.clone();
-                let codex_aliases = s.codex_aliases.clone();
                 let theme = s.theme;
                 drop(s);
                 build_entry_list(
@@ -2647,9 +2397,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
                     &entries,
                     None,
                     &agent_sessions,
-                    &codex_bindings,
-                    &codex_sessions,
-                    &codex_aliases,
                     true,
                     theme,
                 );
@@ -2658,9 +2405,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
                 s.pending_key = Some(key_char);
                 let entries = s.entries.clone();
                 let agent_sessions = s.agent_sessions.clone();
-                let codex_bindings = s.codex_bindings.clone();
-                let codex_sessions = s.codex_sessions.clone();
-                let codex_aliases = s.codex_aliases.clone();
                 let theme = s.theme;
                 drop(s);
                 build_entry_list(
@@ -2668,9 +2412,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
                     &entries,
                     Some(key_char),
                     &agent_sessions,
-                    &codex_bindings,
-                    &codex_sessions,
-                    &codex_aliases,
                     true,
                     theme,
                 );
@@ -2695,9 +2436,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         let entries = s.entries.clone();
         let pending = s.pending_key;
         let agent_sessions = s.agent_sessions.clone();
-        let codex_bindings = s.codex_bindings.clone();
-        let codex_sessions = s.codex_sessions.clone();
-        let codex_aliases = s.codex_aliases.clone();
         let theme = s.theme;
         drop(s);
         build_entry_list(
@@ -2705,9 +2443,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
             &entries,
             pending,
             &agent_sessions,
-            &codex_bindings,
-            &codex_sessions,
-            &codex_aliases,
             true,
             theme,
         );
@@ -2725,9 +2460,6 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
             &s.entries,
             s.pending_key,
             &s.agent_sessions,
-            &s.codex_bindings,
-            &s.codex_sessions,
-            &s.codex_aliases,
             true,
             s.theme,
         );
@@ -2900,22 +2632,6 @@ ignore = ["web"]
     }
 
     #[test]
-    fn codex_aliases_are_normalized_and_matched_case_insensitively() {
-        let aliases = projects::normalized_codex_aliases(&["cx".to_string(), "CXY".to_string()]);
-        assert_eq!(aliases, vec!["codex", "cx", "CXY"]);
-        assert!(window_title_matches_codex_aliases("codex", &aliases));
-        assert!(window_title_matches_codex_aliases("CX", &aliases));
-        assert!(window_title_matches_codex_aliases("cxy", &aliases));
-        assert!(window_title_matches_codex_aliases("cxy resume", &aliases));
-        assert!(window_title_matches_codex_aliases(
-            "/home/me/bin/cx",
-            &aliases
-        ));
-        assert!(!window_title_matches_codex_aliases("claude", &aliases));
-        assert!(!window_title_matches_codex_aliases("execute", &aliases));
-    }
-
-    #[test]
     fn named_agent_titles_are_extracted_for_claude_and_pi() {
         assert_eq!(
             named_claude_title("✳ debug-helium-launch-issues").as_deref(),
@@ -2948,14 +2664,8 @@ ignore = ["web"]
             },
         )]);
 
-        let info = agent_info_for_entry(
-            &entry,
-            &agent_sessions,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        )
-        .expect("tracked claude session should be detected");
+        let info = agent_info_for_entry(&entry, &agent_sessions)
+            .expect("tracked claude session should be detected");
 
         assert_eq!(info.agent, "claude");
         assert_eq!(info.title.as_deref(), Some("debug-helium-launch-issues"));
@@ -2975,23 +2685,14 @@ ignore = ["web"]
             },
         )]);
 
-        let info = agent_info_for_entry(
-            &entry,
-            &agent_sessions,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        )
-        .expect("tracked claude session should be detected");
+        let info = agent_info_for_entry(&entry, &agent_sessions)
+            .expect("tracked claude session should be detected");
 
         assert_eq!(info.agent, "claude");
         assert_eq!(info.title, None);
         assert!(!agents_view_has_titles(
             std::slice::from_ref(&entry),
             &agent_sessions,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
         ));
     }
 
@@ -3007,23 +2708,11 @@ ignore = ["web"]
         );
         let entries = [entry];
 
-        let sorted = sorted_agent_entries(
-            &entries,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        );
+        let sorted = sorted_agent_entries(&entries, &HashMap::new());
 
         assert_eq!(sorted.len(), 1);
-        let info = agent_info_for_entry(
-            sorted[0],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        )
-        .expect("named pi title should be treated as an agent window");
+        let info = agent_info_for_entry(sorted[0], &HashMap::new())
+            .expect("named pi title should be treated as an agent window");
         assert_eq!(info.agent, "pi");
         assert_eq!(info.title.as_deref(), Some("test-foo"));
         assert_eq!(info.state, AgentState::Idle);
@@ -3053,16 +2742,10 @@ ignore = ["web"]
         assert!(!agents_view_has_titles(
             std::slice::from_ref(&untitled),
             &agent_sessions,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
         ));
         assert!(agents_view_has_titles(
             std::slice::from_ref(&titled),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
         ));
     }
 
@@ -3165,13 +2848,7 @@ dir = "~/code/wayvoice"
             ),
         ]);
 
-        let sorted = sorted_agent_entries(
-            &entries,
-            &agent_sessions,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        );
+        let sorted = sorted_agent_entries(&entries, &agent_sessions);
         let ids: Vec<_> = sorted
             .into_iter()
             .filter_map(|entry| entry.window_id)
@@ -3227,13 +2904,7 @@ dir = "~/code/wayvoice"
                 },
             ),
         ]);
-        let sorted = sorted_agent_entries(
-            &entries,
-            &agent_sessions,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        );
+        let sorted = sorted_agent_entries(&entries, &agent_sessions);
 
         assert_eq!(
             agent_selection_key_for_entry(sorted[0], &sorted, Some(1)),
@@ -3255,29 +2926,13 @@ dir = "~/code/wayvoice"
         );
 
         assert_eq!(
-            find_agent_entry_for_selection_key(
-                &entries,
-                &agent_sessions,
-                &HashMap::new(),
-                &HashMap::new(),
-                &[],
-                Some(1),
-                'h',
-            )
-            .and_then(|entry| entry.window_id),
+            find_agent_entry_for_selection_key(&entries, &agent_sessions, Some(1), 'h')
+                .and_then(|entry| entry.window_id),
             Some(3)
         );
         assert_eq!(
-            find_agent_entry_for_selection_key(
-                &entries,
-                &agent_sessions,
-                &HashMap::new(),
-                &HashMap::new(),
-                &[],
-                Some(1),
-                'j',
-            )
-            .and_then(|entry| entry.window_id),
+            find_agent_entry_for_selection_key(&entries, &agent_sessions, Some(1), 'j')
+                .and_then(|entry| entry.window_id),
             Some(4)
         );
     }
@@ -3310,13 +2965,7 @@ dir = "~/code/wayvoice"
             ),
         ]);
 
-        let sorted = sorted_agent_entries(
-            &entries,
-            &agent_sessions,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        );
+        let sorted = sorted_agent_entries(&entries, &agent_sessions);
         let ids: Vec<_> = sorted
             .into_iter()
             .filter_map(|entry| entry.window_id)
@@ -3352,8 +3001,8 @@ dir = "~/code/wayvoice"
 
         assert!(forwarded.is_none());
         let response = resp_rx.recv().expect("list response should be sent");
-        assert_eq!(response.claude.len(), 1);
-        assert_eq!(response.claude[0].session_id, "session-42");
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(response.sessions[0].session_id, "session-42");
     }
 
     #[test]
@@ -3437,35 +3086,10 @@ dir = "~/code/wayvoice"
 
         refresh_cache_after_cleanup(&cache, || Ok(refreshed_store))
             .expect("cleanup refresh should succeed");
-        let (agent_sessions, _, _) = overlay_snapshot_from_cache(&cache);
+        let agent_sessions = overlay_snapshot_from_cache(&cache);
         assert_eq!(
             agent_sessions.get(&42).map(|session| session.state),
             Some(AgentState::Responding)
-        );
-    }
-
-    #[test]
-    fn overlay_snapshot_cools_stale_codex_responding_sessions() {
-        let cache = Arc::new(Mutex::new(SessionCache::new()));
-        let stale_at = state::now() - 60.0;
-        {
-            let mut cache = cache.lock().unwrap();
-            cache.codex_sessions.insert(
-                "session-1".to_string(),
-                CodexSession::new(
-                    "session-1".to_string(),
-                    "/tmp/project".to_string(),
-                    AgentState::Responding,
-                    stale_at,
-                ),
-            );
-        }
-
-        let (_, _, codex_sessions) = overlay_snapshot_from_cache(&cache);
-
-        assert_eq!(
-            codex_sessions.get("session-1").map(|session| session.state),
-            Some(AgentState::Unknown)
         );
     }
 }

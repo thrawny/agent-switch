@@ -85,10 +85,18 @@ pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
         }
     };
 
+    let agent = match agent_override.map(str::to_string).or(hook.agent) {
+        Some(agent) => agent,
+        None => {
+            eprintln!("Missing agent; pass --agent or include agent in hook payload");
+            return false;
+        }
+    };
+
     let msg = daemon::TrackEvent {
         event,
         session_id,
-        agent: agent_override.map(str::to_string).or(hook.agent),
+        agent: Some(agent),
         cwd: hook.cwd,
         transcript_path: hook.transcript_path,
         notification_type: hook.notification_type,
