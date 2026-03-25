@@ -92,10 +92,21 @@ cargo run --features niri -- serve --niri
 agent-switch niri --toggle
 ```
 
-Optional niri bind:
+### Toggle agents-only view
+
+Opens the overlay filtered to only show windows with active agent sessions:
+
+```bash
+agent-switch niri --toggle-agents
+```
+
+You can also press `a` inside the overlay to switch between the full workspace view and agents-only view. In agents-only view, press `Space` to smart-jump to the most relevant agent window.
+
+Optional niri binds:
 
 ```kdl
 Mod+S { spawn "agent-switch" "niri" "--toggle"; }
+Mod+A { spawn "agent-switch" "niri" "--toggle-agents"; }
 ```
 
 Optional startup entry:
