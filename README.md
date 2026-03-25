@@ -130,7 +130,7 @@ static_workspace = true
 
 [[project]]
 name = "company"
-dir = "~/code/the-company-private"
+dir = "~/code/the-office"
 
 [[project]]
 dir = "~/code/agent-switch" # name inferred from folder if omitted
