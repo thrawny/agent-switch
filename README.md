@@ -221,6 +221,30 @@ Configure the hook in **`~/.codex/hooks.json`**:
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-switch track prompt-submit --agent codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-switch track stop --agent codex",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
