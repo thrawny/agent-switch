@@ -276,7 +276,7 @@ agent-switch list      # dump tracked sessions as JSON
 agent-switch cleanup   # remove stale sessions
 ```
 
-Socket path: `$XDG_RUNTIME_DIR/agent-switch.sock` (fallback: `/tmp/agent-switch.sock`).
+Socket path: `$AGENT_SWITCH_SOCKET` if set, otherwise `$XDG_RUNTIME_DIR/agent-switch.sock` (fallback: `/tmp/agent-switch.sock`).
 
 ---
 

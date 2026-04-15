@@ -61,7 +61,7 @@ src/
 
 ## State
 
-Sessions stored in `~/.local/state/agent-switch/sessions.json`, keyed by window ID (tmux or niri). Daemon communicates via Unix socket at `$XDG_RUNTIME_DIR/agent-switch.sock` (or `/tmp/agent-switch.sock`).
+Sessions stored in `~/.local/state/agent-switch/sessions.json`, keyed by window ID (tmux or niri). Daemon communicates via Unix socket at `$AGENT_SWITCH_SOCKET` if set, otherwise `$XDG_RUNTIME_DIR/agent-switch.sock` (or `/tmp/agent-switch.sock`).
 
 ## Hook Integration
 

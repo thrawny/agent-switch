@@ -256,11 +256,22 @@ impl SessionCache {
     }
 }
 
+fn resolve_socket_path(
+    agent_switch_socket: Option<PathBuf>,
+    xdg_runtime_dir: Option<PathBuf>,
+) -> PathBuf {
+    agent_switch_socket.unwrap_or_else(|| {
+        xdg_runtime_dir
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("agent-switch.sock")
+    })
+}
+
 pub fn socket_path() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join("agent-switch.sock")
+    resolve_socket_path(
+        std::env::var_os("AGENT_SWITCH_SOCKET").map(PathBuf::from),
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+    )
 }
 
 fn daemon_runtime_paths() -> DaemonRuntimePaths {
@@ -1269,6 +1280,23 @@ mod tests {
         let path = dir.join("transcript.jsonl");
         fs::write(&path, contents).expect("test transcript should be written");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn socket_path_prefers_agent_switch_socket_override() {
+        let path = resolve_socket_path(
+            Some(PathBuf::from("/tmp/custom-agent-switch.sock")),
+            Some(PathBuf::from("/run/user/1000")),
+        );
+
+        assert_eq!(path, PathBuf::from("/tmp/custom-agent-switch.sock"));
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_xdg_runtime_dir() {
+        let path = resolve_socket_path(None, Some(PathBuf::from("/run/user/1000")));
+
+        assert_eq!(path, PathBuf::from("/run/user/1000/agent-switch.sock"));
     }
 
     #[test]
