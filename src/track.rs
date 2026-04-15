@@ -53,6 +53,15 @@ fn get_niri_window_id() -> Option<String> {
         .map(|id| id.to_string())
 }
 
+/// Append the caller's PPID to the session ID so that forked Claude agents
+/// (which inherit the same session_id) get distinct entries.  The PPID is
+/// the PID of the Claude process that spawned this hook command, which
+/// differs between a parent Claude and any agents it forks.
+fn disambiguate_session_id(id: String) -> String {
+    let ppid = std::os::unix::process::parent_id();
+    format!("{id}-{ppid}")
+}
+
 /// Returns true on success, false on failure
 pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
     let mut input = String::new();
@@ -78,7 +87,7 @@ pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
     };
 
     let session_id = match hook.session_id {
-        Some(id) => id,
+        Some(id) => disambiguate_session_id(id),
         None => {
             eprintln!("Missing session_id");
             return false;

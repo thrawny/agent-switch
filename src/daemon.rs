@@ -835,6 +835,7 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
                                     let is_question = event
                                         .transcript_path
                                         .as_ref()
+                                        .or(session.transcript_path.as_ref())
                                         .map(|p| ends_with_question(p))
                                         .unwrap_or(false);
                                     session.state = if is_question {
@@ -917,6 +918,7 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
                     let is_question = event
                         .transcript_path
                         .as_ref()
+                        .or(session.transcript_path.as_ref())
                         .map(|p| ends_with_question(p))
                         .unwrap_or(false);
                     session.state = if is_question {
@@ -1862,6 +1864,124 @@ mod tests {
         let _ = tx.send(DaemonMessage::Shutdown);
         drop(guard);
         worker.join().expect("worker should exit cleanly");
+    }
+
+    #[test]
+    fn stop_without_event_transcript_path_falls_back_to_session_transcript_path() {
+        let transcript_path = write_test_transcript(
+            "stop-fallback-question",
+            &format!(
+                "{}\n",
+                json_line(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "Want me to proceed with the refactor?" }
+                        ]
+                    }
+                }))
+            ),
+        );
+        let state_path = test_state_path("stop-fallback-question");
+
+        // session-start includes transcript_path (like Claude hooks that set it up front)
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::SessionStart,
+                session_id: "claude-session-1".to_string(),
+                agent: Some("claude".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                transcript_path: Some(transcript_path),
+                notification_type: None,
+                tmux_id: None,
+                niri_id: Some("42".to_string()),
+            },
+            None,
+            &state_path,
+        );
+
+        // prompt-submit (no transcript_path in event, like Claude hooks)
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::PromptSubmit,
+                session_id: "claude-session-1".to_string(),
+                agent: Some("claude".to_string()),
+                cwd: None,
+                transcript_path: None,
+                notification_type: None,
+                tmux_id: None,
+                niri_id: Some("42".to_string()),
+            },
+            Some(42),
+            &state_path,
+        );
+
+        // stop event also has no transcript_path (the bug scenario)
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::Stop,
+                session_id: "claude-session-1".to_string(),
+                agent: Some("claude".to_string()),
+                cwd: None,
+                transcript_path: None,
+                notification_type: None,
+                tmux_id: None,
+                niri_id: Some("42".to_string()),
+            },
+            Some(42),
+            &state_path,
+        );
+
+        let store = state::load_from_path(&state_path).expect("state should load after stop");
+        let session = store.sessions.get("42").expect("session should exist");
+        assert_eq!(
+            session.state,
+            state::SessionState::Waiting,
+            "stop should detect question from session's transcript_path when event has none"
+        );
+    }
+
+    #[test]
+    fn stop_without_any_transcript_path_defaults_to_idle() {
+        let state_path = test_state_path("stop-no-transcript");
+
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::SessionStart,
+                session_id: "session-no-tp".to_string(),
+                agent: Some("claude".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                transcript_path: None,
+                notification_type: None,
+                tmux_id: None,
+                niri_id: Some("43".to_string()),
+            },
+            None,
+            &state_path,
+        );
+
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::Stop,
+                session_id: "session-no-tp".to_string(),
+                agent: Some("claude".to_string()),
+                cwd: None,
+                transcript_path: None,
+                notification_type: None,
+                tmux_id: None,
+                niri_id: Some("43".to_string()),
+            },
+            Some(43),
+            &state_path,
+        );
+
+        let store = state::load_from_path(&state_path).expect("state should load");
+        let session = store.sessions.get("43").expect("session should exist");
+        assert_eq!(
+            session.state,
+            state::SessionState::Idle,
+            "stop without any transcript path should default to idle"
+        );
     }
 
     #[test]
