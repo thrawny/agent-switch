@@ -54,6 +54,7 @@ impl From<state::SessionState> for AgentState {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSession {
     pub agent: String,
+    pub session_name: Option<String>,
     pub state: AgentState,
     pub cwd: Option<String>,
     pub state_updated: f64,
@@ -119,6 +120,8 @@ pub struct TrackEvent {
     pub agent: Option<String>,
     pub session_id: String,
     #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<String>,
@@ -165,6 +168,8 @@ pub struct ListResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListEntry {
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_name: Option<String>,
     pub agent: String,
     pub cwd: Option<String>,
     pub state: AgentState,
@@ -236,6 +241,7 @@ impl SessionCache {
             .iter()
             .map(|(key, session)| ListEntry {
                 session_id: session.session_id.clone(),
+                session_name: session.session_name.clone(),
                 agent: session.agent.clone(),
                 cwd: session.cwd.clone(),
                 state: session.state.into(),
@@ -868,6 +874,7 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
                 let session = state::Session {
                     agent: agent.to_string(),
                     session_id: session_id.to_string(),
+                    session_name: normalized_session_name(event.session_name.as_deref()),
                     cwd: event.cwd.clone(),
                     state: state::SessionState::Idle,
                     state_updated: state::now(),
@@ -902,6 +909,7 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
                     let session = state::Session {
                         agent: agent.to_string(),
                         session_id: session_id.to_string(),
+                        session_name: normalized_session_name(event.session_name.as_deref()),
                         cwd: event.cwd.clone(),
                         state: state::SessionState::Responding,
                         state_updated: state::now(),
@@ -1001,7 +1009,17 @@ fn update_session_window_binding(
     }
 }
 
+fn normalized_session_name(session_name: Option<&str>) -> Option<String> {
+    session_name.and_then(|name| {
+        let trimmed = name.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
 fn update_session_metadata(session: &mut state::Session, event: &TrackEvent) {
+    if let Some(session_name) = normalized_session_name(event.session_name.as_deref()) {
+        session.session_name = Some(session_name);
+    }
     if let Some(cwd) = &event.cwd {
         session.cwd = Some(cwd.clone());
     }
@@ -1327,6 +1345,7 @@ mod tests {
         let mut session = state::Session {
             agent: "claude".to_string(),
             session_id: "session-1".to_string(),
+            session_name: None,
             cwd: Some("/tmp/project".to_string()),
             state: state::SessionState::Idle,
             state_updated: 1.0,
@@ -1348,6 +1367,7 @@ mod tests {
         let mut session = state::Session {
             agent: "claude".to_string(),
             session_id: "session-1".to_string(),
+            session_name: None,
             cwd: Some("/tmp/project".to_string()),
             state: state::SessionState::Idle,
             state_updated: 1.0,
@@ -1372,6 +1392,7 @@ mod tests {
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-1".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/old".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 1.0,
@@ -1388,6 +1409,7 @@ mod tests {
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "other-session".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/other".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 1.0,
@@ -1406,6 +1428,7 @@ mod tests {
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-1".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/new".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 2.0,
@@ -1438,6 +1461,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::SessionStart,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("claude".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1457,6 +1481,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::PromptSubmit,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("claude".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1489,6 +1514,7 @@ mod tests {
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-148".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Waiting,
                 state_updated: modified_at - 1.0,
@@ -1523,6 +1549,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::SessionStart,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("codex".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1538,6 +1565,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::PromptSubmit,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("codex".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1553,6 +1581,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::Stop,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("codex".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1586,6 +1615,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::SessionStart,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("codex".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1601,6 +1631,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::PromptSubmit,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("codex".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1633,6 +1664,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::PromptSubmit,
                 session_id: session_id.to_string(),
+                session_name: None,
                 agent: Some("codex".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1679,6 +1711,7 @@ mod tests {
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-148".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Waiting,
                 state_updated: 1.0,
@@ -1736,6 +1769,7 @@ mod tests {
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-148".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Waiting,
                 state_updated: 1.0,
@@ -1786,6 +1820,7 @@ mod tests {
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-148".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Waiting,
                 state_updated: modified_at + 5.0,
@@ -1830,6 +1865,7 @@ mod tests {
             event: TrackEventKind::PromptSubmit,
             agent: Some("claude".to_string()),
             session_id: "session-large".to_string(),
+            session_name: None,
             cwd: Some(format!("/tmp/{}", "deep-project/".repeat(512))),
             transcript_path: None,
             notification_type: None,
@@ -1889,6 +1925,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::SessionStart,
                 session_id: "claude-session-1".to_string(),
+                session_name: None,
                 agent: Some("claude".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: Some(transcript_path),
@@ -1905,6 +1942,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::PromptSubmit,
                 session_id: "claude-session-1".to_string(),
+                session_name: None,
                 agent: Some("claude".to_string()),
                 cwd: None,
                 transcript_path: None,
@@ -1921,6 +1959,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::Stop,
                 session_id: "claude-session-1".to_string(),
+                session_name: None,
                 agent: Some("claude".to_string()),
                 cwd: None,
                 transcript_path: None,
@@ -1949,6 +1988,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::SessionStart,
                 session_id: "session-no-tp".to_string(),
+                session_name: None,
                 agent: Some("claude".to_string()),
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
@@ -1964,6 +2004,7 @@ mod tests {
             &TrackEvent {
                 event: TrackEventKind::Stop,
                 session_id: "session-no-tp".to_string(),
+                session_name: None,
                 agent: Some("claude".to_string()),
                 cwd: None,
                 transcript_path: None,

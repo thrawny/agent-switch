@@ -7,6 +7,7 @@ use std::str::FromStr;
 #[derive(Debug, Deserialize)]
 struct HookInput {
     session_id: Option<String>,
+    session_name: Option<String>,
     agent: Option<String>,
     cwd: Option<String>,
     transcript_path: Option<String>,
@@ -62,8 +63,19 @@ fn disambiguate_session_id(id: String) -> String {
     format!("{id}-{ppid}")
 }
 
+fn normalize_session_name(session_name: Option<String>) -> Option<String> {
+    session_name.and_then(|name| {
+        let trimmed = name.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
 /// Returns true on success, false on failure
-pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
+pub fn handle_event(
+    event: &str,
+    agent_override: Option<&str>,
+    session_name_override: Option<&str>,
+) -> bool {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
         eprintln!("Failed to read stdin");
@@ -105,6 +117,11 @@ pub fn handle_event(event: &str, agent_override: Option<&str>) -> bool {
     let msg = daemon::TrackEvent {
         event,
         session_id,
+        session_name: normalize_session_name(
+            session_name_override
+                .map(str::to_string)
+                .or(hook.session_name),
+        ),
         agent: Some(agent),
         cwd: hook.cwd,
         transcript_path: hook.transcript_path,

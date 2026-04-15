@@ -28,6 +28,9 @@ enum Command {
         /// Override the agent name carried in the hook payload
         #[arg(long)]
         agent: Option<String>,
+        /// Override the session name carried in the hook payload
+        #[arg(long)]
+        session_name: Option<String>,
         /// Event type: session-start, session-end, prompt-submit, stop, notification
         event: String,
     },
@@ -73,8 +76,12 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Track { event, agent } => {
-            if !track::handle_event(&event, agent.as_deref()) {
+        Command::Track {
+            event,
+            agent,
+            session_name,
+        } => {
+            if !track::handle_event(&event, agent.as_deref(), session_name.as_deref()) {
                 std::process::exit(1);
             }
         }

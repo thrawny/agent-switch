@@ -130,6 +130,7 @@ fn agent_sessions_from_store(store: &state::SessionStore) -> HashMap<u64, AgentS
             window_id,
             AgentSession {
                 agent: session.agent.clone(),
+                session_name: session.session_name.clone(),
                 state: session.state.into(),
                 cwd: session.cwd.clone(),
                 state_updated: session.state_updated,
@@ -285,6 +286,17 @@ fn named_title_for_agent(entry: &WorkspaceColumn, agent: &str) -> Option<String>
         _ => None,
     }?;
     (!title_duplicates_workspace(&title, &entry.workspace_name)).then_some(title)
+}
+
+fn tracked_session_title(entry: &WorkspaceColumn, session: &AgentSession) -> Option<String> {
+    session
+        .session_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .filter(|title| !title_duplicates_workspace(title, &entry.workspace_name))
+        .map(str::to_string)
+        .or_else(|| named_title_for_agent(entry, &session.agent))
 }
 
 fn agent_fallback_from_window_title(entry: &WorkspaceColumn) -> Option<AgentInfo> {
@@ -1700,7 +1712,7 @@ fn agent_info_for_entry(
             agent: session.agent.clone(),
             state: session.state,
             state_updated: Some(session.state_updated),
-            title: named_title_for_agent(entry, &session.agent),
+            title: tracked_session_title(entry, session),
         });
     }
 
@@ -2261,6 +2273,7 @@ fn mock_agent_sessions(entries: &[WorkspaceColumn], cycle: usize) -> HashMap<u64
             window_id,
             AgentSession {
                 agent: agents[agent_idx].to_string(),
+                session_name: None,
                 state: states[state_idx],
                 cwd: entry.dir.clone(),
                 state_updated: state::now() - [30.0, 125.0, 3600.0, 45.0, 900.0][i % 5],

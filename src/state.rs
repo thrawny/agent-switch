@@ -40,6 +40,8 @@ pub enum WaitingReason {
 pub struct Session {
     pub agent: String,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub state: SessionState,
@@ -536,6 +538,7 @@ mod tests {
             Session {
                 agent: "claude".to_string(),
                 session_id: "session-9".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: SessionState::Idle,
                 state_updated: now(),
@@ -565,6 +568,7 @@ mod tests {
             Session {
                 agent: "claude".to_string(),
                 session_id: "session-9".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: SessionState::Idle,
                 state_updated: 1.0,
@@ -589,6 +593,7 @@ mod tests {
             Session {
                 agent: "claude".to_string(),
                 session_id: "session-42".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: SessionState::Idle,
                 state_updated: 1.0,
@@ -621,6 +626,7 @@ mod tests {
             Session {
                 agent: "claude".to_string(),
                 session_id: "session-1".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: SessionState::Idle,
                 state_updated: 1.0,
@@ -657,6 +663,7 @@ mod tests {
                 Session {
                     agent: "claude".to_string(),
                     session_id: "session-9".to_string(),
+                    session_name: None,
                     cwd: None,
                     state: SessionState::Responding,
                     state_updated: 9.0,
