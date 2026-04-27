@@ -45,6 +45,7 @@ const NIRI_OVERLAY_PAGE_SCROLL: f64 = 320.0;
 const WAITING_PRIORITY_WINDOW_SECS: f64 = 30.0 * 60.0;
 const GTK_MAIN_LOOP_HEARTBEAT_MS: u64 = 100;
 const GTK_MAIN_LOOP_STALL_WARN_MS: u128 = 200;
+const GTK_MESSAGE_POLL_MS: u64 = 10;
 
 // Use DaemonMessage as base, add niri-specific ReloadConfig
 #[derive(Debug)]
@@ -870,6 +871,9 @@ fn start_focus_tracker(focused_window: Arc<Mutex<Option<u64>>>) {
                     _ => {}
                 }
             }
+
+            log::warn!("niri IPC event stream ended; reconnecting after backoff");
+            thread::sleep(std::time::Duration::from_secs(1));
         }
     });
 }
@@ -1408,251 +1412,255 @@ fn build_ui(
         },
     );
 
-    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                NiriMessage::Daemon {
-                    msg: inner @ (DaemonMessage::Toggle | DaemonMessage::ToggleAgents),
-                    enqueued_at,
-                } => {
-                    let is_agents = matches!(inner, DaemonMessage::ToggleAgents);
-                    log::info!(
-                        "toggle queue delay: {}ms agents_only={}",
-                        enqueued_at.elapsed().as_millis(),
-                        is_agents,
-                    );
-                    let is_visible = window_for_poll.is_visible();
-                    if is_visible {
-                        window_for_poll.set_visible(false);
-                        pending_overlay_frame_for_poll.borrow_mut().take();
-                        let mut state = state_for_poll.borrow_mut();
-                        state.pending_key = None;
-                        state.agents_view = false;
-                    } else {
-                        let open_start = Instant::now();
-                        let snapshot_start = Instant::now();
-                        let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
-                        let snapshot_elapsed = snapshot_start.elapsed();
-                        dirty_state_for_poll.clear_all();
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(GTK_MESSAGE_POLL_MS),
+        move || {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    NiriMessage::Daemon {
+                        msg: inner @ (DaemonMessage::Toggle | DaemonMessage::ToggleAgents),
+                        enqueued_at,
+                    } => {
+                        let is_agents = matches!(inner, DaemonMessage::ToggleAgents);
+                        log::info!(
+                            "toggle queue delay: {}ms agents_only={}",
+                            enqueued_at.elapsed().as_millis(),
+                            is_agents,
+                        );
+                        let is_visible = window_for_poll.is_visible();
+                        if is_visible {
+                            window_for_poll.set_visible(false);
+                            pending_overlay_frame_for_poll.borrow_mut().take();
+                            let mut state = state_for_poll.borrow_mut();
+                            state.pending_key = None;
+                            state.agents_view = false;
+                        } else {
+                            let open_start = Instant::now();
+                            let snapshot_start = Instant::now();
+                            let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
+                            let snapshot_elapsed = snapshot_start.elapsed();
+                            dirty_state_for_poll.clear_all();
 
+                            let mut state = state_for_poll.borrow_mut();
+                            state.agent_sessions = agent_sessions;
+                            state.pending_key = None;
+                            state.agents_view = is_agents;
+                            state.focused_at_open = *focused_window_for_poll.lock().unwrap();
+                            // First pass: natural label widths for size computation
+                            let first_rebuild_start = Instant::now();
+                            rebuild_for_poll(&main_box_for_poll, &state, false);
+                            let first_rebuild_elapsed = first_rebuild_start.elapsed();
+                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            drop(state);
+                            reset_overlay_scroll(&scroller_for_poll);
+                            let resize_start = Instant::now();
+                            update_overlay_size(
+                                &window_for_poll,
+                                &scroller_for_poll,
+                                &outer_box_for_poll,
+                                wide_agents_layout,
+                            );
+                            let resize_elapsed = resize_start.elapsed();
+                            // Second pass: locked label widths
+                            let state = state_for_poll.borrow();
+                            let second_rebuild_start = Instant::now();
+                            rebuild_for_poll(&main_box_for_poll, &state, true);
+                            let second_rebuild_elapsed = second_rebuild_start.elapsed();
+                            drop(state);
+                            *pending_overlay_frame_for_poll.borrow_mut() =
+                                Some(PendingOverlayFrame {
+                                    presented_at: Instant::now(),
+                                    agents_only: is_agents,
+                                });
+                            window_for_poll.set_visible(true);
+                            window_for_poll.present();
+                            let total_elapsed = open_start.elapsed();
+                            log::info!(
+                                "overlay open: {}ms agents_only={} snapshot={}ms rebuild1={}ms resize={}ms rebuild2={}ms",
+                                total_elapsed.as_millis(),
+                                is_agents,
+                                snapshot_elapsed.as_millis(),
+                                first_rebuild_elapsed.as_millis(),
+                                resize_elapsed.as_millis(),
+                                second_rebuild_elapsed.as_millis(),
+                            );
+                            let config = state_for_poll.borrow().config.clone();
+                            request_workspace_refresh(tx_for_poll.clone(), config, is_agents);
+                        }
+                    }
+                    NiriMessage::ReloadConfig => {
+                        let mut state = state_for_poll.borrow_mut();
+                        let reloaded = match projects::load_config() {
+                            Ok(config) => {
+                                state.theme = themes::get(&config.theme);
+                                apply_theme_css(&css_provider_for_poll, state.theme);
+                                state.config = config;
+                                state.last_config_error = None;
+                                debug!("config reloaded");
+                                true
+                            }
+                            Err(err) => {
+                                let should_notify =
+                                    state.last_config_error.as_deref() != Some(err.as_str());
+                                if should_notify {
+                                    notify_config_error(&err);
+                                }
+                                state.last_config_error = Some(err);
+                                false
+                            }
+                        };
+
+                        if reloaded && window_for_poll.is_visible() {
+                            rebuild_for_poll(&main_box_for_poll, &state, false);
+                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            let config = state.config.clone();
+                            drop(state);
+                            update_overlay_size(
+                                &window_for_poll,
+                                &scroller_for_poll,
+                                &outer_box_for_poll,
+                                wide_agents_layout,
+                            );
+                            let state = state_for_poll.borrow();
+                            rebuild_for_poll(&main_box_for_poll, &state, true);
+                            reset_overlay_scroll(&scroller_for_poll);
+                            drop(state);
+                            request_workspace_refresh(
+                                tx_for_poll.clone(),
+                                config,
+                                state_for_poll.borrow().agents_view,
+                            );
+                        }
+                    }
+                    NiriMessage::WorkspaceColumns {
+                        entries,
+                        agents_only,
+                        enqueued_at,
+                    } => {
+                        log::debug!(
+                            "workspace refresh queue delay: {}ms agents_only={} entries={}",
+                            enqueued_at.elapsed().as_millis(),
+                            agents_only,
+                            entries.len(),
+                        );
+                        let mut state = state_for_poll.borrow_mut();
+                        let current_entries = if agents_only {
+                            &state.agent_entries
+                        } else {
+                            &state.entries
+                        };
+                        let needs_rebuild = window_for_poll.is_visible()
+                            && state.agents_view == agents_only
+                            && workspace_entries_changed(current_entries, &entries);
+                        if agents_only {
+                            state.agent_entries = entries;
+                        } else {
+                            state.entries = entries;
+                        }
+                        if needs_rebuild {
+                            let apply_start = Instant::now();
+                            rebuild_for_poll(&main_box_for_poll, &state, false);
+                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            drop(state);
+                            update_overlay_size(
+                                &window_for_poll,
+                                &scroller_for_poll,
+                                &outer_box_for_poll,
+                                wide_agents_layout,
+                            );
+                            let state = state_for_poll.borrow();
+                            rebuild_for_poll(&main_box_for_poll, &state, true);
+                            let elapsed = apply_start.elapsed();
+                            log::debug!(
+                                "workspace refresh apply: {}ms agents_only={} entries={}",
+                                elapsed.as_millis(),
+                                agents_only,
+                                if agents_only {
+                                    state.agent_entries.len()
+                                } else {
+                                    state.entries.len()
+                                },
+                            );
+                        }
+                    }
+                    NiriMessage::Daemon {
+                        msg: DaemonMessage::SessionsChanged,
+                        enqueued_at,
+                    } => {
+                        log::debug!(
+                            "sessions-changed queue delay: {}ms",
+                            enqueued_at.elapsed().as_millis(),
+                        );
+                        let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
                         let mut state = state_for_poll.borrow_mut();
                         state.agent_sessions = agent_sessions;
-                        state.pending_key = None;
-                        state.agents_view = is_agents;
-                        state.focused_at_open = *focused_window_for_poll.lock().unwrap();
-                        // First pass: natural label widths for size computation
-                        let first_rebuild_start = Instant::now();
-                        rebuild_for_poll(&main_box_for_poll, &state, false);
-                        let first_rebuild_elapsed = first_rebuild_start.elapsed();
-                        let wide_agents_layout = uses_wide_agents_layout(&state);
-                        drop(state);
-                        reset_overlay_scroll(&scroller_for_poll);
-                        let resize_start = Instant::now();
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
-                            wide_agents_layout,
-                        );
-                        let resize_elapsed = resize_start.elapsed();
-                        // Second pass: locked label widths
-                        let state = state_for_poll.borrow();
-                        let second_rebuild_start = Instant::now();
-                        rebuild_for_poll(&main_box_for_poll, &state, true);
-                        let second_rebuild_elapsed = second_rebuild_start.elapsed();
-                        drop(state);
-                        *pending_overlay_frame_for_poll.borrow_mut() = Some(PendingOverlayFrame {
-                            presented_at: Instant::now(),
-                            agents_only: is_agents,
-                        });
-                        window_for_poll.set_visible(true);
-                        window_for_poll.present();
-                        let total_elapsed = open_start.elapsed();
-                        log::info!(
-                            "overlay open: {}ms agents_only={} snapshot={}ms rebuild1={}ms resize={}ms rebuild2={}ms",
-                            total_elapsed.as_millis(),
-                            is_agents,
-                            snapshot_elapsed.as_millis(),
-                            first_rebuild_elapsed.as_millis(),
-                            resize_elapsed.as_millis(),
-                            second_rebuild_elapsed.as_millis(),
-                        );
-                        let config = state_for_poll.borrow().config.clone();
-                        request_workspace_refresh(tx_for_poll.clone(), config, is_agents);
+                        if window_for_poll.is_visible() {
+                            rebuild_for_poll(&main_box_for_poll, &state, false);
+                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            drop(state);
+                            update_overlay_size(
+                                &window_for_poll,
+                                &scroller_for_poll,
+                                &outer_box_for_poll,
+                                wide_agents_layout,
+                            );
+                            let state = state_for_poll.borrow();
+                            rebuild_for_poll(&main_box_for_poll, &state, true);
+                        }
+                    }
+                    NiriMessage::Daemon {
+                        msg: DaemonMessage::Track(_),
+                        ..
+                    }
+                    | NiriMessage::Daemon {
+                        msg: DaemonMessage::List(_),
+                        ..
+                    } => {}
+                    NiriMessage::Daemon {
+                        msg: DaemonMessage::Shutdown,
+                        ..
+                    } => {
+                        // Exit GTK app
+                        std::process::exit(0);
                     }
                 }
-                NiriMessage::ReloadConfig => {
-                    let mut state = state_for_poll.borrow_mut();
-                    let reloaded = match projects::load_config() {
-                        Ok(config) => {
-                            state.theme = themes::get(&config.theme);
-                            apply_theme_css(&css_provider_for_poll, state.theme);
-                            state.config = config;
-                            state.last_config_error = None;
-                            debug!("config reloaded");
-                            true
-                        }
-                        Err(err) => {
-                            let should_notify =
-                                state.last_config_error.as_deref() != Some(err.as_str());
-                            if should_notify {
-                                notify_config_error(&err);
-                            }
-                            state.last_config_error = Some(err);
-                            false
-                        }
-                    };
+            }
 
-                    if reloaded && window_for_poll.is_visible() {
-                        rebuild_for_poll(&main_box_for_poll, &state, false);
-                        let wide_agents_layout = uses_wide_agents_layout(&state);
-                        let config = state.config.clone();
-                        drop(state);
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
-                            wide_agents_layout,
-                        );
-                        let state = state_for_poll.borrow();
-                        rebuild_for_poll(&main_box_for_poll, &state, true);
-                        reset_overlay_scroll(&scroller_for_poll);
-                        drop(state);
-                        request_workspace_refresh(
-                            tx_for_poll.clone(),
-                            config,
-                            state_for_poll.borrow().agents_view,
-                        );
-                    }
-                }
-                NiriMessage::WorkspaceColumns {
-                    entries,
-                    agents_only,
-                    enqueued_at,
-                } => {
-                    log::debug!(
-                        "workspace refresh queue delay: {}ms agents_only={} entries={}",
-                        enqueued_at.elapsed().as_millis(),
-                        agents_only,
-                        entries.len(),
-                    );
+            if window_for_poll.is_visible() {
+                let sessions_dirty = dirty_state_for_poll.take_sessions();
+                if sessions_dirty {
+                    let refresh_start = Instant::now();
                     let mut state = state_for_poll.borrow_mut();
-                    let current_entries = if agents_only {
-                        &state.agent_entries
-                    } else {
-                        &state.entries
-                    };
-                    let needs_rebuild = window_for_poll.is_visible()
-                        && state.agents_view == agents_only
-                        && workspace_entries_changed(current_entries, &entries);
-                    if agents_only {
-                        state.agent_entries = entries;
-                    } else {
-                        state.entries = entries;
-                    }
-                    if needs_rebuild {
-                        let apply_start = Instant::now();
-                        rebuild_for_poll(&main_box_for_poll, &state, false);
-                        let wide_agents_layout = uses_wide_agents_layout(&state);
-                        drop(state);
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
-                            wide_agents_layout,
-                        );
-                        let state = state_for_poll.borrow();
-                        rebuild_for_poll(&main_box_for_poll, &state, true);
-                        let elapsed = apply_start.elapsed();
-                        log::debug!(
-                            "workspace refresh apply: {}ms agents_only={} entries={}",
-                            elapsed.as_millis(),
-                            agents_only,
-                            if agents_only {
-                                state.agent_entries.len()
-                            } else {
-                                state.entries.len()
-                            },
-                        );
-                    }
-                }
-                NiriMessage::Daemon {
-                    msg: DaemonMessage::SessionsChanged,
-                    enqueued_at,
-                } => {
-                    log::debug!(
-                        "sessions-changed queue delay: {}ms",
-                        enqueued_at.elapsed().as_millis(),
-                    );
+
+                    let snapshot_start = Instant::now();
                     let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
-                    let mut state = state_for_poll.borrow_mut();
+                    let snapshot_elapsed = snapshot_start.elapsed();
                     state.agent_sessions = agent_sessions;
-                    if window_for_poll.is_visible() {
-                        rebuild_for_poll(&main_box_for_poll, &state, false);
-                        let wide_agents_layout = uses_wide_agents_layout(&state);
-                        drop(state);
-                        update_overlay_size(
-                            &window_for_poll,
-                            &scroller_for_poll,
-                            &outer_box_for_poll,
-                            wide_agents_layout,
-                        );
-                        let state = state_for_poll.borrow();
-                        rebuild_for_poll(&main_box_for_poll, &state, true);
-                    }
-                }
-                NiriMessage::Daemon {
-                    msg: DaemonMessage::Track(_),
-                    ..
-                }
-                | NiriMessage::Daemon {
-                    msg: DaemonMessage::List(_),
-                    ..
-                } => {}
-                NiriMessage::Daemon {
-                    msg: DaemonMessage::Shutdown,
-                    ..
-                } => {
-                    // Exit GTK app
-                    std::process::exit(0);
+                    log::debug!(
+                        "dirty refresh snapshot: {}ms sessions_dirty=true",
+                        snapshot_elapsed.as_millis(),
+                    );
+
+                    rebuild_for_poll(&main_box_for_poll, &state, false);
+                    let wide_agents_layout = uses_wide_agents_layout(&state);
+                    drop(state);
+                    update_overlay_size(
+                        &window_for_poll,
+                        &scroller_for_poll,
+                        &outer_box_for_poll,
+                        wide_agents_layout,
+                    );
+                    let state = state_for_poll.borrow();
+                    rebuild_for_poll(&main_box_for_poll, &state, true);
+                    log::debug!(
+                        "dirty refresh apply: {}ms sessions_dirty=true",
+                        refresh_start.elapsed().as_millis(),
+                    );
                 }
             }
-        }
-
-        if window_for_poll.is_visible() {
-            let sessions_dirty = dirty_state_for_poll.take_sessions();
-            if sessions_dirty {
-                let refresh_start = Instant::now();
-                let mut state = state_for_poll.borrow_mut();
-
-                let snapshot_start = Instant::now();
-                let agent_sessions = overlay_snapshot_from_cache(&cache_for_poll);
-                let snapshot_elapsed = snapshot_start.elapsed();
-                state.agent_sessions = agent_sessions;
-                log::debug!(
-                    "dirty refresh snapshot: {}ms sessions_dirty=true",
-                    snapshot_elapsed.as_millis(),
-                );
-
-                rebuild_for_poll(&main_box_for_poll, &state, false);
-                let wide_agents_layout = uses_wide_agents_layout(&state);
-                drop(state);
-                update_overlay_size(
-                    &window_for_poll,
-                    &scroller_for_poll,
-                    &outer_box_for_poll,
-                    wide_agents_layout,
-                );
-                let state = state_for_poll.borrow();
-                rebuild_for_poll(&main_box_for_poll, &state, true);
-                log::debug!(
-                    "dirty refresh apply: {}ms sessions_dirty=true",
-                    refresh_start.elapsed().as_millis(),
-                );
-            }
-        }
-        glib::ControlFlow::Continue
-    });
+            glib::ControlFlow::Continue
+        },
+    );
 }
 
 fn group_entries_by_workspace<'a>(
