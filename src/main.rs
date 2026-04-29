@@ -11,6 +11,23 @@ mod niri;
 
 use clap::{Parser, Subcommand};
 
+fn focused_niri_window_id() -> Result<String, String> {
+    let output = std::process::Command::new("niri")
+        .args(["msg", "--json", "focused-window"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())?;
+    value
+        .get("id")
+        .and_then(|id| id.as_u64())
+        .map(|id| id.to_string())
+        .ok_or_else(|| "focused window JSON did not contain numeric id".to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "agent-switch",
@@ -38,6 +55,8 @@ enum Command {
     Fix,
     /// List all sessions as JSON
     List,
+    /// Print the session for the focused niri window as JSON
+    Focused,
     /// Remove stale sessions
     Cleanup,
     /// Tmux picker (daemonless)
@@ -104,6 +123,30 @@ fn main() {
                     eprintln!("Failed to serialize state for output: {}", err);
                     std::process::exit(1);
                 }
+            }
+        }
+        Command::Focused => {
+            let focused_id = match focused_niri_window_id() {
+                Ok(id) => id,
+                Err(err) => {
+                    eprintln!("Failed to get focused niri window: {err}");
+                    std::process::exit(1);
+                }
+            };
+            let session = match state::with_locked_store(|store| {
+                state::cleanup_stale(store);
+                daemon::refresh_transcript_derived_states(store);
+                Ok(store.sessions.get(&focused_id).cloned())
+            }) {
+                Ok(session) => session,
+                Err(err) => {
+                    eprintln!("Failed to load state: {}", err);
+                    std::process::exit(1);
+                }
+            };
+            match session {
+                Some(session) => println!("{}", serde_json::to_string_pretty(&session).unwrap()),
+                None => std::process::exit(1),
             }
         }
         Command::Cleanup => {

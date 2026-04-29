@@ -5,7 +5,7 @@ Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) acro
 ## 1) How to execute tasks
 
 - Prefer `just` recipes over raw commands.
-- Primary dev loop: `just watch-niri` or `just watch-tmux` (runs in zmx).
+- Primary dev loop: `just watch` (niri, default) or `just watch tmux` (runs in zmx).
 
 ## 2) After code changes
 
@@ -26,8 +26,8 @@ just install      # Install to ~/.cargo/bin
 just test         # Run tests
 just clippy       # Lint
 just fmt           # Format
-just watch-tmux   # Watch + run tmux daemon (zmx session)
-just watch-niri   # Watch + run niri GTK daemon (zmx session)
+just watch        # Watch + run niri GTK daemon (zmx session)
+just watch tmux   # Watch + run tmux daemon (zmx session)
 ```
 
 ## Architecture
@@ -41,6 +41,7 @@ Single binary with subcommands:
 | `serve --niri` | Daemon with niri GTK overlay (requires `niri` feature) |
 | `tmux` | Daemonless tmux picker (fzf-based) |
 | `list` | Dump all sessions as JSON |
+| `focused` | Dump the focused niri window's session as JSON |
 | `cleanup` | Remove stale sessions |
 
 ## Source Layout

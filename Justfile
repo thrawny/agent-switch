@@ -19,25 +19,16 @@ run-tmux:
 run-niri:
     cargo run --features niri -- serve --niri
 
-# Watch tmux daemon with build-gated restart (old process stays alive on compile errors)
-watch-tmux:
+# Watch daemon with build-gated restart (old process stays alive on compile errors)
+watch target="niri":
+    @case "{{ target }}" in niri|tmux) ;; *) echo "target must be 'niri' or 'tmux'" >&2; exit 1;; esac
     -zmx kill agent-switch-build
-    -zmx kill agent-switch-tmux
-    cargo build
+    -zmx kill agent-switch-{{ target }}
+    cargo build {{ if target == "niri" { "--features niri" } else { "" } }}
     touch {{ _build_stamp }}
-    zmx run agent-switch-build watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build && touch {{ _build_stamp }}' &
+    zmx run agent-switch-build -d watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build {{ if target == "niri" { "--features niri " } else { "" } }}&& touch {{ _build_stamp }}'
     sleep 0.2
-    zmx attach agent-switch-tmux env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve
-
-# Watch niri daemon with build-gated restart (old process stays alive on compile errors)
-watch-niri:
-    -zmx kill agent-switch-build
-    -zmx kill agent-switch-niri
-    cargo build --features niri
-    touch {{ _build_stamp }}
-    zmx run agent-switch-build watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build --features niri && touch {{ _build_stamp }}' &
-    sleep 0.2
-    zmx attach agent-switch-niri env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve --niri
+    zmx attach agent-switch-{{ target }} env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve {{ if target == "niri" { "--niri" } else { "" } }}
 
 # Install to ~/.cargo/bin
 install:
