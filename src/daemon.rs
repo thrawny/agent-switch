@@ -263,6 +263,7 @@ fn resolve_socket_path(
     agent_switch_socket.unwrap_or_else(|| {
         xdg_runtime_dir
             .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("agent-switch")
             .join("agent-switch.sock")
     })
 }
@@ -1296,7 +1297,10 @@ mod tests {
     fn socket_path_falls_back_to_xdg_runtime_dir() {
         let path = resolve_socket_path(None, Some(PathBuf::from("/run/user/1000")));
 
-        assert_eq!(path, PathBuf::from("/run/user/1000/agent-switch.sock"));
+        assert_eq!(
+            path,
+            PathBuf::from("/run/user/1000/agent-switch/agent-switch.sock")
+        );
     }
 
     #[test]

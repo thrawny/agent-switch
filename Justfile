@@ -23,12 +23,13 @@ run-niri:
 watch target="niri":
     @case "{{ target }}" in niri|tmux) ;; *) echo "target must be 'niri' or 'tmux'" >&2; exit 1;; esac
     -zmx kill agent-switch-build
-    -zmx kill agent-switch-{{ target }}
+    if [ "$${ZMX_SESSION:-}" != "agent-switch-{{ target }}" ]; then zmx kill agent-switch-{{ target }} || true; fi
+    sleep 0.2
     cargo build {{ if target == "niri" { "--features niri" } else { "" } }}
     touch {{ _build_stamp }}
     zmx run agent-switch-build -d watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build {{ if target == "niri" { "--features niri " } else { "" } }}&& touch {{ _build_stamp }}'
     sleep 0.2
-    zmx attach agent-switch-{{ target }} env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve {{ if target == "niri" { "--niri" } else { "" } }}
+    if [ "$${ZMX_SESSION:-}" = "agent-switch-{{ target }}" ]; then env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve {{ if target == "niri" { "--niri" } else { "" } }}; else zmx attach agent-switch-{{ target }} env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve {{ if target == "niri" { "--niri" } else { "" } }}; fi
 
 # Install to ~/.cargo/bin
 install:
