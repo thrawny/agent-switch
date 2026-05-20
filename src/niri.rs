@@ -641,27 +641,22 @@ fn focus_window(id: u64) -> bool {
     )
 }
 
-fn spawn_terminals(dir: &str) {
-    let dir = shellexpand::tilde(dir).to_string();
+const TERMINALS_PER_NEW_NIRI_SESSION: usize = 3;
+const TERMINAL_SPAWN_STAGGER_MS: u64 = 75;
 
-    // Prefer compositor-side spawn to avoid inheriting daemon/zmx env vars.
-    let spawned_via_niri = matches!(
+fn spawn_terminal_via_niri(dir: &str) -> bool {
+    matches!(
         niri_request(Request::Action(Action::Spawn {
-            command: vec![
-                "ghostty".to_string(),
-                format!("--working-directory={}", dir)
-            ],
+            command: vec!["ghostty".to_string(), format!("--working-directory={dir}")],
         })),
         Some(Response::Handled)
-    );
-    if spawned_via_niri {
-        return;
-    }
+    )
+}
 
-    // Fallback path for environments where niri IPC spawn is unavailable.
+fn spawn_terminal_fallback(dir: &str) {
     let mut command = Command::new("ghostty");
     command
-        .arg(format!("--working-directory={}", dir))
+        .arg(format!("--working-directory={dir}"))
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env_remove("TMUX_TMPDIR");
@@ -671,6 +666,22 @@ fn spawn_terminals(dir: &str) {
         }
     }
     let _ = command.spawn();
+}
+
+fn spawn_terminals(dir: &str) {
+    let dir = shellexpand::tilde(dir).to_string();
+
+    for idx in 0..TERMINALS_PER_NEW_NIRI_SESSION {
+        if idx > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(TERMINAL_SPAWN_STAGGER_MS));
+        }
+
+        // Prefer compositor-side spawn to avoid inheriting daemon/zmx env vars.
+        if !spawn_terminal_via_niri(&dir) {
+            // Fallback path for environments where niri IPC spawn is unavailable.
+            spawn_terminal_fallback(&dir);
+        }
+    }
 }
 
 fn create_workspace(name: &str, dir: Option<&str>) {
