@@ -684,13 +684,67 @@ fn spawn_terminals(dir: &str) {
     }
 }
 
+fn focused_workspace_output(workspaces: &[Workspace]) -> Option<String> {
+    workspaces
+        .iter()
+        .find(|ws| ws.is_focused)
+        .and_then(|ws| ws.output.clone())
+}
+
+fn first_unnamed_workspace_idx(workspaces: &[Workspace], output: Option<&str>) -> Option<u8> {
+    workspaces
+        .iter()
+        .filter(|ws| ws.output.as_deref() == output)
+        .filter(|ws| ws.name.is_none() && ws.active_window_id.is_some())
+        .map(|ws| ws.idx)
+        .min()
+}
+
+fn reusable_empty_workspace_idx(
+    workspaces: &[Workspace],
+    output: Option<&str>,
+    before_idx: Option<u8>,
+) -> Option<u8> {
+    workspaces
+        .iter()
+        .filter(|ws| ws.output.as_deref() == output)
+        .filter(|ws| ws.name.is_none() && ws.active_window_id.is_none())
+        .filter(|ws| before_idx.is_none_or(|before_idx| ws.idx < before_idx))
+        .map(|ws| ws.idx)
+        .max()
+}
+
 fn create_workspace(name: &str, dir: Option<&str>) {
     if get_workspace_by_name(name).is_some() {
         focus_workspace(WorkspaceReferenceArg::Name(name.to_string()));
     } else {
-        let max_idx = niri_workspaces().iter().map(|ws| ws.idx).max().unwrap_or(0);
-        let new_idx = max_idx.saturating_add(1);
-        focus_workspace(WorkspaceReferenceArg::Index(new_idx));
+        let workspaces = niri_workspaces();
+        let focused_output = focused_workspace_output(&workspaces);
+        let output = focused_output.as_deref();
+        let first_unnamed_idx = first_unnamed_workspace_idx(&workspaces, output);
+
+        if let Some(target_idx) =
+            reusable_empty_workspace_idx(&workspaces, output, first_unnamed_idx)
+        {
+            focus_workspace(WorkspaceReferenceArg::Index(target_idx));
+        } else {
+            let max_idx = workspaces
+                .iter()
+                .filter(|ws| ws.output.as_deref() == output)
+                .map(|ws| ws.idx)
+                .max()
+                .unwrap_or(0);
+            let new_idx = max_idx.saturating_add(1);
+            focus_workspace(WorkspaceReferenceArg::Index(new_idx));
+
+            if let Some(first_unnamed_idx) = first_unnamed_idx {
+                niri_action(Action::MoveWorkspaceToIndex {
+                    index: first_unnamed_idx as usize,
+                    reference: None,
+                });
+            }
+        }
+
         niri_action(Action::SetWorkspaceName {
             name: name.to_string(),
             workspace: None,
