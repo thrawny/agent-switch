@@ -1254,9 +1254,7 @@ fn build_ui(
     let state_clone = state.clone();
     let window_clone = window.clone();
     let main_box_clone = main_box.clone();
-    let outer_box_clone = outer_box.clone();
     let scroller_clone = scroller.clone();
-    let tx_for_keys = tx.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
         let input_char = input_char_for_key(keyval);
@@ -1311,29 +1309,6 @@ fn build_ui(
             return glib::Propagation::Stop;
         }
 
-        if input_char == Some('a') {
-            let mut state = state_clone.borrow_mut();
-            state.agents_view = !state.agents_view;
-            state.pending_key = None;
-            rebuild_current_view(&main_box_clone, &state, false);
-            let wide_agents_layout = uses_wide_agents_layout(&state);
-            let config = state.config.clone();
-            let agents_only = state.agents_view;
-            drop(state);
-            reset_overlay_scroll(&scroller_clone);
-            update_overlay_size(
-                &window_clone,
-                &scroller_clone,
-                &outer_box_clone,
-                wide_agents_layout,
-            );
-            let state = state_clone.borrow();
-            rebuild_current_view(&main_box_clone, &state, true);
-            drop(state);
-            request_workspace_refresh(tx_for_keys.clone(), config, agents_only);
-            return glib::Propagation::Stop;
-        }
-
         if key == "space" && state_clone.borrow().agents_view {
             let state = state_clone.borrow();
             if let Some(target) = find_smart_jump_target(
@@ -1352,8 +1327,8 @@ fn build_ui(
             return glib::Propagation::Stop;
         }
 
-        if let Some(key_char) = selection_key {
-            if state_clone.borrow().agents_view {
+        if state_clone.borrow().agents_view {
+            if let Some(key_char) = selection_key {
                 let state = state_clone.borrow();
                 if let Some(target) = find_agent_entry_for_selection_key(
                     &state.agent_entries,
@@ -1369,9 +1344,11 @@ fn build_ui(
                     drop(state);
                     switch_to_entry(&target);
                 }
-                return glib::Propagation::Stop;
             }
+            return glib::Propagation::Stop;
+        }
 
+        if let Some(key_char) = input_char {
             let state = state_clone.borrow();
             if let Some(target) = find_switch_target(&state.entries, &state.config, key_char) {
                 drop(state);
@@ -1868,7 +1845,12 @@ fn build_switch_targets(
 ) -> Vec<SwitchTarget> {
     let mut targets = Vec::new();
     let mut seen_workspaces = std::collections::HashSet::new();
-    let mut used_keys = std::collections::HashSet::new();
+    let mut used_keys: std::collections::HashSet<char> = config
+        .bindings
+        .apps
+        .iter()
+        .filter_map(|binding| binding_key(&binding.key))
+        .collect();
 
     for entry in entries {
         if !seen_workspaces.insert(entry.workspace_name.clone()) {
@@ -1876,9 +1858,10 @@ fn build_switch_targets(
         }
         let key =
             explicit_workspace_key(config, &entry.workspace_name).unwrap_or(entry.workspace_key);
-        if !used_keys.insert(key) {
+        if used_keys.contains(&key) {
             continue;
         }
+        used_keys.insert(key);
         targets.push(SwitchTarget {
             key,
             label: entry.workspace_name.clone(),
@@ -1897,9 +1880,6 @@ fn build_switch_targets(
         let Some(key) = binding_key(&binding.key) else {
             continue;
         };
-        if !used_keys.insert(key) {
-            continue;
-        }
         let Some(window) = windows
             .iter()
             .find(|window| app_binding_matches(binding, window))
@@ -1932,10 +1912,46 @@ fn build_switch_target_list(
     grid.set_row_spacing(6);
     grid.set_halign(gtk4::Align::Start);
 
+    let workspace_targets: Vec<_> = targets
+        .iter()
+        .filter(|target| matches!(target.kind, SwitchTargetKind::Workspace { .. }))
+        .collect();
+    let app_targets: Vec<_> = targets
+        .iter()
+        .filter(|target| matches!(target.kind, SwitchTargetKind::Window(_)))
+        .collect();
+
+    let mut next_row = attach_switch_target_section(&grid, "workspaces", &workspace_targets, 0);
+    if !workspace_targets.is_empty() && !app_targets.is_empty() {
+        let separator = Separator::new(Orientation::Horizontal);
+        separator.add_css_class("workspace-separator");
+        grid.attach(&separator, 0, next_row, 2, 1);
+        next_row += 1;
+    }
+    attach_switch_target_section(&grid, "apps", &app_targets, next_row);
+
+    container.append(&grid);
+}
+
+fn attach_switch_target_section(
+    grid: &Grid,
+    title: &str,
+    targets: &[&SwitchTarget],
+    start_row: i32,
+) -> i32 {
+    if targets.is_empty() {
+        return start_row;
+    }
+
+    let title_label = Label::new(Some(title));
+    title_label.add_css_class("workspace-title");
+    title_label.set_xalign(0.0);
+    grid.attach(&title_label, 0, start_row, 2, 1);
+
     let rows_per_column = targets.len().div_ceil(2).max(1);
     for (index, target) in targets.iter().enumerate() {
         let visual_column = (index / rows_per_column) as i32;
-        let row = (index % rows_per_column) as i32;
+        let row = start_row + 1 + (index % rows_per_column) as i32;
 
         let target_row = GtkBox::new(Orientation::Horizontal, 10);
         target_row.add_css_class("entry-row");
@@ -1954,7 +1970,7 @@ fn build_switch_target_list(
         grid.attach(&target_row, visual_column, row, 1, 1);
     }
 
-    container.append(&grid);
+    start_row + 1 + rows_per_column as i32
 }
 
 fn find_switch_target(
