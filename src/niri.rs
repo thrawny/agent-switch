@@ -1,3 +1,4 @@
+use crate::app_labels;
 use crate::daemon::{self, AgentSession, AgentState, DaemonMessage, SessionCache};
 use crate::projects;
 use crate::state;
@@ -13,6 +14,7 @@ use niri_ipc::{
     Action, Event, Request, Response, Window, Workspace, WorkspaceReferenceArg, socket::Socket,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::process::Command;
@@ -391,28 +393,6 @@ fn get_workspace_by_name(name: &str) -> Option<Workspace> {
         .find(|ws| ws.name.as_deref() == Some(name))
 }
 
-fn simplify_label(title: &str, app_id: &str) -> String {
-    if app_id.contains("ghostty") || app_id.contains("terminal") || app_id.contains("alacritty") {
-        let cleaned = title
-            .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '~' && c != '/')
-            .trim();
-        if cleaned.starts_with('~') {
-            let last = cleaned.split('/').next_back().unwrap_or(cleaned);
-            format!("~/{}", last)
-        } else if cleaned.starts_with('/') {
-            cleaned
-                .split('/')
-                .next_back()
-                .unwrap_or(cleaned)
-                .to_string()
-        } else {
-            cleaned.to_string()
-        }
-    } else {
-        app_id.split('.').next_back().unwrap_or(app_id).to_string()
-    }
-}
-
 fn should_skip_discovered_workspace(
     name_opt: Option<&str>,
     display_name: &str,
@@ -487,7 +467,7 @@ fn get_workspace_columns_with_cap(
                     .unwrap_or("?");
                 let window_id = first_window.map(|w| w.id);
                 let window_title = first_window.and_then(|w| w.title.clone());
-                let app_label = simplify_label(title, app_id);
+                let app_label = app_labels::simplify_label(title, app_id);
 
                 entries.push(WorkspaceColumn {
                     workspace_name: ws_name.to_string(),

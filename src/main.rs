@@ -1,3 +1,5 @@
+#[cfg(feature = "niri")]
+mod app_labels;
 mod daemon;
 mod projects;
 mod state;
