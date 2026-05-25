@@ -1652,28 +1652,6 @@ fn build_ui(
     );
 }
 
-fn group_entries_by_workspace<'a>(
-    entries: &[&'a WorkspaceColumn],
-) -> Vec<Vec<&'a WorkspaceColumn>> {
-    let mut groups: Vec<Vec<&WorkspaceColumn>> = Vec::new();
-
-    for entry in entries {
-        let needs_new_group = groups
-            .last()
-            .and_then(|group| group.first())
-            .map(|first| first.workspace_key != entry.workspace_key)
-            .unwrap_or(true);
-
-        if needs_new_group {
-            groups.push(vec![*entry]);
-        } else if let Some(group) = groups.last_mut() {
-            group.push(*entry);
-        }
-    }
-
-    groups
-}
-
 fn format_duration(state_updated: f64) -> String {
     let elapsed = (state::now() - state_updated).max(0.0) as u64;
     if elapsed < 60 {
@@ -1727,85 +1705,6 @@ fn agent_info_for_entry(
     }
 
     None
-}
-
-fn entry_markup(
-    entry: &WorkspaceColumn,
-    agent_sessions: &HashMap<u64, AgentSession>,
-    theme: &themes::Theme,
-) -> String {
-    if let Some(info) = agent_info_for_entry(entry, agent_sessions) {
-        let agent = if let Some(title) = info.title.as_deref() {
-            let title = glib::markup_escape_text(title);
-            format!("{} {}", glib::markup_escape_text(&info.agent), title)
-        } else {
-            glib::markup_escape_text(&info.agent).to_string()
-        };
-        let color = theme.state_color(info.state);
-        let icon = info.state.icon();
-        return if let Some(updated) = info.state_updated {
-            let dur = format_duration(updated);
-            format!("{agent} <span color=\"{color}\">{icon}  {dur}</span>")
-        } else {
-            format!("{agent} <span color=\"{color}\">{icon}</span>")
-        };
-    }
-
-    glib::markup_escape_text(&entry.app_label).to_string()
-}
-
-fn build_entry_row(
-    entry: &WorkspaceColumn,
-    agent_sessions: &HashMap<u64, AgentSession>,
-    lock_label_widths: bool,
-    theme: &themes::Theme,
-) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 10);
-    row.add_css_class("entry-row");
-
-    let key_text = format!("[{}{}]", entry.workspace_key, entry.column_key);
-    let key_label = Label::new(Some(&key_text));
-    key_label.add_css_class("key");
-    row.append(&key_label);
-
-    let name_label = Label::new(None);
-    name_label.set_markup(&entry_markup(entry, agent_sessions, theme));
-    name_label.add_css_class("project");
-    name_label.set_xalign(0.0);
-    name_label.set_hexpand(true);
-    name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    name_label.set_max_width_chars(if lock_label_widths { 1 } else { 25 });
-    row.append(&name_label);
-
-    row
-}
-
-fn build_workspace_group(
-    entries: &[&WorkspaceColumn],
-    agent_sessions: &HashMap<u64, AgentSession>,
-    lock_label_widths: bool,
-    theme: &themes::Theme,
-) -> GtkBox {
-    let group = GtkBox::new(Orientation::Vertical, 6);
-    group.add_css_class("workspace-group");
-
-    if let Some(first) = entries.first() {
-        let title = Label::new(Some(&first.workspace_name));
-        title.add_css_class("workspace-title");
-        title.set_xalign(0.0);
-        group.append(&title);
-    }
-
-    for entry in entries {
-        group.append(&build_entry_row(
-            entry,
-            agent_sessions,
-            lock_label_widths,
-            theme,
-        ));
-    }
-
-    group
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2006,83 +1905,6 @@ fn switch_to_target(target: &SwitchTarget) {
                     spawn_terminals(dir);
                 }
             }
-        }
-    }
-}
-
-fn build_entry_list(
-    container: &GtkBox,
-    entries: &[WorkspaceColumn],
-    pending_key: Option<char>,
-    agent_sessions: &HashMap<u64, AgentSession>,
-    lock_label_widths: bool,
-    theme: &themes::Theme,
-) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-
-    let filtered: Vec<_> = if let Some(key) = pending_key {
-        entries.iter().filter(|e| e.workspace_key == key).collect()
-    } else {
-        entries.iter().collect()
-    };
-
-    let groups = group_entries_by_workspace(&filtered);
-
-    if pending_key.is_none() && groups.len() > 1 {
-        let grid = Grid::new();
-        grid.add_css_class("workspace-columns");
-        grid.set_column_spacing(36);
-
-        let num_pair_rows = groups.len().div_ceil(2);
-
-        for pair_row in 0..num_pair_rows {
-            let grid_row = if pair_row == 0 {
-                0
-            } else {
-                let sep_row = (pair_row * 2 - 1) as i32;
-                let separator = Separator::new(Orientation::Horizontal);
-                separator.add_css_class("workspace-separator");
-                grid.attach(&separator, 0, sep_row, 2, 1);
-                sep_row + 1
-            };
-
-            let left_idx = pair_row * 2;
-            let group =
-                build_workspace_group(&groups[left_idx], agent_sessions, lock_label_widths, theme);
-            group.set_valign(gtk4::Align::Start);
-            group.add_css_class("workspace-column-left");
-            grid.attach(&group, 0, grid_row, 1, 1);
-
-            let right_idx = left_idx + 1;
-            if right_idx < groups.len() {
-                let group = build_workspace_group(
-                    &groups[right_idx],
-                    agent_sessions,
-                    lock_label_widths,
-                    theme,
-                );
-                group.set_valign(gtk4::Align::Start);
-                grid.attach(&group, 1, grid_row, 1, 1);
-            }
-        }
-
-        container.append(&grid);
-    } else {
-        for (index, group_entries) in groups.iter().enumerate() {
-            if index > 0 {
-                let separator = Separator::new(Orientation::Horizontal);
-                separator.add_css_class("workspace-separator");
-                container.append(&separator);
-            }
-
-            container.append(&build_workspace_group(
-                group_entries,
-                agent_sessions,
-                lock_label_widths,
-                theme,
-            ));
         }
     }
 }
@@ -2539,14 +2361,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
 
     {
         let s = state.borrow();
-        build_entry_list(
-            &main_box,
-            &s.entries,
-            s.pending_key,
-            &s.agent_sessions,
-            false,
-            s.theme,
-        );
+        build_switch_target_list(&main_box, &s.entries, &s.config);
     }
     outer_box.append(&scroller);
 
@@ -2554,12 +2369,12 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
 
     window.set_child(Some(&outer_box));
 
-    // Key handler: q/Escape to quit, same pending-key logic as real UI
+    // Key handler: q/Escape to quit, same target selection logic as real UI
     let key_controller = gtk4::EventControllerKey::new();
     let state_clone = state.clone();
     let window_clone = window.clone();
-    let main_box_clone = main_box.clone();
-    let scroller_clone = scroller.clone();
+    let _main_box_clone = main_box.clone();
+    let _scroller_clone = scroller.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
         let input_char = input_char_for_key(keyval);
@@ -2572,61 +2387,15 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         };
 
         if input_char == Some('q') || key == "escape" {
-            let mut s = state_clone.borrow_mut();
-            if s.pending_key.is_some() {
-                s.pending_key = None;
-                let entries = s.entries.clone();
-                let agent_sessions = s.agent_sessions.clone();
-                let theme = s.theme;
-                drop(s);
-                build_entry_list(
-                    &main_box_clone,
-                    &entries,
-                    None,
-                    &agent_sessions,
-                    true,
-                    theme,
-                );
-                reset_overlay_scroll(&scroller_clone);
-            } else {
-                drop(s);
-                window_clone.close();
-            }
+            window_clone.close();
             return glib::Propagation::Stop;
         }
 
-        if let Some(key_char) = selection_key {
-            let mut s = state_clone.borrow_mut();
-            if s.pending_key.is_some() {
-                s.pending_key = None;
-                let entries = s.entries.clone();
-                let agent_sessions = s.agent_sessions.clone();
-                let theme = s.theme;
-                drop(s);
-                build_entry_list(
-                    &main_box_clone,
-                    &entries,
-                    None,
-                    &agent_sessions,
-                    true,
-                    theme,
-                );
-                reset_overlay_scroll(&scroller_clone);
-            } else if s.entries.iter().any(|e| e.workspace_key == key_char) {
-                s.pending_key = Some(key_char);
-                let entries = s.entries.clone();
-                let agent_sessions = s.agent_sessions.clone();
-                let theme = s.theme;
-                drop(s);
-                build_entry_list(
-                    &main_box_clone,
-                    &entries,
-                    Some(key_char),
-                    &agent_sessions,
-                    true,
-                    theme,
-                );
-                reset_overlay_scroll(&scroller_clone);
+        if let Some(key_char) = input_char {
+            let s = state_clone.borrow();
+            if let Some(target) = find_switch_target(&s.entries, &s.config, key_char) {
+                log::info!("demo selected target: {}", target.label);
+                window_clone.close();
             }
         }
 
@@ -2645,18 +2414,9 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         let mut s = state_for_timer.borrow_mut();
         s.agent_sessions = mock_agent_sessions(&s.entries, *c);
         let entries = s.entries.clone();
-        let pending = s.pending_key;
-        let agent_sessions = s.agent_sessions.clone();
-        let theme = s.theme;
+        let config = s.config.clone();
         drop(s);
-        build_entry_list(
-            &main_box_for_timer,
-            &entries,
-            pending,
-            &agent_sessions,
-            true,
-            theme,
-        );
+        build_switch_target_list(&main_box_for_timer, &entries, &config);
         glib::ControlFlow::Continue
     });
 
@@ -2666,14 +2426,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     // Second pass: lock label widths so content changes don't shift layout
     {
         let s = state.borrow();
-        build_entry_list(
-            &main_box,
-            &s.entries,
-            s.pending_key,
-            &s.agent_sessions,
-            true,
-            s.theme,
-        );
+        build_switch_target_list(&main_box, &s.entries, &s.config);
     }
 
     window.present();
