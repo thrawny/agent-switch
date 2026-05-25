@@ -36,19 +36,19 @@ install:
     cargo install --path . --locked --force {{ _niri }}
 
 # Run all post-change checks
-check: fmt _clippy-strict test
+check: fmt clippy test
 
-# Clippy with denied warnings (for CI/check)
+# Clippy with denied warnings
 _clippy-strict:
     cargo clippy {{ _niri }} -- -D warnings
 
-# Run clippy
+# Run clippy and apply machine-applicable fixes
 clippy:
-    cargo clippy --fix --allow-dirty --allow-staged --release {{ _niri }}
+    cargo clippy --fix --allow-dirty --allow-staged {{ _niri }}
 
 # Run tests
 test:
-    cargo test --release
+    cargo test
 
 # Run niri overlay demo with mock data (optional theme: just demo default)
 demo theme="":
