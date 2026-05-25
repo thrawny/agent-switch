@@ -78,6 +78,25 @@ struct WorkspaceColumn {
     window_id: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct SwitchTarget {
+    key: char,
+    label: String,
+    kind: SwitchTargetKind,
+}
+
+#[derive(Debug, Clone)]
+enum SwitchTargetKind {
+    Workspace {
+        workspace_name: String,
+        workspace_ref: WorkspaceReferenceArg,
+        dir: Option<String>,
+        static_workspace: bool,
+        is_empty: bool,
+    },
+    Window(u64),
+}
+
 struct AppState {
     config: projects::Config,
     theme: &'static themes::Theme,
@@ -1194,14 +1213,7 @@ fn build_ui(
 
     {
         let state_ref = state.borrow();
-        build_entry_list(
-            &main_box,
-            &state_ref.entries,
-            state_ref.pending_key,
-            &state_ref.agent_sessions,
-            false,
-            state_ref.theme,
-        );
+        build_switch_target_list(&main_box, &state_ref.entries, &state_ref.config);
     }
     outer_box.append(&scroller);
 
@@ -1231,14 +1243,8 @@ fn build_ui(
                 state.theme,
             );
         } else {
-            build_entry_list(
-                main_box,
-                &state.entries,
-                state.pending_key,
-                &state.agent_sessions,
-                lock_label_widths,
-                state.theme,
-            );
+            let _ = lock_label_widths;
+            build_switch_target_list(main_box, &state.entries, &state.config);
         }
     };
 
@@ -1366,50 +1372,11 @@ fn build_ui(
                 return glib::Propagation::Stop;
             }
 
-            let mut state = state_clone.borrow_mut();
-
-            if let Some(first_key) = state.pending_key {
-                if let Some(entry) = state
-                    .entries
-                    .iter()
-                    .find(|e| e.workspace_key == first_key && e.column_key == key_char)
-                {
-                    let entry = entry.clone();
-                    state.pending_key = None;
-                    drop(state);
-                    window_clone.set_visible(false);
-                    switch_to_entry(&entry);
-                } else {
-                    state.pending_key = None;
-                    let entries = state.entries.clone();
-                    let agent_sessions = state.agent_sessions.clone();
-                    let theme = state.theme;
-                    drop(state);
-                    build_entry_list(
-                        &main_box_clone,
-                        &entries,
-                        None,
-                        &agent_sessions,
-                        true,
-                        theme,
-                    );
-                    reset_overlay_scroll(&scroller_clone);
-                }
-            } else if state.entries.iter().any(|e| e.workspace_key == key_char) {
-                state.pending_key = Some(key_char);
-                let entries = state.entries.clone();
-                let agent_sessions = state.agent_sessions.clone();
-                let theme = state.theme;
+            let state = state_clone.borrow();
+            if let Some(target) = find_switch_target(&state.entries, &state.config, key_char) {
                 drop(state);
-                build_entry_list(
-                    &main_box_clone,
-                    &entries,
-                    Some(key_char),
-                    &agent_sessions,
-                    true,
-                    theme,
-                );
-                reset_overlay_scroll(&scroller_clone);
+                window_clone.set_visible(false);
+                switch_to_target(&target);
             }
         }
 
@@ -1865,6 +1832,168 @@ fn build_workspace_group(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn binding_key(value: &str) -> Option<char> {
+    value.chars().next().filter(|_| value.chars().count() == 1)
+}
+
+fn explicit_workspace_key(config: &projects::Config, workspace_name: &str) -> Option<char> {
+    config
+        .bindings
+        .workspaces
+        .iter()
+        .find_map(|(key, name)| (name == workspace_name).then(|| binding_key(key)).flatten())
+}
+
+fn app_binding_matches(binding: &projects::AppBinding, window: &Window) -> bool {
+    let app_id = window.app_id.as_deref().unwrap_or("").to_ascii_lowercase();
+    let title = window.title.as_deref().unwrap_or("").to_ascii_lowercase();
+
+    binding
+        .app_id
+        .as_deref()
+        .is_some_and(|expected| app_id == expected.to_ascii_lowercase())
+        || binding
+            .app_id_contains
+            .as_deref()
+            .is_some_and(|needle| app_id.contains(&needle.to_ascii_lowercase()))
+        || binding
+            .title_contains
+            .as_deref()
+            .is_some_and(|needle| title.contains(&needle.to_ascii_lowercase()))
+}
+
+fn build_switch_targets(
+    entries: &[WorkspaceColumn],
+    config: &projects::Config,
+) -> Vec<SwitchTarget> {
+    let mut targets = Vec::new();
+    let mut seen_workspaces = std::collections::HashSet::new();
+    let mut used_keys = std::collections::HashSet::new();
+
+    for entry in entries {
+        if !seen_workspaces.insert(entry.workspace_name.clone()) {
+            continue;
+        }
+        let key =
+            explicit_workspace_key(config, &entry.workspace_name).unwrap_or(entry.workspace_key);
+        if !used_keys.insert(key) {
+            continue;
+        }
+        targets.push(SwitchTarget {
+            key,
+            label: entry.workspace_name.clone(),
+            kind: SwitchTargetKind::Workspace {
+                workspace_name: entry.workspace_name.clone(),
+                workspace_ref: entry.workspace_ref.clone(),
+                dir: entry.dir.clone(),
+                static_workspace: entry.static_workspace,
+                is_empty: entry.app_label == "(empty)",
+            },
+        });
+    }
+
+    let windows = niri_windows();
+    for binding in &config.bindings.apps {
+        let Some(key) = binding_key(&binding.key) else {
+            continue;
+        };
+        if !used_keys.insert(key) {
+            continue;
+        }
+        let Some(window) = windows
+            .iter()
+            .find(|window| app_binding_matches(binding, window))
+        else {
+            continue;
+        };
+        targets.push(SwitchTarget {
+            key,
+            label: binding.label.clone(),
+            kind: SwitchTargetKind::Window(window.id),
+        });
+    }
+
+    targets
+}
+
+fn build_switch_target_list(
+    container: &GtkBox,
+    entries: &[WorkspaceColumn],
+    config: &projects::Config,
+) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let targets = build_switch_targets(entries, config);
+    let grid = Grid::new();
+    grid.add_css_class("workspace-columns");
+    grid.set_column_spacing(48);
+    grid.set_row_spacing(6);
+    grid.set_halign(gtk4::Align::Start);
+
+    let rows_per_column = targets.len().div_ceil(2).max(1);
+    for (index, target) in targets.iter().enumerate() {
+        let visual_column = (index / rows_per_column) as i32;
+        let row = (index % rows_per_column) as i32;
+
+        let target_row = GtkBox::new(Orientation::Horizontal, 10);
+        target_row.add_css_class("entry-row");
+
+        let key_label = Label::new(Some(&format!("[{}]", target.key)));
+        key_label.add_css_class("key");
+        target_row.append(&key_label);
+
+        let label = Label::new(Some(&target.label));
+        label.add_css_class("project");
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        label.set_max_width_chars(28);
+        target_row.append(&label);
+
+        grid.attach(&target_row, visual_column, row, 1, 1);
+    }
+
+    container.append(&grid);
+}
+
+fn find_switch_target(
+    entries: &[WorkspaceColumn],
+    config: &projects::Config,
+    key: char,
+) -> Option<SwitchTarget> {
+    build_switch_targets(entries, config)
+        .into_iter()
+        .find(|target| target.key == key)
+}
+
+fn switch_to_target(target: &SwitchTarget) {
+    match &target.kind {
+        SwitchTargetKind::Window(window_id) => {
+            focus_window(*window_id);
+        }
+        SwitchTargetKind::Workspace {
+            workspace_name,
+            workspace_ref,
+            dir,
+            static_workspace,
+            is_empty,
+        } => {
+            if *is_empty && !*static_workspace {
+                create_workspace(workspace_name, dir.as_deref());
+            } else {
+                focus_workspace(workspace_ref.clone());
+                if *is_empty
+                    && *static_workspace
+                    && let Some(dir) = dir
+                {
+                    spawn_terminals(dir);
+                }
+            }
+        }
+    }
+}
+
 fn build_entry_list(
     container: &GtkBox,
     entries: &[WorkspaceColumn],

@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,29 @@ pub struct Project {
     #[serde(default = "default_true", alias = "skip_first_column")]
     #[cfg_attr(not(feature = "niri"), allow(dead_code))]
     pub skip_first_column: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Bindings {
+    #[serde(default)]
+    #[cfg_attr(not(feature = "niri"), allow(dead_code))]
+    pub workspaces: HashMap<String, String>,
+    #[serde(default)]
+    #[cfg_attr(not(feature = "niri"), allow(dead_code))]
+    pub apps: Vec<AppBinding>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(not(feature = "niri"), allow(dead_code))]
+pub struct AppBinding {
+    pub key: String,
+    pub label: String,
+    #[serde(default, alias = "appId")]
+    pub app_id: Option<String>,
+    #[serde(default, alias = "appIdContains")]
+    pub app_id_contains: Option<String>,
+    #[serde(default, alias = "titleContains")]
+    pub title_contains: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +66,9 @@ pub struct Config {
     #[serde(default = "default_theme")]
     #[cfg_attr(not(feature = "niri"), allow(dead_code))]
     pub theme: String,
+    #[serde(default)]
+    #[cfg_attr(not(feature = "niri"), allow(dead_code))]
+    pub bindings: Bindings,
 }
 
 impl Default for Config {
@@ -52,6 +79,7 @@ impl Default for Config {
             ignore_unnamed_workspaces: default_ignore_unnamed_workspaces(),
             ignore_numeric_sessions: default_ignore_numeric_sessions(),
             theme: default_theme(),
+            bindings: Bindings::default(),
         }
     }
 }
