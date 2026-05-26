@@ -163,9 +163,7 @@ fn agent_sessions_from_store(store: &state::SessionStore) -> HashMap<u64, AgentS
 }
 
 fn session_niri_window_id(window_key: &str, session: &state::Session) -> Option<u64> {
-    if session.window.tmux_id.is_none()
-        && let Ok(window_id) = window_key.parse::<u64>()
-    {
+    if let Ok(window_id) = window_key.parse::<u64>() {
         return Some(window_id);
     }
 
@@ -2953,7 +2951,6 @@ dir = "~/code/wayvoice"
                 transcript_path: None,
                 window: state::WindowId {
                     niri_id: Some("42".to_string()),
-                    tmux_id: None,
                 },
             },
         );
@@ -2983,7 +2980,6 @@ dir = "~/code/wayvoice"
                 waiting_reason: None,
                 transcript_path: None,
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("56".to_string()),
                 },
             },
@@ -3043,7 +3039,6 @@ dir = "~/code/wayvoice"
                 transcript_path: None,
                 window: state::WindowId {
                     niri_id: Some("42".to_string()),
-                    tmux_id: None,
                 },
             },
         );

@@ -15,23 +15,6 @@ struct HookInput {
     niri_id: Option<String>,
 }
 
-fn get_tmux_window_id() -> Option<String> {
-    if std::env::var("TMUX").is_err() {
-        return None;
-    }
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", "#{window_id}"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !id.is_empty() {
-            return Some(id);
-        }
-    }
-    None
-}
-
 fn get_niri_window_id() -> Option<String> {
     let output = Command::new("niri")
         .args(["msg", "-j", "windows"])
@@ -126,7 +109,6 @@ pub fn handle_event(
         cwd: hook.cwd,
         transcript_path: hook.transcript_path,
         notification_type: hook.notification_type,
-        tmux_id: get_tmux_window_id(),
         niri_id: hook.niri_id.or_else(get_niri_window_id),
     };
 

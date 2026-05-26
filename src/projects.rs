@@ -162,6 +162,7 @@ pub fn configured_projects(config: &Config) -> Vec<&Project> {
     projects
 }
 
+#[allow(dead_code)]
 pub fn configured_project_names(config: &Config) -> Vec<String> {
     configured_projects(config)
         .into_iter()
@@ -188,6 +189,7 @@ pub fn is_numeric_name(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
+#[allow(dead_code)]
 pub fn should_ignore_name(name: &str, config: &Config) -> bool {
     config.ignore.iter().any(|ignored| ignored == name)
         || (config.ignore_numeric_sessions && is_numeric_name(name))

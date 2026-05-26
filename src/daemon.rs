@@ -2,7 +2,6 @@ use crate::state::{self, SessionStore};
 use log::{debug, error, info, warn};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, Write};
@@ -67,6 +66,7 @@ pub enum DaemonMessage {
     Track(TrackEvent),
     List(std::sync::mpsc::Sender<ListResponse>),
     SessionsChanged,
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -128,8 +128,6 @@ pub struct TrackEvent {
     #[serde(default)]
     pub notification_type: Option<String>,
     #[serde(default)]
-    pub tmux_id: Option<String>,
-    #[serde(default)]
     pub niri_id: Option<String>,
 }
 
@@ -175,8 +173,6 @@ pub struct ListEntry {
     pub state: AgentState,
     pub state_updated: f64,
     pub window_id: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tmux_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub niri_id: Option<String>,
 }
@@ -247,7 +243,6 @@ impl SessionCache {
                 state: session.state.into(),
                 state_updated: session.state_updated,
                 window_id: key.clone(),
-                tmux_id: session.window.tmux_id.clone(),
                 niri_id: session.window.niri_id.clone(),
             })
             .collect();
@@ -509,11 +504,10 @@ fn handle_socket_request(
         }
         SocketRequest::Track { event } => {
             info!(
-                "track {} agent={} session={} tmux={:?} niri={:?} cwd={:?}",
+                "track {} agent={} session={} niri={:?} cwd={:?}",
                 event.event,
                 event.agent.as_deref().unwrap_or("claude"),
                 event.session_id,
-                event.tmux_id,
                 event.niri_id,
                 event.cwd
             );
@@ -645,94 +639,6 @@ pub fn start_sessions_watcher(tx: mpsc::Sender<DaemonMessage>) {
     });
 }
 
-/// Monitor tmux sockets for daemon lifecycle (headless mode only)
-pub fn start_tmux_monitor(tx: mpsc::Sender<DaemonMessage>) {
-    thread::spawn(move || {
-        loop {
-            thread::sleep(std::time::Duration::from_secs(5));
-            if !tmux_server_running() {
-                info!("No tmux sockets found, shutting down daemon");
-                let _ = tx.send(DaemonMessage::Shutdown);
-                return;
-            }
-        }
-    });
-}
-
-fn tmux_server_running() -> bool {
-    let sockets = find_tmux_sockets();
-    if !sockets.is_empty() {
-        return true;
-    }
-
-    // Fallback to tmux's default lookup in case the socket lives in a custom dir
-    std::process::Command::new("tmux")
-        .arg("list-sessions")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn find_tmux_sockets() -> Vec<PathBuf> {
-    let uid = unsafe { libc::getuid() };
-    let mut sockets: HashSet<PathBuf> = HashSet::new();
-
-    if let Some(path) = tmux_socket_from_env() {
-        sockets.insert(path);
-    }
-
-    for dir in tmux_socket_dirs(uid) {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                sockets.insert(entry.path());
-            }
-        }
-    }
-
-    sockets.into_iter().collect()
-}
-
-fn tmux_socket_from_env() -> Option<PathBuf> {
-    let value = std::env::var("TMUX").ok()?;
-    let socket_path = value.split(',').next()?.trim();
-    if socket_path.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(socket_path))
-}
-
-fn tmux_socket_dirs(uid: u32) -> Vec<PathBuf> {
-    let mut bases: HashSet<PathBuf> = HashSet::new();
-
-    // tmux defaults
-    bases.insert(PathBuf::from("/tmp"));
-    if cfg!(target_os = "macos") {
-        bases.insert(PathBuf::from("/private/tmp"));
-    }
-
-    // common overrides
-    if let Ok(tmpdir) = std::env::var("TMUX_TMPDIR")
-        && !tmpdir.is_empty()
-    {
-        bases.insert(PathBuf::from(tmpdir));
-    }
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
-        && !runtime_dir.is_empty()
-    {
-        bases.insert(PathBuf::from(runtime_dir));
-    }
-
-    // Linux systems typically place tmux sockets under /run/user/<uid>
-    if cfg!(target_os = "linux") {
-        bases.insert(PathBuf::from(format!("/run/user/{}", uid)));
-    }
-
-    bases
-        .into_iter()
-        .map(|base| base.join(format!("tmux-{}", uid)))
-        .collect()
-}
-
 /// Run the headless daemon
 pub fn run_headless() {
     let (tx, rx) = mpsc::channel();
@@ -754,7 +660,6 @@ pub fn run_headless() {
     info!("daemon started, socket={:?}", socket_path());
 
     start_sessions_watcher(tx.clone());
-    start_tmux_monitor(tx.clone());
 
     loop {
         let msg = match rx.recv() {
@@ -807,23 +712,14 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
     });
 
     if let Err(err) = state::with_locked_store_at_path(state_path, |store| {
-        // Determine window key and IDs - prefer tmux_id, fall back to niri_id
-        let (window_key, window_id) = match (&event.tmux_id, focused_niri_id) {
-            (Some(tmux), niri) => (
-                tmux.clone(),
-                state::WindowId {
-                    tmux_id: Some(tmux.clone()),
-                    niri_id: niri.map(|n| n.to_string()),
-                },
-            ),
-            (None, Some(niri)) => (
+        let (window_key, window_id) = match focused_niri_id {
+            Some(niri) => (
                 niri.to_string(),
                 state::WindowId {
-                    tmux_id: None,
                     niri_id: Some(niri.to_string()),
                 },
             ),
-            (None, None) => {
+            None => {
                 // No window info - can only update existing sessions
                 match event.event {
                     TrackEventKind::SessionEnd => {
@@ -912,11 +808,7 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
                     session.state = state::SessionState::Responding;
                     session.state_updated = state::now();
                     clear_waiting_reason(session);
-                    update_session_window_binding(
-                        session,
-                        event.tmux_id.as_deref(),
-                        focused_niri_id,
-                    );
+                    update_session_window_binding(session, focused_niri_id);
                 } else {
                     let session = state::Session {
                         agent: agent.to_string(),
@@ -984,26 +876,7 @@ fn remove_other_session_bindings(
     });
 }
 
-fn update_session_window_binding(
-    session: &mut state::Session,
-    tmux_id: Option<&str>,
-    niri_id: Option<u64>,
-) {
-    if let Some(tmux_id) = tmux_id {
-        match session.window.tmux_id.as_deref() {
-            Some(existing) if existing != tmux_id => {
-                debug!(
-                    "Ignoring tmux rebinding for session {}: keeping {} over {}",
-                    session.session_id, existing, tmux_id
-                );
-            }
-            None => {
-                session.window.tmux_id = Some(tmux_id.to_string());
-            }
-            _ => {}
-        }
-    }
-
+fn update_session_window_binding(session: &mut state::Session, niri_id: Option<u64>) {
     if let Some(niri_id) = niri_id {
         let niri_id = niri_id.to_string();
         match session.window.niri_id.as_deref() {
@@ -1384,12 +1257,11 @@ mod tests {
             waiting_reason: None,
             transcript_path: None,
             window: state::WindowId {
-                tmux_id: None,
                 niri_id: Some("122".to_string()),
             },
         };
 
-        update_session_window_binding(&mut session, None, Some(56));
+        update_session_window_binding(&mut session, Some(56));
 
         assert_eq!(session.window.niri_id.as_deref(), Some("122"));
     }
@@ -1405,13 +1277,10 @@ mod tests {
             state_updated: 1.0,
             waiting_reason: None,
             transcript_path: None,
-            window: state::WindowId {
-                tmux_id: None,
-                niri_id: None,
-            },
+            window: state::WindowId { niri_id: None },
         };
 
-        update_session_window_binding(&mut session, None, Some(56));
+        update_session_window_binding(&mut session, Some(56));
 
         assert_eq!(session.window.niri_id.as_deref(), Some("56"));
     }
@@ -1431,7 +1300,6 @@ mod tests {
                 waiting_reason: None,
                 transcript_path: None,
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("122".to_string()),
                 },
             },
@@ -1448,7 +1316,6 @@ mod tests {
                 waiting_reason: None,
                 transcript_path: None,
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("219".to_string()),
                 },
             },
@@ -1467,7 +1334,6 @@ mod tests {
                 waiting_reason: None,
                 transcript_path: None,
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("56".to_string()),
                 },
             },
@@ -1498,7 +1364,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: None,
             },
             Some(19),
@@ -1518,7 +1383,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("47".to_string()),
             },
             Some(19),
@@ -1553,7 +1417,6 @@ mod tests {
                 waiting_reason: Some(state::WaitingReason::PermissionPrompt),
                 transcript_path: Some(transcript_path),
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("148".to_string()),
                 },
             },
@@ -1586,7 +1449,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("47".to_string()),
             },
             Some(19),
@@ -1602,7 +1464,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("56".to_string()),
             },
             Some(56),
@@ -1618,7 +1479,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("56".to_string()),
             },
             Some(56),
@@ -1652,7 +1512,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: None,
             },
             Some(19),
@@ -1668,7 +1527,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("47".to_string()),
             },
             Some(47),
@@ -1701,7 +1559,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("47".to_string()),
             },
             Some(47),
@@ -1750,7 +1607,6 @@ mod tests {
                 waiting_reason: None,
                 transcript_path: Some(transcript_path),
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("148".to_string()),
                 },
             },
@@ -1808,7 +1664,6 @@ mod tests {
                 waiting_reason: None,
                 transcript_path: Some(transcript_path),
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("148".to_string()),
                 },
             },
@@ -1859,7 +1714,6 @@ mod tests {
                 waiting_reason: None,
                 transcript_path: Some(transcript_path),
                 window: state::WindowId {
-                    tmux_id: None,
                     niri_id: Some("148".to_string()),
                 },
             },
@@ -1901,8 +1755,7 @@ mod tests {
             cwd: Some(format!("/tmp/{}", "deep-project/".repeat(512))),
             transcript_path: None,
             notification_type: None,
-            tmux_id: Some("@999".to_string()),
-            niri_id: None,
+            niri_id: Some("999".to_string()),
         };
 
         let response = send_socket_request_to_path(
@@ -1925,7 +1778,7 @@ mod tests {
                 .sessions
                 .iter()
                 .any(|entry| entry.session_id == event.session_id
-                    && entry.tmux_id.as_deref() == Some("@999")
+                    && entry.niri_id.as_deref() == Some("999")
                     && entry.cwd.as_deref() == event.cwd.as_deref())
         );
 
@@ -1962,7 +1815,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: Some(transcript_path),
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("42".to_string()),
             },
             None,
@@ -1979,7 +1831,6 @@ mod tests {
                 cwd: None,
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("42".to_string()),
             },
             Some(42),
@@ -1996,7 +1847,6 @@ mod tests {
                 cwd: None,
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("42".to_string()),
             },
             Some(42),
@@ -2025,7 +1875,6 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("43".to_string()),
             },
             None,
@@ -2041,7 +1890,6 @@ mod tests {
                 cwd: None,
                 transcript_path: None,
                 notification_type: None,
-                tmux_id: None,
                 niri_id: Some("43".to_string()),
             },
             Some(43),

@@ -5,7 +5,6 @@ mod projects;
 mod state;
 #[cfg(feature = "niri")]
 mod themes;
-mod tmux;
 mod track;
 
 #[cfg(feature = "niri")]
@@ -61,12 +60,6 @@ enum Command {
     Focused,
     /// Remove stale sessions
     Cleanup,
-    /// Tmux picker (daemonless)
-    Tmux {
-        /// Skip keyboard UI, go straight to fzf search
-        #[arg(long)]
-        fzf: bool,
-    },
     /// Run the daemon (session cache + file watchers)
     Serve {
         /// Enable niri GTK overlay (Linux only)
@@ -158,13 +151,6 @@ fn main() {
             }) {
                 eprintln!("Failed to update state: {}", err);
                 std::process::exit(1);
-            }
-        }
-        Command::Tmux { fzf } => {
-            if fzf {
-                tmux::run_fzf_only();
-            } else {
-                tmux::run();
             }
         }
         #[cfg(feature = "niri")]

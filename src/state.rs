@@ -16,8 +16,6 @@ const STALE_SESSION_MAX_AGE_SECS: f64 = 24.0 * 60.0 * 60.0;
 pub struct WindowId {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub niri_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tmux_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,9 +78,6 @@ struct WindowProbeError {
     backend: &'static str,
     detail: String,
 }
-
-#[derive(Debug, Clone, Default)]
-struct TmuxWindowInfo;
 
 #[derive(Debug, Clone, Default)]
 struct NiriWindowInfo;
@@ -246,21 +241,14 @@ pub fn find_by_session_id_mut<'a>(
 
 /// Remove stale sessions (windows that no longer exist)
 pub fn cleanup_stale(store: &mut SessionStore) {
-    let live_tmux_windows = store_uses_tmux_windows(store).then(get_live_tmux_windows);
     let live_niri_windows = store_uses_niri_windows(store).then(get_live_niri_windows);
 
-    if let Some(Err(err)) = &live_tmux_windows {
-        warn!("Skipping tmux stale cleanup: {}", err);
-    }
     if let Some(Err(err)) = &live_niri_windows {
         warn!("Skipping niri stale cleanup: {}", err);
     }
 
     cleanup_stale_with_window_snapshots(
         store,
-        live_tmux_windows
-            .as_ref()
-            .and_then(|result| result.as_ref().ok()),
         live_niri_windows
             .as_ref()
             .and_then(|result| result.as_ref().ok()),
@@ -272,13 +260,6 @@ pub fn cleanup_stale(store: &mut SessionStore) {
         .retain(|_, session| session.state_updated > cutoff);
 }
 
-fn store_uses_tmux_windows(store: &SessionStore) -> bool {
-    store
-        .sessions
-        .values()
-        .any(|session| session.window.tmux_id.is_some())
-}
-
 fn store_uses_niri_windows(store: &SessionStore) -> bool {
     store
         .sessions
@@ -288,39 +269,11 @@ fn store_uses_niri_windows(store: &SessionStore) -> bool {
 
 fn cleanup_stale_with_window_snapshots(
     store: &mut SessionStore,
-    live_tmux_windows: Option<&HashMap<String, TmuxWindowInfo>>,
     live_niri_windows: Option<&HashMap<String, NiriWindowInfo>>,
 ) {
-    store.sessions.retain(|_, session| {
-        retain_window_binding(&mut session.window, &live_tmux_windows, &live_niri_windows)
-    });
-}
-
-fn get_live_tmux_windows() -> std::result::Result<HashMap<String, TmuxWindowInfo>, WindowProbeError>
-{
-    let mut windows = HashMap::new();
-    let output = Command::new("tmux")
-        .args([
-            "list-windows",
-            "-a",
-            "-F",
-            "#{window_id}\t#{window_name}\t#{pane_current_command}",
-        ])
-        .output()
-        .map_err(|err| WindowProbeError::command_error("tmux", err))?;
-    if !output.status.success() {
-        return Err(WindowProbeError::command_failed("tmux", &output));
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut parts = line.splitn(3, '\t');
-        let id = parts.next().unwrap_or("").trim();
-        if !id.is_empty() {
-            windows.insert(id.to_string(), TmuxWindowInfo);
-        }
-    }
-
-    Ok(windows)
+    store
+        .sessions
+        .retain(|_, session| retain_window_binding(&mut session.window, &live_niri_windows));
 }
 
 fn get_live_niri_windows() -> std::result::Result<HashMap<String, NiriWindowInfo>, WindowProbeError>
@@ -347,26 +300,18 @@ fn get_live_niri_windows() -> std::result::Result<HashMap<String, NiriWindowInfo
 
 fn retain_window_binding(
     window: &mut WindowId,
-    live_tmux_windows: &Option<&HashMap<String, TmuxWindowInfo>>,
     live_niri_windows: &Option<&HashMap<String, NiriWindowInfo>>,
 ) -> bool {
-    let drop_tmux = matches!(
-        (window.tmux_id.as_ref(), live_tmux_windows),
-        (Some(id), Some(valid)) if !valid.contains_key(id)
-    );
     let drop_niri = matches!(
         (window.niri_id.as_ref(), live_niri_windows),
         (Some(id), Some(valid)) if !valid.contains_key(id)
     );
 
-    if drop_tmux {
-        window.tmux_id = None;
-    }
     if drop_niri {
         window.niri_id = None;
     }
 
-    window.tmux_id.is_some() || window.niri_id.is_some()
+    window.niri_id.is_some()
 }
 
 pub(crate) fn with_locked_store_at_path<T, F>(path: &Path, mutate: F) -> Result<T>
@@ -484,50 +429,10 @@ mod tests {
         dir.join("sessions.json")
     }
 
-    fn tmux_windows(ids: &[&str]) -> HashMap<String, TmuxWindowInfo> {
-        ids.iter()
-            .map(|id| (id.to_string(), TmuxWindowInfo::default()))
-            .collect()
-    }
-
     fn niri_windows(ids: &[&str]) -> HashMap<String, NiriWindowInfo> {
         ids.iter()
             .map(|id| (id.to_string(), NiriWindowInfo::default()))
             .collect()
-    }
-
-    #[test]
-    fn retain_window_binding_keeps_tmux_binding_when_niri_window_is_gone() {
-        let mut window = WindowId {
-            niri_id: Some("42".to_string()),
-            tmux_id: Some("@7".to_string()),
-        };
-        let valid_tmux = tmux_windows(&["@7"]);
-        let valid_niri = niri_windows(&[]);
-
-        assert!(retain_window_binding(
-            &mut window,
-            &Some(&valid_tmux),
-            &Some(&valid_niri)
-        ));
-        assert_eq!(window.tmux_id.as_deref(), Some("@7"));
-        assert_eq!(window.niri_id, None);
-    }
-
-    #[test]
-    fn retain_window_binding_keeps_tmux_binding_when_tmux_probe_fails() {
-        let mut window = WindowId {
-            niri_id: None,
-            tmux_id: Some("@7".to_string()),
-        };
-        let valid_niri = niri_windows(&[]);
-
-        assert!(retain_window_binding(
-            &mut window,
-            &None,
-            &Some(&valid_niri)
-        ));
-        assert_eq!(window.tmux_id.as_deref(), Some("@7"));
     }
 
     #[test]
@@ -544,43 +449,14 @@ mod tests {
                 state_updated: now(),
                 waiting_reason: None,
                 transcript_path: None,
-                window: WindowId {
-                    niri_id: None,
-                    tmux_id: Some("@9".to_string()),
-                },
+                window: WindowId { niri_id: None },
             },
         );
 
-        let valid_tmux = tmux_windows(&[]);
         let valid_niri = niri_windows(&[]);
-        cleanup_stale_with_window_snapshots(&mut store, Some(&valid_tmux), Some(&valid_niri));
+        cleanup_stale_with_window_snapshots(&mut store, Some(&valid_niri));
 
         assert!(store.sessions.is_empty());
-    }
-
-    #[test]
-    fn store_uses_tmux_windows_checks_sessions() {
-        let mut store = SessionStore::default();
-        assert!(!store_uses_tmux_windows(&store));
-
-        store.sessions.insert(
-            "@9".to_string(),
-            Session {
-                agent: "claude".to_string(),
-                session_id: "session-9".to_string(),
-                session_name: None,
-                cwd: Some("/tmp/project".to_string()),
-                state: SessionState::Idle,
-                state_updated: 1.0,
-                waiting_reason: None,
-                transcript_path: None,
-                window: WindowId {
-                    niri_id: None,
-                    tmux_id: Some("@9".to_string()),
-                },
-            },
-        );
-        assert!(store_uses_tmux_windows(&store));
     }
 
     #[test]
@@ -601,7 +477,6 @@ mod tests {
                 transcript_path: None,
                 window: WindowId {
                     niri_id: Some("42".to_string()),
-                    tmux_id: None,
                 },
             },
         );
@@ -632,10 +507,7 @@ mod tests {
                 state_updated: 1.0,
                 waiting_reason: None,
                 transcript_path: None,
-                window: WindowId {
-                    niri_id: None,
-                    tmux_id: Some("@1".to_string()),
-                },
+                window: WindowId { niri_id: None },
             },
         );
 
@@ -669,10 +541,7 @@ mod tests {
                     state_updated: 9.0,
                     waiting_reason: None,
                     transcript_path: None,
-                    window: WindowId {
-                        niri_id: None,
-                        tmux_id: Some("@9".to_string()),
-                    },
+                    window: WindowId { niri_id: None },
                 },
             );
             Ok(())
@@ -691,7 +560,7 @@ mod tests {
             "cwd": "/tmp/project",
             "state": "responding",
             "state_updated": 1.0,
-            "window": { "tmux_id": "@1" }
+            "window": { "niri_id": "1" }
         }))
         .expect("legacy lowercase session state should deserialize");
 
@@ -706,7 +575,7 @@ mod tests {
             "cwd": "/tmp/project",
             "state": "mystery",
             "state_updated": 1.0,
-            "window": { "tmux_id": "@1" }
+            "window": { "niri_id": "1" }
         }))
         .expect("unknown session state should still deserialize");
 

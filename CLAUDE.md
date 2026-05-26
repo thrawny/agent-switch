@@ -1,11 +1,11 @@
 # agent-switch
 
-Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) across tmux and niri.
+Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) on niri.
 
 ## 1) How to execute tasks
 
 - Prefer `just` recipes over raw commands.
-- Primary dev loop: `just watch` (niri, default) or `just watch tmux` (runs in zmx).
+- Primary dev loop: `just watch` (runs niri daemon in zmx).
 
 ## 2) After code changes
 
@@ -15,7 +15,6 @@ Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) acro
   - `zmx list --short`
   - `zmx history agent-switch-build | tail -n 200` (build watcher)
   - `zmx history agent-switch-niri | tail -n 200` (niri daemon)
-  - `zmx history agent-switch-tmux | tail -n 200` (tmux daemon)
 
 ## Task Runner
 
@@ -27,7 +26,6 @@ just test         # Run tests
 just clippy       # Lint
 just fmt           # Format
 just watch        # Watch + run niri GTK daemon (zmx session)
-just watch tmux   # Watch + run tmux daemon (zmx session)
 ```
 
 ## Architecture
@@ -39,7 +37,6 @@ Single binary with subcommands:
 | `track <event>` | Called by agent hooks, updates session state via daemon socket |
 | `serve` | Run daemon (session cache + file watchers + Unix socket) |
 | `serve --niri` | Daemon with niri GTK overlay (requires `niri` feature) |
-| `tmux` | Daemonless tmux picker (fzf-based) |
 | `list` | Dump all sessions as JSON |
 | `focused` | Dump the focused niri window's session as JSON |
 | `cleanup` | Remove stale sessions |
@@ -52,7 +49,6 @@ src/
 ├── daemon.rs   # Daemon: socket server, file watchers, session cache, codex log parsing
 ├── state.rs    # Session store (load/save ~/.local/state/agent-switch/sessions.json)
 ├── track.rs    # Hook event handler (stdin JSON → daemon socket)
-├── tmux.rs     # Tmux picker UI (fzf)
 └── niri.rs     # GTK4 layer-shell overlay for niri (behind `niri` feature)
 ```
 
@@ -62,7 +58,7 @@ src/
 
 ## State
 
-Sessions stored in `~/.local/state/agent-switch/sessions.json`, keyed by window ID (tmux or niri). Daemon communicates via Unix socket at `$AGENT_SWITCH_SOCKET` if set, otherwise `$XDG_RUNTIME_DIR/agent-switch.sock` (or `/tmp/agent-switch.sock`).
+Sessions stored in `~/.local/state/agent-switch/sessions.json`, keyed by niri window ID. Daemon communicates via Unix socket at `$AGENT_SWITCH_SOCKET` if set, otherwise `$XDG_RUNTIME_DIR/agent-switch.sock` (or `/tmp/agent-switch.sock`).
 
 ## Hook Integration
 
@@ -83,7 +79,7 @@ The JSON payload should include `transcript_path` (the session file) so the daem
 }
 ```
 
-The `tmux_id` is auto-detected from `$TMUX_PANE` / `tmux display-message`. The `niri_id` is auto-detected via `niri msg -j windows` (focused window) unless overridden in the payload.
+The `niri_id` is auto-detected via `niri msg -j windows` (focused window) unless overridden in the payload.
 
 ### Claude Code Hooks
 
