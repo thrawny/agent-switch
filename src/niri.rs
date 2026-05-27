@@ -641,10 +641,18 @@ fn focus_window(id: u64) -> bool {
 const TERMINALS_PER_NEW_NIRI_SESSION: usize = 3;
 const TERMINAL_SPAWN_STAGGER_MS: u64 = 75;
 
+fn ghostty_new_window_command(dir: &str) -> Vec<String> {
+    vec![
+        "ghostty".to_string(),
+        "+new-window".to_string(),
+        format!("--working-directory={dir}"),
+    ]
+}
+
 fn spawn_terminal_via_niri(dir: &str) -> bool {
     matches!(
         niri_request(Request::Action(Action::Spawn {
-            command: vec!["ghostty".to_string(), format!("--working-directory={dir}")],
+            command: ghostty_new_window_command(dir),
         })),
         Some(Response::Handled)
     )
@@ -653,6 +661,7 @@ fn spawn_terminal_via_niri(dir: &str) -> bool {
 fn spawn_terminal_fallback(dir: &str) {
     let mut command = Command::new("ghostty");
     command
+        .arg("+new-window")
         .arg(format!("--working-directory={dir}"))
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
