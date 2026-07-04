@@ -298,16 +298,6 @@ fn title_duplicates_workspace(title: &str, workspace_name: &str) -> bool {
     title.trim().eq_ignore_ascii_case(workspace_name.trim())
 }
 
-fn named_title_for_agent(entry: &WorkspaceColumn, agent: &str) -> Option<String> {
-    let title = entry.window_title.as_deref()?;
-    let title = match agent {
-        "claude" => named_claude_title(title),
-        "pi" => named_pi_title(title),
-        _ => None,
-    }?;
-    (!title_duplicates_workspace(&title, &entry.workspace_name)).then_some(title)
-}
-
 fn tracked_session_title(entry: &WorkspaceColumn, session: &AgentSession) -> Option<String> {
     session
         .session_name
@@ -316,27 +306,24 @@ fn tracked_session_title(entry: &WorkspaceColumn, session: &AgentSession) -> Opt
         .filter(|title| !title.is_empty())
         .filter(|title| !title_duplicates_workspace(title, &entry.workspace_name))
         .map(str::to_string)
-        .or_else(|| named_title_for_agent(entry, &session.agent))
 }
 
 fn agent_fallback_from_window_title(entry: &WorkspaceColumn) -> Option<AgentInfo> {
     let title = entry.window_title.as_deref()?;
-    if let Some(title) = named_claude_title(title) {
-        let title = (!title_duplicates_workspace(&title, &entry.workspace_name)).then_some(title);
+    if named_claude_title(title).is_some() {
         return Some(AgentInfo {
             agent: "claude".to_string(),
             state: AgentState::Idle,
             state_updated: None,
-            title,
+            title: None,
         });
     }
-    if let Some(title) = named_pi_title(title) {
-        let title = (!title_duplicates_workspace(&title, &entry.workspace_name)).then_some(title);
+    if named_pi_title(title).is_some() {
         return Some(AgentInfo {
             agent: "pi".to_string(),
             state: AgentState::Idle,
             state_updated: None,
-            title,
+            title: None,
         });
     }
     None
@@ -925,10 +912,8 @@ fn start_focus_tracker(focused_window: Arc<Mutex<Option<u64>>>) {
                         let focused = windows.iter().find(|w| w.is_focused).map(|w| w.id);
                         *focused_window.lock().unwrap() = focused;
                     }
-                    Event::WindowOpenedOrChanged { window } => {
-                        if window.is_focused {
-                            *focused_window.lock().unwrap() = Some(window.id);
-                        }
+                    Event::WindowOpenedOrChanged { window } if window.is_focused => {
+                        *focused_window.lock().unwrap() = Some(window.id);
                     }
                     Event::WindowFocusChanged { id } => {
                         *focused_window.lock().unwrap() = id;
@@ -2616,7 +2601,7 @@ ignore = ["web"]
     }
 
     #[test]
-    fn agent_info_uses_named_window_title_for_tracked_session() {
+    fn agent_info_uses_session_name_for_tracked_session() {
         let entry = workspace_entry_with_window(
             "dotfiles",
             'a',
@@ -2629,6 +2614,7 @@ ignore = ["web"]
             292,
             AgentSession {
                 agent: "claude".to_string(),
+                session_name: Some("review-fixes".to_string()),
                 state: AgentState::Responding,
                 cwd: Some("/tmp/dotfiles".to_string()),
                 state_updated: 42.0,
@@ -2639,7 +2625,7 @@ ignore = ["web"]
             .expect("tracked claude session should be detected");
 
         assert_eq!(info.agent, "claude");
-        assert_eq!(info.title.as_deref(), Some("debug-helium-launch-issues"));
+        assert_eq!(info.title.as_deref(), Some("review-fixes"));
     }
 
     #[test]
@@ -2650,6 +2636,7 @@ ignore = ["web"]
             292,
             AgentSession {
                 agent: "claude".to_string(),
+                session_name: None,
                 state: AgentState::Responding,
                 cwd: Some("/tmp/dotfiles".to_string()),
                 state_updated: 42.0,
@@ -2668,7 +2655,7 @@ ignore = ["web"]
     }
 
     #[test]
-    fn sorted_agent_entries_include_named_pi_window_without_tracking() {
+    fn pi_window_title_fallback_does_not_show_title_without_tracking() {
         let entry = workspace_entry_with_window(
             "agent-switch",
             'a',
@@ -2677,15 +2664,11 @@ ignore = ["web"]
             "π - test-foo - agent-switch",
             "π - test-foo - agent-switch",
         );
-        let entries = [entry];
 
-        let sorted = sorted_agent_entries(&entries, &HashMap::new());
-
-        assert_eq!(sorted.len(), 1);
-        let info = agent_info_for_entry(sorted[0], &HashMap::new())
-            .expect("named pi title should be treated as an agent window");
+        let info = agent_info_for_entry(&entry, &HashMap::new())
+            .expect("pi title should be treated as an agent window");
         assert_eq!(info.agent, "pi");
-        assert_eq!(info.title.as_deref(), Some("test-foo"));
+        assert_eq!(info.title, None);
         assert_eq!(info.state, AgentState::Idle);
     }
 
@@ -2704,6 +2687,7 @@ ignore = ["web"]
             148,
             AgentSession {
                 agent: "claude".to_string(),
+                session_name: None,
                 state: AgentState::Idle,
                 cwd: Some("/tmp/kanel-backend".to_string()),
                 state_updated: 42.0,
@@ -2714,7 +2698,7 @@ ignore = ["web"]
             std::slice::from_ref(&untitled),
             &agent_sessions,
         ));
-        assert!(agents_view_has_titles(
+        assert!(!agents_view_has_titles(
             std::slice::from_ref(&titled),
             &HashMap::new(),
         ));
@@ -2794,6 +2778,7 @@ dir = "~/code/wayvoice"
                 1,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Waiting,
                     cwd: Some("/tmp/fresh".to_string()),
                     state_updated: now - 60.0,
@@ -2803,6 +2788,7 @@ dir = "~/code/wayvoice"
                 2,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Responding,
                     cwd: Some("/tmp/responding".to_string()),
                     state_updated: now - 120.0,
@@ -2812,6 +2798,7 @@ dir = "~/code/wayvoice"
                 3,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Waiting,
                     cwd: Some("/tmp/stale".to_string()),
                     state_updated: now - WAITING_PRIORITY_WINDOW_SECS - 1.0,
@@ -2842,6 +2829,7 @@ dir = "~/code/wayvoice"
                 1,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Responding,
                     cwd: Some("/tmp/current".to_string()),
                     state_updated: now - 30.0,
@@ -2851,6 +2839,7 @@ dir = "~/code/wayvoice"
                 2,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Responding,
                     cwd: Some("/tmp/space-target".to_string()),
                     state_updated: now - 60.0,
@@ -2860,6 +2849,7 @@ dir = "~/code/wayvoice"
                 3,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Responding,
                     cwd: Some("/tmp/first-direct".to_string()),
                     state_updated: now - 90.0,
@@ -2869,6 +2859,7 @@ dir = "~/code/wayvoice"
                 4,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Responding,
                     cwd: Some("/tmp/second-direct".to_string()),
                     state_updated: now - 120.0,
@@ -2920,6 +2911,7 @@ dir = "~/code/wayvoice"
                 1,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Responding,
                     cwd: Some("/tmp/agent-switch".to_string()),
                     state_updated: now - 30.0,
@@ -2929,6 +2921,7 @@ dir = "~/code/wayvoice"
                 2,
                 AgentSession {
                     agent: "claude".to_string(),
+                    session_name: None,
                     state: AgentState::Responding,
                     cwd: Some("/tmp/quotabar".to_string()),
                     state_updated: now - 60.0,
@@ -2953,6 +2946,7 @@ dir = "~/code/wayvoice"
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-42".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Idle,
                 state_updated: 42.0,
@@ -2983,6 +2977,7 @@ dir = "~/code/wayvoice"
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-122".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Responding,
                 state_updated: 42.0,
@@ -3041,6 +3036,7 @@ dir = "~/code/wayvoice"
             state::Session {
                 agent: "claude".to_string(),
                 session_id: "session-42".to_string(),
+                session_name: None,
                 cwd: Some("/tmp/project".to_string()),
                 state: state::SessionState::Responding,
                 state_updated: 42.0,
