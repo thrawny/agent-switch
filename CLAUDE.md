@@ -121,14 +121,15 @@ Pi uses a TypeScript extension (`agent-switch.ts`) rather than shell hooks. The 
 |---|---|
 | `session_start` | `session-start` |
 | `session_shutdown` | `session-end` |
-| `agent_start` | `prompt-submit` |
-| `agent_end` | `stop` |
+| `before_agent_start` | `prompt-submit` |
+| `agent_settled` | `stop` |
 | `session_switch` / `session_fork` | `session-end` (previous) + `session-start` (new) |
 
 **Key behaviors:**
 - Session ID derived from Pi's session file basename (falls back to `pi-ephemeral-<pid>-<timestamp>`)
 - Includes `transcript_path` from `ctx.sessionManager.getSessionFile()` for file watching
 - Auto-disables on first error with a one-time warning notification (no retries)
+- Uses prompt-level `before_agent_start` and fully settled `agent_settled` events so automatic retries and compaction do not reset the timer
 - 800ms timeout on `execFileSync` calls to avoid blocking the UI
 
 ## Dev Shell
