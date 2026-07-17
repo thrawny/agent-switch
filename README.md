@@ -170,6 +170,11 @@ Notes:
 
 ---
 
+## Design notes
+
+- [Background-task session state](docs/background-task-state.md) — deferred PID-tree approach
+  for distinguishing delegated work from true idle without transcript parsing
+
 ## Useful commands
 
 ```bash
