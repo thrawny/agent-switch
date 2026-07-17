@@ -1,6 +1,6 @@
 # agent-switch
 
-Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) on niri.
+Track and switch between AI coding agent sessions (Claude, Codex, Pi, OpenCode) on niri.
 
 ## 1) How to execute tasks
 
@@ -20,12 +20,13 @@ Track and switch between AI coding agent sessions (Claude, Codex, OpenCode) on n
 
 ```bash
 just              # List all recipes
-just build        # Build with release profile (includes niri on Linux)
+just build        # Build with release profile
 just install      # Install to ~/.cargo/bin
 just test         # Run tests
 just clippy       # Lint
 just fmt           # Format
 just watch        # Watch + run niri GTK daemon (zmx session)
+just demo         # Run overlay demo with mock data
 ```
 
 ## Architecture
@@ -35,26 +36,29 @@ Single binary with subcommands:
 | Command | Description |
 |---------|-------------|
 | `track <event>` | Called by agent hooks, updates session state via daemon socket |
-| `serve` | Run daemon (session cache + file watchers + Unix socket) |
-| `serve --niri` | Daemon with niri GTK overlay (requires `niri` feature) |
+| `serve` | Run headless daemon (session cache + file watchers + Unix socket) |
+| `serve --niri` | Daemon with the GTK agents overlay |
+| `niri --toggle-agents` | Toggle the agents overlay (sends to running daemon) |
 | `list` | Dump all sessions as JSON |
 | `focused` | Dump the focused niri window's session as JSON |
 | `cleanup` | Remove stale sessions |
+
+App/workspace switching is NOT part of this project (handled externally by
+nirius + xremap chords and niri-project-picker).
 
 ## Source Layout
 
 ```
 src/
-├── main.rs     # CLI (clap) dispatch
-├── daemon.rs   # Daemon: socket server, file watchers, session cache, codex log parsing
-├── state.rs    # Session store (load/save ~/.local/state/agent-switch/sessions.json)
-├── track.rs    # Hook event handler (stdin JSON → daemon socket)
-└── niri.rs     # GTK4 layer-shell overlay for niri (behind `niri` feature)
+├── main.rs        # CLI (clap) dispatch
+├── daemon.rs      # Daemon: socket server, file watchers, session cache, codex log parsing
+├── state.rs       # Session store (load/save ~/.local/state/agent-switch/sessions.json)
+├── track.rs       # Hook event handler (stdin JSON → daemon socket)
+├── niri.rs        # GTK4 layer-shell agents overlay
+├── projects.rs    # config.toml loading (workspace ignore rules, theme)
+├── app_labels.rs  # Window title/app-id → short label heuristics
+└── themes.rs      # Overlay color themes
 ```
-
-## Features
-
-- `niri` — GTK4 layer-shell overlay for the niri compositor. Linux only. Adds deps: gtk4, gtk4-layer-shell, niri-ipc, toml, shellexpand.
 
 ## State
 
@@ -134,4 +138,4 @@ Pi uses a TypeScript extension (`agent-switch.ts`) rather than shell hooks. The 
 
 ## Dev Shell
 
-`flake.nix` provides a dev shell with GTK4/layer-shell system dependencies needed for the `niri` feature. Activated automatically via `.envrc`.
+`flake.nix` provides a dev shell with the GTK4/layer-shell system dependencies. Activated automatically via `.envrc`.

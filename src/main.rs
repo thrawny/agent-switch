@@ -1,14 +1,10 @@
-#[cfg(feature = "niri")]
 mod app_labels;
 mod daemon;
+mod niri;
 mod projects;
 mod state;
-#[cfg(feature = "niri")]
 mod themes;
 mod track;
-
-#[cfg(feature = "niri")]
-mod niri;
 
 use clap::{Parser, Subcommand};
 
@@ -52,8 +48,6 @@ enum Command {
         /// Event type: session-start, session-end, prompt-submit, stop, notification
         event: String,
     },
-    /// Re-associate focused window with orphan session
-    Fix,
     /// List all sessions as JSON
     List,
     /// Print the session for the focused niri window as JSON
@@ -62,18 +56,13 @@ enum Command {
     Cleanup,
     /// Run the daemon (session cache + file watchers)
     Serve {
-        /// Enable niri GTK overlay (Linux only)
-        #[cfg(feature = "niri")]
+        /// Enable the GTK agents overlay
         #[arg(long)]
         niri: bool,
     },
     /// Niri GTK daemon (deprecated, use `serve --niri`)
-    #[cfg(feature = "niri")]
     Niri {
-        /// Toggle visibility (send to running daemon)
-        #[arg(long)]
-        toggle: bool,
-        /// Toggle agents-only view (send to running daemon)
+        /// Toggle the agents overlay (send to running daemon)
         #[arg(long)]
         toggle_agents: bool,
         /// Show demo overlay with mock data
@@ -99,7 +88,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Fix => todo!("fix command"),
         Command::List => {
             let store = match state::with_locked_store(|store| {
                 state::cleanup_stale(store);
@@ -153,7 +141,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        #[cfg(feature = "niri")]
         Command::Serve { niri } => {
             if niri {
                 let exit_code = niri::run_with_daemon();
@@ -162,13 +149,7 @@ fn main() {
                 daemon::run_headless();
             }
         }
-        #[cfg(not(feature = "niri"))]
-        Command::Serve {} => {
-            daemon::run_headless();
-        }
-        #[cfg(feature = "niri")]
         Command::Niri {
-            toggle,
             toggle_agents,
             demo,
             theme,
@@ -178,7 +159,7 @@ fn main() {
             } else if toggle_agents {
                 niri::run_toggle_agents()
             } else {
-                niri::run(toggle)
+                niri::run_with_daemon()
             };
             std::process::exit(exit_code.into());
         }

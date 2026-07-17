@@ -6,7 +6,7 @@ use crate::themes;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Grid, Label, Orientation, PolicyType,
-    ScrolledWindow, Separator, glib,
+    ScrolledWindow, glib,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use log::debug;
@@ -59,7 +59,6 @@ enum NiriMessage {
     ReloadConfig,
     WorkspaceColumns {
         entries: Vec<WorkspaceColumn>,
-        agents_only: bool,
         enqueued_at: Instant,
     },
 }
@@ -73,37 +72,13 @@ struct WorkspaceColumn {
     column_key: char,
     app_label: String,
     window_title: Option<String>,
-    dir: Option<String>,
-    static_workspace: bool,
     window_id: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct SwitchTarget {
-    key: char,
-    label: String,
-    kind: SwitchTargetKind,
-}
-
-#[derive(Debug, Clone)]
-enum SwitchTargetKind {
-    Workspace {
-        workspace_name: String,
-        workspace_ref: WorkspaceReferenceArg,
-        dir: Option<String>,
-        static_workspace: bool,
-        is_empty: bool,
-    },
-    Window(u64),
 }
 
 struct AppState {
     config: projects::Config,
     theme: &'static themes::Theme,
-    entries: Vec<WorkspaceColumn>,
     agent_entries: Vec<WorkspaceColumn>,
-    pending_key: Option<char>,
-    agents_view: bool,
     focused_at_open: Option<u64>,
     agent_sessions: HashMap<u64, AgentSession>,
     last_config_error: Option<String>,
@@ -112,7 +87,6 @@ struct AppState {
 #[derive(Clone, Copy)]
 struct PendingOverlayFrame {
     presented_at: Instant,
-    agents_only: bool,
 }
 
 #[derive(Default)]
@@ -207,7 +181,7 @@ fn process_daemon_message(
     focused_window: &Arc<Mutex<Option<u64>>>,
 ) -> Option<NiriMessage> {
     match msg {
-        DaemonMessage::Toggle | DaemonMessage::ToggleAgents => Some(NiriMessage::Daemon {
+        DaemonMessage::ToggleAgents => Some(NiriMessage::Daemon {
             msg,
             enqueued_at: Instant::now(),
         }),
@@ -242,28 +216,18 @@ fn process_daemon_message(
     }
 }
 
-fn request_workspace_refresh(
-    tx: mpsc::Sender<NiriMessage>,
-    config: projects::Config,
-    agents_only: bool,
-) {
+fn request_workspace_refresh(tx: mpsc::Sender<NiriMessage>, config: projects::Config) {
     thread::spawn(move || {
         let refresh_start = Instant::now();
-        let entries = if agents_only {
-            get_agent_workspace_columns(&config)
-        } else {
-            get_workspace_columns(&config)
-        };
+        let entries = get_agent_workspace_columns(&config);
         let elapsed = refresh_start.elapsed();
         log::debug!(
-            "workspace refresh: {}ms agents_only={} entries={}",
+            "workspace refresh: {}ms entries={}",
             elapsed.as_millis(),
-            agents_only,
             entries.len(),
         );
         let _ = tx.send(NiriMessage::WorkspaceColumns {
             entries,
-            agents_only,
             enqueued_at: Instant::now(),
         });
     });
@@ -366,8 +330,6 @@ fn niri_request_name(request: &Request) -> &'static str {
         Request::Action(Action::FocusWindow { .. }) => "action.focus-window",
         Request::Action(Action::FocusWorkspace { .. }) => "action.focus-workspace",
         Request::Action(Action::FocusColumn { .. }) => "action.focus-column",
-        Request::Action(Action::SetWorkspaceName { .. }) => "action.set-workspace-name",
-        Request::Action(Action::Spawn { .. }) => "action.spawn",
         Request::Action(_) => "action.other",
         _ => "other",
     }
@@ -391,12 +353,6 @@ fn niri_windows() -> Vec<Window> {
     }
 }
 
-fn get_workspace_by_name(name: &str) -> Option<Workspace> {
-    niri_workspaces()
-        .into_iter()
-        .find(|ws| ws.name.as_deref() == Some(name))
-}
-
 fn should_skip_discovered_workspace(
     name_opt: Option<&str>,
     display_name: &str,
@@ -413,11 +369,7 @@ fn workspace_key_for_index(index: usize) -> char {
     KEYS.get(index).copied().unwrap_or('\0')
 }
 
-fn get_workspace_columns_with_cap(
-    config: &projects::Config,
-    workspace_limit: Option<usize>,
-    allow_unkeyed_columns: bool,
-) -> Vec<WorkspaceColumn> {
+fn get_agent_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
     let workspaces = niri_workspaces();
@@ -432,11 +384,7 @@ fn get_workspace_columns_with_cap(
                                  ws_name: &str,
                                  workspace_ref: WorkspaceReferenceArg,
                                  workspace_key: char,
-                                 dir: Option<String>,
-                                 static_workspace: bool,
-                                 skip_first_column: bool,
                                  windows_arr: &[&Window]| {
-        let min_col: usize = if skip_first_column { 2 } else { 1 };
         let mut columns: BTreeMap<usize, Vec<&Window>> = BTreeMap::new();
 
         for window in windows_arr.iter() {
@@ -451,104 +399,34 @@ fn get_workspace_columns_with_cap(
             columns.entry(col_idx).or_default().push(*window);
         }
 
-        let has_columns = columns.keys().any(|&idx| idx >= min_col);
+        for (&col_idx, col_windows) in &columns {
+            let column_key = workspace_key_for_index(col_idx.saturating_sub(1));
 
-        if has_columns {
-            for (&col_idx, col_windows) in &columns {
-                if col_idx < min_col {
-                    continue;
-                }
-                let key_offset = col_idx - min_col;
-                if key_offset >= KEYS.len() && !allow_unkeyed_columns {
-                    continue;
-                }
-                let column_key = workspace_key_for_index(key_offset);
+            let first_window = col_windows.first();
+            let title = first_window.and_then(|w| w.title.as_deref()).unwrap_or("?");
+            let app_id = first_window
+                .and_then(|w| w.app_id.as_deref())
+                .unwrap_or("?");
+            let window_id = first_window.map(|w| w.id);
+            let window_title = first_window.and_then(|w| w.title.clone());
+            let app_label = app_labels::simplify_label(title, app_id);
 
-                let first_window = col_windows.first();
-                let title = first_window.and_then(|w| w.title.as_deref()).unwrap_or("?");
-                let app_id = first_window
-                    .and_then(|w| w.app_id.as_deref())
-                    .unwrap_or("?");
-                let window_id = first_window.map(|w| w.id);
-                let window_title = first_window.and_then(|w| w.title.clone());
-                let app_label = app_labels::simplify_label(title, app_id);
-
-                entries.push(WorkspaceColumn {
-                    workspace_name: ws_name.to_string(),
-                    workspace_ref: workspace_ref.clone(),
-                    workspace_key,
-                    column_index: col_idx as u32,
-                    column_key,
-                    app_label,
-                    window_title,
-                    dir: dir.clone(),
-                    static_workspace,
-                    window_id,
-                });
-            }
-        } else {
             entries.push(WorkspaceColumn {
                 workspace_name: ws_name.to_string(),
                 workspace_ref: workspace_ref.clone(),
                 workspace_key,
-                column_index: 2,
-                column_key: workspace_key_for_index(0),
-                app_label: "(empty)".to_string(),
-                window_title: None,
-                dir: dir.clone(),
-                static_workspace,
-                window_id: None,
+                column_index: col_idx as u32,
+                column_key,
+                app_label,
+                window_title,
+                window_id,
             });
         }
     };
 
     let windows_refs: Vec<&Window> = windows.iter().collect();
 
-    for project in projects::configured_projects(config) {
-        if workspace_limit.is_some_and(|limit| key_idx >= limit) {
-            break;
-        }
-
-        let project_name = projects::project_workspace_name(project);
-        seen_workspaces.insert(project_name.clone());
-        let workspace_key = workspace_key_for_index(key_idx);
-
-        let ws_id = workspaces
-            .iter()
-            .find(|ws| ws.name.as_deref() == Some(project_name.as_str()))
-            .map(|ws| ws.id);
-
-        if let Some(ws_id) = ws_id {
-            add_workspace_entries(
-                &mut entries,
-                ws_id,
-                &project_name,
-                WorkspaceReferenceArg::Name(project_name.clone()),
-                workspace_key,
-                Some(project.dir.clone()),
-                project.static_workspace,
-                project.skip_first_column,
-                &windows_refs,
-            );
-        } else {
-            entries.push(WorkspaceColumn {
-                workspace_name: project_name.clone(),
-                workspace_ref: WorkspaceReferenceArg::Name(project_name),
-                workspace_key,
-                column_index: 2,
-                column_key: workspace_key_for_index(0),
-                app_label: "(empty)".to_string(),
-                window_title: None,
-                dir: Some(project.dir.clone()),
-                static_workspace: project.static_workspace,
-                window_id: None,
-            });
-        }
-
-        key_idx += 1;
-    }
-
-    let mut remaining: Vec<_> = workspaces
+    let mut discovered: Vec<_> = workspaces
         .iter()
         .filter_map(|ws| {
             let ws_id = ws.id;
@@ -563,6 +441,7 @@ fn get_workspace_columns_with_cap(
             if should_skip_discovered_workspace(name_opt, &display_name, config, &seen_workspaces) {
                 return None;
             }
+            seen_workspaces.insert(display_name.clone());
 
             let workspace_ref = match name_opt {
                 Some(n) => WorkspaceReferenceArg::Name(n.to_string()),
@@ -573,13 +452,9 @@ fn get_workspace_columns_with_cap(
         })
         .collect();
 
-    remaining.sort_by_key(|(idx, _, _, _)| *idx);
+    discovered.sort_by_key(|(idx, _, _, _)| *idx);
 
-    for (_, ws_id, display_name, workspace_ref) in remaining {
-        if workspace_limit.is_some_and(|limit| key_idx >= limit) {
-            break;
-        }
-
+    for (_, ws_id, display_name, workspace_ref) in discovered {
         let workspace_key = workspace_key_for_index(key_idx);
 
         add_workspace_entries(
@@ -588,9 +463,6 @@ fn get_workspace_columns_with_cap(
             &display_name,
             workspace_ref,
             workspace_key,
-            None,
-            true,
-            true,
             &windows_refs,
         );
 
@@ -598,14 +470,6 @@ fn get_workspace_columns_with_cap(
     }
 
     entries
-}
-
-fn get_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
-    get_workspace_columns_with_cap(config, Some(KEYS.len()), false)
-}
-
-fn get_agent_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
-    get_workspace_columns_with_cap(config, None, true)
 }
 
 fn focus_workspace(reference: WorkspaceReferenceArg) {
@@ -625,131 +489,6 @@ fn focus_window(id: u64) -> bool {
     )
 }
 
-const TERMINALS_PER_NEW_NIRI_SESSION: usize = 3;
-const TERMINAL_SPAWN_STAGGER_MS: u64 = 75;
-
-fn ghostty_new_window_command(dir: &str) -> Vec<String> {
-    vec![
-        "ghostty".to_string(),
-        "+new-window".to_string(),
-        format!("--working-directory={dir}"),
-    ]
-}
-
-fn spawn_terminal_via_niri(dir: &str) -> bool {
-    matches!(
-        niri_request(Request::Action(Action::Spawn {
-            command: ghostty_new_window_command(dir),
-        })),
-        Some(Response::Handled)
-    )
-}
-
-fn spawn_terminal_fallback(dir: &str) {
-    let mut command = Command::new("ghostty");
-    command
-        .arg("+new-window")
-        .arg(format!("--working-directory={dir}"))
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .env_remove("TMUX_TMPDIR");
-    for (key, _) in std::env::vars() {
-        if key.starts_with("ZMX_") {
-            command.env_remove(key);
-        }
-    }
-    let _ = command.spawn();
-}
-
-fn spawn_terminals(dir: &str) {
-    let dir = shellexpand::tilde(dir).to_string();
-
-    for idx in 0..TERMINALS_PER_NEW_NIRI_SESSION {
-        if idx > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(TERMINAL_SPAWN_STAGGER_MS));
-        }
-
-        // Prefer compositor-side spawn to avoid inheriting daemon/zmx env vars.
-        if !spawn_terminal_via_niri(&dir) {
-            // Fallback path for environments where niri IPC spawn is unavailable.
-            spawn_terminal_fallback(&dir);
-        }
-    }
-}
-
-fn focused_workspace_output(workspaces: &[Workspace]) -> Option<String> {
-    workspaces
-        .iter()
-        .find(|ws| ws.is_focused)
-        .and_then(|ws| ws.output.clone())
-}
-
-fn first_unnamed_workspace_idx(workspaces: &[Workspace], output: Option<&str>) -> Option<u8> {
-    workspaces
-        .iter()
-        .filter(|ws| ws.output.as_deref() == output)
-        .filter(|ws| ws.name.is_none() && ws.active_window_id.is_some())
-        .map(|ws| ws.idx)
-        .min()
-}
-
-fn reusable_empty_workspace_idx(
-    workspaces: &[Workspace],
-    output: Option<&str>,
-    before_idx: Option<u8>,
-) -> Option<u8> {
-    workspaces
-        .iter()
-        .filter(|ws| ws.output.as_deref() == output)
-        .filter(|ws| ws.name.is_none() && ws.active_window_id.is_none())
-        .filter(|ws| before_idx.is_none_or(|before_idx| ws.idx < before_idx))
-        .map(|ws| ws.idx)
-        .max()
-}
-
-fn create_workspace(name: &str, dir: Option<&str>) {
-    if get_workspace_by_name(name).is_some() {
-        focus_workspace(WorkspaceReferenceArg::Name(name.to_string()));
-    } else {
-        let workspaces = niri_workspaces();
-        let focused_output = focused_workspace_output(&workspaces);
-        let output = focused_output.as_deref();
-        let first_unnamed_idx = first_unnamed_workspace_idx(&workspaces, output);
-
-        if let Some(target_idx) =
-            reusable_empty_workspace_idx(&workspaces, output, first_unnamed_idx)
-        {
-            focus_workspace(WorkspaceReferenceArg::Index(target_idx));
-        } else {
-            let max_idx = workspaces
-                .iter()
-                .filter(|ws| ws.output.as_deref() == output)
-                .map(|ws| ws.idx)
-                .max()
-                .unwrap_or(0);
-            let new_idx = max_idx.saturating_add(1);
-            focus_workspace(WorkspaceReferenceArg::Index(new_idx));
-
-            if let Some(first_unnamed_idx) = first_unnamed_idx {
-                niri_action(Action::MoveWorkspaceToIndex {
-                    index: first_unnamed_idx as usize,
-                    reference: None,
-                });
-            }
-        }
-
-        niri_action(Action::SetWorkspaceName {
-            name: name.to_string(),
-            workspace: None,
-        });
-    }
-
-    if let Some(d) = dir {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        spawn_terminals(d);
-    }
-}
-
 fn switch_to_entry(entry: &WorkspaceColumn) {
     let switch_start = Instant::now();
     if let Some(window_id) = entry.window_id {
@@ -766,65 +505,16 @@ fn switch_to_entry(entry: &WorkspaceColumn) {
         }
     }
 
-    let mut path = "workspace";
-    let mut spawn_elapsed_ms = None;
-    if entry.static_workspace {
-        let focus_workspace_start = Instant::now();
-        focus_workspace(entry.workspace_ref.clone());
-        let focus_workspace_elapsed = focus_workspace_start.elapsed().as_millis();
-        if entry.app_label == "(empty)"
-            && let Some(ref dir) = entry.dir
-        {
-            let spawn_start = Instant::now();
-            spawn_terminals(dir);
-            spawn_elapsed_ms = Some(spawn_start.elapsed().as_millis());
-            path = "static-empty";
-        }
-        log::debug!(
-            "switch_to_entry workspace phase: workspace={} static=true focus_workspace={}ms spawn={}ms",
-            entry.workspace_name,
-            focus_workspace_elapsed,
-            spawn_elapsed_ms.unwrap_or(0),
-        );
-    } else {
-        if entry.app_label == "(empty)" {
-            let create_workspace_start = Instant::now();
-            create_workspace(&entry.workspace_name, entry.dir.as_deref());
-            spawn_elapsed_ms = Some(create_workspace_start.elapsed().as_millis());
-            path = "create-workspace";
-        } else {
-            path = "focus-workspace";
-        }
-        let focus_workspace_start = Instant::now();
-        focus_workspace(entry.workspace_ref.clone());
-        log::debug!(
-            "switch_to_entry workspace phase: workspace={} static=false focus_workspace={}ms create_workspace={}ms",
-            entry.workspace_name,
-            focus_workspace_start.elapsed().as_millis(),
-            spawn_elapsed_ms.unwrap_or(0),
-        );
-    }
-    let sleep_start = Instant::now();
+    // Fallback when the window is gone: focus the workspace and column instead.
+    focus_workspace(entry.workspace_ref.clone());
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let sleep_elapsed = sleep_start.elapsed().as_millis();
-    let focus_column_start = Instant::now();
     focus_column(entry.column_index);
-    let focus_column_elapsed = focus_column_start.elapsed().as_millis();
     log::info!(
-        "switch_to_entry: {}ms path={} workspace={} column={} sleep={}ms focus_column={}ms workspace_phase={}ms",
+        "switch_to_entry: {}ms path=focus-workspace workspace={} column={}",
         switch_start.elapsed().as_millis(),
-        path,
         entry.workspace_name,
         entry.column_index,
-        sleep_elapsed,
-        focus_column_elapsed,
-        spawn_elapsed_ms.unwrap_or(0),
     );
-}
-
-fn send_toggle_request(agents_only: bool) -> Result<(), Box<dyn std::error::Error>> {
-    daemon::send_toggle_request(agents_only)?;
-    Ok(())
 }
 
 fn start_config_watcher(tx: mpsc::Sender<NiriMessage>) {
@@ -1012,8 +702,6 @@ fn same_workspace_entry(a: &WorkspaceColumn, b: &WorkspaceColumn) -> bool {
     a.workspace_name == b.workspace_name
         && a.column_index == b.column_index
         && a.window_id == b.window_id
-        && a.static_workspace == b.static_workspace
-        && a.dir == b.dir
 }
 
 fn workspace_entries_changed(current: &[WorkspaceColumn], updated: &[WorkspaceColumn]) -> bool {
@@ -1167,17 +855,13 @@ fn build_ui(
         }
     };
     let theme = themes::get(&config.theme);
-    let entries = get_workspace_columns(&config);
     let agent_entries = get_agent_workspace_columns(&config);
     let agent_sessions = overlay_snapshot_from_cache(&cache);
 
     let state = Rc::new(RefCell::new(AppState {
         config,
         theme,
-        entries,
         agent_entries,
-        pending_key: None,
-        agents_view: false,
         focused_at_open: None,
         agent_sessions,
         last_config_error,
@@ -1205,7 +889,13 @@ fn build_ui(
 
     {
         let state_ref = state.borrow();
-        build_switch_target_list(&main_box, &state_ref.entries, &state_ref.config);
+        build_agents_list(
+            &main_box,
+            &state_ref.agent_entries,
+            &state_ref.agent_sessions,
+            state_ref.focused_at_open,
+            state_ref.theme,
+        );
     }
     outer_box.append(&scroller);
 
@@ -1216,28 +906,22 @@ fn build_ui(
     window.add_tick_callback(move |_, _| {
         if let Some(pending) = pending_overlay_frame_for_tick.borrow_mut().take() {
             log::info!(
-                "overlay first frame: {}ms agents_only={}",
+                "overlay first frame: {}ms",
                 pending.presented_at.elapsed().as_millis(),
-                pending.agents_only,
             );
         }
         glib::ControlFlow::Continue
     });
 
-    // Helper: rebuild the current view (normal or agents)
-    let rebuild_current_view = |main_box: &GtkBox, state: &AppState, lock_label_widths: bool| {
-        if state.agents_view {
-            build_agents_list(
-                main_box,
-                &state.agent_entries,
-                &state.agent_sessions,
-                state.focused_at_open,
-                state.theme,
-            );
-        } else {
-            let _ = lock_label_widths;
-            build_switch_target_list(main_box, &state.entries, &state.config);
-        }
+    // Helper: rebuild the agents view
+    let rebuild_current_view = |main_box: &GtkBox, state: &AppState, _lock_label_widths: bool| {
+        build_agents_list(
+            main_box,
+            &state.agent_entries,
+            &state.agent_sessions,
+            state.focused_at_open,
+            state.theme,
+        );
     };
 
     let rebuild_for_poll = rebuild_current_view;
@@ -1245,7 +929,6 @@ fn build_ui(
     let key_controller = gtk4::EventControllerKey::new();
     let state_clone = state.clone();
     let window_clone = window.clone();
-    let main_box_clone = main_box.clone();
     let scroller_clone = scroller.clone();
 
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
@@ -1287,21 +970,11 @@ fn build_ui(
         }
 
         if input_char == Some('q') || key == "escape" {
-            let mut state = state_clone.borrow_mut();
-            if state.pending_key.is_some() {
-                state.pending_key = None;
-                rebuild_current_view(&main_box_clone, &state, true);
-                drop(state);
-                reset_overlay_scroll(&scroller_clone);
-            } else {
-                state.agents_view = false;
-                drop(state);
-                window_clone.set_visible(false);
-            }
+            window_clone.set_visible(false);
             return glib::Propagation::Stop;
         }
 
-        if key == "space" && state_clone.borrow().agents_view {
+        if key == "space" {
             let state = state_clone.borrow();
             if let Some(target) = find_smart_jump_target(
                 &state.agent_entries,
@@ -1311,41 +984,23 @@ fn build_ui(
                 let target = target.clone();
                 drop(state);
                 window_clone.set_visible(false);
-                let mut state = state_clone.borrow_mut();
-                state.agents_view = false;
-                drop(state);
                 switch_to_entry(&target);
             }
             return glib::Propagation::Stop;
         }
 
-        if state_clone.borrow().agents_view {
-            if let Some(key_char) = selection_key {
-                let state = state_clone.borrow();
-                if let Some(target) = find_agent_entry_for_selection_key(
-                    &state.agent_entries,
-                    &state.agent_sessions,
-                    state.focused_at_open,
-                    key_char,
-                ) {
-                    let target = target.clone();
-                    drop(state);
-                    window_clone.set_visible(false);
-                    let mut state = state_clone.borrow_mut();
-                    state.agents_view = false;
-                    drop(state);
-                    switch_to_entry(&target);
-                }
-            }
-            return glib::Propagation::Stop;
-        }
-
-        if let Some(key_char) = input_char {
+        if let Some(key_char) = selection_key {
             let state = state_clone.borrow();
-            if let Some(target) = find_switch_target(&state.entries, &state.config, key_char) {
+            if let Some(target) = find_agent_entry_for_selection_key(
+                &state.agent_entries,
+                &state.agent_sessions,
+                state.focused_at_open,
+                key_char,
+            ) {
+                let target = target.clone();
                 drop(state);
                 window_clone.set_visible(false);
-                switch_to_target(&target);
+                switch_to_entry(&target);
             }
         }
 
@@ -1399,22 +1054,17 @@ fn build_ui(
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     NiriMessage::Daemon {
-                        msg: inner @ (DaemonMessage::Toggle | DaemonMessage::ToggleAgents),
+                        msg: DaemonMessage::ToggleAgents,
                         enqueued_at,
                     } => {
-                        let is_agents = matches!(inner, DaemonMessage::ToggleAgents);
                         log::info!(
-                            "toggle queue delay: {}ms agents_only={}",
+                            "toggle queue delay: {}ms",
                             enqueued_at.elapsed().as_millis(),
-                            is_agents,
                         );
                         let is_visible = window_for_poll.is_visible();
                         if is_visible {
                             window_for_poll.set_visible(false);
                             pending_overlay_frame_for_poll.borrow_mut().take();
-                            let mut state = state_for_poll.borrow_mut();
-                            state.pending_key = None;
-                            state.agents_view = false;
                         } else {
                             let open_start = Instant::now();
                             let snapshot_start = Instant::now();
@@ -1424,8 +1074,6 @@ fn build_ui(
 
                             let mut state = state_for_poll.borrow_mut();
                             state.agent_sessions = agent_sessions;
-                            state.pending_key = None;
-                            state.agents_view = is_agents;
                             state.focused_at_open = *focused_window_for_poll.lock().unwrap();
                             // First pass: natural label widths for size computation
                             let first_rebuild_start = Instant::now();
@@ -1451,22 +1099,20 @@ fn build_ui(
                             *pending_overlay_frame_for_poll.borrow_mut() =
                                 Some(PendingOverlayFrame {
                                     presented_at: Instant::now(),
-                                    agents_only: is_agents,
                                 });
                             window_for_poll.set_visible(true);
                             window_for_poll.present();
                             let total_elapsed = open_start.elapsed();
                             log::info!(
-                                "overlay open: {}ms agents_only={} snapshot={}ms rebuild1={}ms resize={}ms rebuild2={}ms",
+                                "overlay open: {}ms snapshot={}ms rebuild1={}ms resize={}ms rebuild2={}ms",
                                 total_elapsed.as_millis(),
-                                is_agents,
                                 snapshot_elapsed.as_millis(),
                                 first_rebuild_elapsed.as_millis(),
                                 resize_elapsed.as_millis(),
                                 second_rebuild_elapsed.as_millis(),
                             );
                             let config = state_for_poll.borrow().config.clone();
-                            request_workspace_refresh(tx_for_poll.clone(), config, is_agents);
+                            request_workspace_refresh(tx_for_poll.clone(), config);
                         }
                     }
                     NiriMessage::ReloadConfig => {
@@ -1506,38 +1152,22 @@ fn build_ui(
                             rebuild_for_poll(&main_box_for_poll, &state, true);
                             reset_overlay_scroll(&scroller_for_poll);
                             drop(state);
-                            request_workspace_refresh(
-                                tx_for_poll.clone(),
-                                config,
-                                state_for_poll.borrow().agents_view,
-                            );
+                            request_workspace_refresh(tx_for_poll.clone(), config);
                         }
                     }
                     NiriMessage::WorkspaceColumns {
                         entries,
-                        agents_only,
                         enqueued_at,
                     } => {
                         log::debug!(
-                            "workspace refresh queue delay: {}ms agents_only={} entries={}",
+                            "workspace refresh queue delay: {}ms entries={}",
                             enqueued_at.elapsed().as_millis(),
-                            agents_only,
                             entries.len(),
                         );
                         let mut state = state_for_poll.borrow_mut();
-                        let current_entries = if agents_only {
-                            &state.agent_entries
-                        } else {
-                            &state.entries
-                        };
                         let needs_rebuild = window_for_poll.is_visible()
-                            && state.agents_view == agents_only
-                            && workspace_entries_changed(current_entries, &entries);
-                        if agents_only {
-                            state.agent_entries = entries;
-                        } else {
-                            state.entries = entries;
-                        }
+                            && workspace_entries_changed(&state.agent_entries, &entries);
+                        state.agent_entries = entries;
                         if needs_rebuild {
                             let apply_start = Instant::now();
                             rebuild_for_poll(&main_box_for_poll, &state, false);
@@ -1553,14 +1183,9 @@ fn build_ui(
                             rebuild_for_poll(&main_box_for_poll, &state, true);
                             let elapsed = apply_start.elapsed();
                             log::debug!(
-                                "workspace refresh apply: {}ms agents_only={} entries={}",
+                                "workspace refresh apply: {}ms entries={}",
                                 elapsed.as_millis(),
-                                agents_only,
-                                if agents_only {
-                                    state.agent_entries.len()
-                                } else {
-                                    state.entries.len()
-                                },
+                                state.agent_entries.len(),
                             );
                         }
                     }
@@ -1699,208 +1324,6 @@ fn agent_info_for_entry(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
-fn binding_key(value: &str) -> Option<char> {
-    value.chars().next().filter(|_| value.chars().count() == 1)
-}
-
-fn explicit_workspace_key(config: &projects::Config, workspace_name: &str) -> Option<char> {
-    config
-        .bindings
-        .workspaces
-        .iter()
-        .find_map(|(key, name)| (name == workspace_name).then(|| binding_key(key)).flatten())
-}
-
-fn app_binding_matches(binding: &projects::AppBinding, window: &Window) -> bool {
-    let app_id = window.app_id.as_deref().unwrap_or("").to_ascii_lowercase();
-    let title = window.title.as_deref().unwrap_or("").to_ascii_lowercase();
-
-    binding
-        .app_id
-        .as_deref()
-        .is_some_and(|expected| app_id == expected.to_ascii_lowercase())
-        || binding
-            .app_id_contains
-            .as_deref()
-            .is_some_and(|needle| app_id.contains(&needle.to_ascii_lowercase()))
-        || binding
-            .title_contains
-            .as_deref()
-            .is_some_and(|needle| title.contains(&needle.to_ascii_lowercase()))
-}
-
-fn build_switch_targets(
-    entries: &[WorkspaceColumn],
-    config: &projects::Config,
-) -> Vec<SwitchTarget> {
-    let mut targets = Vec::new();
-    let mut seen_workspaces = std::collections::HashSet::new();
-    let mut used_keys: std::collections::HashSet<char> = config
-        .bindings
-        .apps
-        .iter()
-        .filter_map(|binding| binding_key(&binding.key))
-        .collect();
-
-    for entry in entries {
-        if !seen_workspaces.insert(entry.workspace_name.clone()) {
-            continue;
-        }
-        let key =
-            explicit_workspace_key(config, &entry.workspace_name).unwrap_or(entry.workspace_key);
-        if used_keys.contains(&key) {
-            continue;
-        }
-        used_keys.insert(key);
-        targets.push(SwitchTarget {
-            key,
-            label: entry.workspace_name.clone(),
-            kind: SwitchTargetKind::Workspace {
-                workspace_name: entry.workspace_name.clone(),
-                workspace_ref: entry.workspace_ref.clone(),
-                dir: entry.dir.clone(),
-                static_workspace: entry.static_workspace,
-                is_empty: entry.app_label == "(empty)",
-            },
-        });
-    }
-
-    let windows = niri_windows();
-    for binding in &config.bindings.apps {
-        let Some(key) = binding_key(&binding.key) else {
-            continue;
-        };
-        let Some(window) = windows
-            .iter()
-            .find(|window| app_binding_matches(binding, window))
-        else {
-            continue;
-        };
-        targets.push(SwitchTarget {
-            key,
-            label: binding.label.clone(),
-            kind: SwitchTargetKind::Window(window.id),
-        });
-    }
-
-    targets
-}
-
-fn build_switch_target_list(
-    container: &GtkBox,
-    entries: &[WorkspaceColumn],
-    config: &projects::Config,
-) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-
-    let targets = build_switch_targets(entries, config);
-    let grid = Grid::new();
-    grid.add_css_class("workspace-columns");
-    grid.set_column_spacing(48);
-    grid.set_row_spacing(6);
-    grid.set_halign(gtk4::Align::Start);
-
-    let workspace_targets: Vec<_> = targets
-        .iter()
-        .filter(|target| matches!(target.kind, SwitchTargetKind::Workspace { .. }))
-        .collect();
-    let app_targets: Vec<_> = targets
-        .iter()
-        .filter(|target| matches!(target.kind, SwitchTargetKind::Window(_)))
-        .collect();
-
-    let mut next_row = attach_switch_target_section(&grid, "workspaces", &workspace_targets, 0);
-    if !workspace_targets.is_empty() && !app_targets.is_empty() {
-        let separator = Separator::new(Orientation::Horizontal);
-        separator.add_css_class("workspace-separator");
-        grid.attach(&separator, 0, next_row, 2, 1);
-        next_row += 1;
-    }
-    attach_switch_target_section(&grid, "apps", &app_targets, next_row);
-
-    container.append(&grid);
-}
-
-fn attach_switch_target_section(
-    grid: &Grid,
-    title: &str,
-    targets: &[&SwitchTarget],
-    start_row: i32,
-) -> i32 {
-    if targets.is_empty() {
-        return start_row;
-    }
-
-    let title_label = Label::new(Some(title));
-    title_label.add_css_class("workspace-title");
-    title_label.set_xalign(0.0);
-    grid.attach(&title_label, 0, start_row, 2, 1);
-
-    let rows_per_column = targets.len().div_ceil(2).max(1);
-    for (index, target) in targets.iter().enumerate() {
-        let visual_column = (index / rows_per_column) as i32;
-        let row = start_row + 1 + (index % rows_per_column) as i32;
-
-        let target_row = GtkBox::new(Orientation::Horizontal, 10);
-        target_row.add_css_class("entry-row");
-
-        let key_label = Label::new(Some(&format!("[{}]", target.key)));
-        key_label.add_css_class("key");
-        target_row.append(&key_label);
-
-        let label = Label::new(Some(&target.label));
-        label.add_css_class("project");
-        label.set_xalign(0.0);
-        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        label.set_max_width_chars(28);
-        target_row.append(&label);
-
-        grid.attach(&target_row, visual_column, row, 1, 1);
-    }
-
-    start_row + 1 + rows_per_column as i32
-}
-
-fn find_switch_target(
-    entries: &[WorkspaceColumn],
-    config: &projects::Config,
-    key: char,
-) -> Option<SwitchTarget> {
-    build_switch_targets(entries, config)
-        .into_iter()
-        .find(|target| target.key == key)
-}
-
-fn switch_to_target(target: &SwitchTarget) {
-    match &target.kind {
-        SwitchTargetKind::Window(window_id) => {
-            focus_window(*window_id);
-        }
-        SwitchTargetKind::Workspace {
-            workspace_name,
-            workspace_ref,
-            dir,
-            static_workspace,
-            is_empty,
-        } => {
-            if *is_empty && !*static_workspace {
-                create_workspace(workspace_name, dir.as_deref());
-            } else {
-                focus_workspace(workspace_ref.clone());
-                if *is_empty
-                    && *static_workspace
-                    && let Some(dir) = dir
-                {
-                    spawn_terminals(dir);
-                }
-            }
-        }
-    }
-}
-
 fn agents_view_has_titles(
     entries: &[WorkspaceColumn],
     agent_sessions: &HashMap<u64, AgentSession>,
@@ -1913,7 +1336,7 @@ fn agents_view_has_titles(
 }
 
 fn uses_wide_agents_layout(state: &AppState) -> bool {
-    state.agents_view && agents_view_has_titles(&state.entries, &state.agent_sessions)
+    agents_view_has_titles(&state.agent_entries, &state.agent_sessions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2158,7 +1581,7 @@ pub fn run_with_daemon() -> glib::ExitCode {
                 Ok(msg) => msg,
                 Err(_) => break,
             };
-            let is_toggle = matches!(msg, DaemonMessage::Toggle | DaemonMessage::ToggleAgents);
+            let is_toggle = matches!(msg, DaemonMessage::ToggleAgents);
 
             let forwarded = match msg {
                 DaemonMessage::Track(_) | DaemonMessage::SessionsChanged => {
@@ -2250,8 +1673,6 @@ fn mock_workspace_columns() -> Vec<WorkspaceColumn> {
                 column_key,
                 app_label: app_labels[label_idx].to_string(),
                 window_title: Some(app_labels[label_idx].to_string()),
-                dir: Some(format!("~/code/{name}")),
-                static_workspace: false,
                 window_id: Some(window_id),
             });
             window_id += 1;
@@ -2287,7 +1708,7 @@ fn mock_agent_sessions(entries: &[WorkspaceColumn], cycle: usize) -> HashMap<u64
                 agent: agents[agent_idx].to_string(),
                 session_name: None,
                 state: states[state_idx],
-                cwd: entry.dir.clone(),
+                cwd: Some(format!("~/code/{}", entry.workspace_name)),
                 state_updated: state::now() - [30.0, 125.0, 3600.0, 45.0, 900.0][i % 5],
             },
         );
@@ -2316,17 +1737,13 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         config.theme = t;
     }
     let theme = themes::get(&config.theme);
-    let entries = mock_workspace_columns();
-    let agent_entries = entries.clone();
-    let agent_sessions = mock_agent_sessions(&entries, 0);
+    let agent_entries = mock_workspace_columns();
+    let agent_sessions = mock_agent_sessions(&agent_entries, 0);
 
     let state = Rc::new(RefCell::new(AppState {
         config,
         theme,
-        entries,
         agent_entries,
-        pending_key: None,
-        agents_view: false,
         focused_at_open: None,
         agent_sessions,
         last_config_error: None,
@@ -2351,9 +1768,19 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     main_box.set_hexpand(true);
     scroller.set_child(Some(&main_box));
 
+    let rebuild = |main_box: &GtkBox, state: &AppState| {
+        build_agents_list(
+            main_box,
+            &state.agent_entries,
+            &state.agent_sessions,
+            state.focused_at_open,
+            state.theme,
+        );
+    };
+
     {
         let s = state.borrow();
-        build_switch_target_list(&main_box, &s.entries, &s.config);
+        rebuild(&main_box, &s);
     }
     outer_box.append(&scroller);
 
@@ -2361,34 +1788,16 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
 
     window.set_child(Some(&outer_box));
 
-    // Key handler: q/Escape to quit, same target selection logic as real UI
-    let key_controller = gtk4::EventControllerKey::new();
-    let state_clone = state.clone();
+    // Key handler: q/Escape to quit
     let window_clone = window.clone();
-    let _main_box_clone = main_box.clone();
-    let _scroller_clone = scroller.clone();
 
+    let key_controller = gtk4::EventControllerKey::new();
     key_controller.connect_key_pressed(move |_, keyval, _, _| {
         let input_char = input_char_for_key(keyval);
-        let selection_key = selection_key_for_input(keyval);
         let key_name = keyval.name().map(|s| s.to_lowercase());
-        let key = match key_name.as_deref() {
-            Some(key) => key,
-            None if selection_key.is_some() => "",
-            None => return glib::Propagation::Proceed,
-        };
 
-        if input_char == Some('q') || key == "escape" {
+        if input_char == Some('q') || key_name.as_deref() == Some("escape") {
             window_clone.close();
-            return glib::Propagation::Stop;
-        }
-
-        if let Some(key_char) = input_char {
-            let s = state_clone.borrow();
-            if let Some(target) = find_switch_target(&s.entries, &s.config, key_char) {
-                log::info!("demo selected target: {}", target.label);
-                window_clone.close();
-            }
         }
 
         glib::Propagation::Stop
@@ -2404,21 +1813,21 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
         let mut c = cycle.borrow_mut();
         *c += 1;
         let mut s = state_for_timer.borrow_mut();
-        s.agent_sessions = mock_agent_sessions(&s.entries, *c);
-        let entries = s.entries.clone();
-        let config = s.config.clone();
+        s.agent_sessions = mock_agent_sessions(&s.agent_entries, *c);
         drop(s);
-        build_switch_target_list(&main_box_for_timer, &entries, &config);
+        let s = state_for_timer.borrow();
+        rebuild(&main_box_for_timer, &s);
         glib::ControlFlow::Continue
     });
 
     // First pass used natural widths for sizing; now compute overlay size
-    update_overlay_size(&window, &scroller, &outer_box, false);
+    let wide = uses_wide_agents_layout(&state.borrow());
+    update_overlay_size(&window, &scroller, &outer_box, wide);
 
     // Second pass: lock label widths so content changes don't shift layout
     {
         let s = state.borrow();
-        build_switch_target_list(&main_box, &s.entries, &s.config);
+        rebuild(&main_box, &s);
     }
 
     window.present();
@@ -2435,22 +1844,8 @@ pub fn run_demo(theme_override: Option<&str>) -> glib::ExitCode {
     app.run_with_args::<&str>(&[])
 }
 
-/// Legacy run function for backward compatibility (`niri --toggle` and standalone daemon)
-pub fn run(toggle: bool) -> glib::ExitCode {
-    if toggle {
-        if let Err(e) = send_toggle_request(false) {
-            log::error!("Failed to toggle: {} (is daemon running?)", e);
-            std::process::exit(1);
-        }
-        std::process::exit(0);
-    }
-
-    // Legacy mode: run standalone with its own socket listener
-    run_with_daemon()
-}
-
 pub fn run_toggle_agents() -> glib::ExitCode {
-    if let Err(e) = send_toggle_request(true) {
+    if let Err(e) = daemon::send_toggle_agents_request() {
         log::error!("Failed to toggle agents: {} (is daemon running?)", e);
         std::process::exit(1);
     }
@@ -2476,8 +1871,6 @@ mod tests {
             column_key,
             app_label: "Claude Code".to_string(),
             window_title: Some("Claude Code".to_string()),
-            dir: Some(format!("~/code/{name}")),
-            static_workspace: false,
             window_id: Some(window_id),
         }
     }
@@ -2498,23 +1891,8 @@ mod tests {
             column_key,
             app_label: app_label.to_string(),
             window_title: Some(window_title.to_string()),
-            dir: Some(format!("~/code/{name}")),
-            static_workspace: false,
             window_id: Some(window_id),
         }
-    }
-
-    #[test]
-    fn project_name_is_inferred_from_dir_when_missing() {
-        let project = projects::Project {
-            key: None,
-            name: None,
-            dir: "~/code/agent-switch".to_string(),
-            static_workspace: false,
-            skip_first_column: true,
-        };
-
-        assert_eq!(projects::project_workspace_name(&project), "agent-switch");
     }
 
     #[test]
@@ -2733,36 +2111,6 @@ ignore = ["web"]
 
         assert!(agents.0 > regular.0);
         assert!(agents.1 > regular.1);
-    }
-
-    #[test]
-    fn configured_projects_are_deduplicated_in_order() {
-        let config: projects::Config = toml::from_str(
-            r#"
-[[project]]
-dir = "~/code/agent-switch"
-
-[[project]]
-name = "main"
-
-[[project]]
-dir = "~/code/agent-switch"
-
-[[project]]
-name = "main"
-
-[[project]]
-dir = "~/code/wayvoice"
-"#,
-        )
-        .expect("config should parse");
-
-        let names: Vec<_> = projects::configured_projects(&config)
-            .into_iter()
-            .map(projects::project_workspace_name)
-            .collect();
-
-        assert_eq!(names, vec!["agent-switch", "main", "wayvoice"]);
     }
 
     #[test]
@@ -3000,12 +2348,13 @@ dir = "~/code/wayvoice"
         let cache = Arc::new(Mutex::new(SessionCache::new()));
         let focused_window = Arc::new(Mutex::new(None));
 
-        let forwarded = process_daemon_message(DaemonMessage::Toggle, &cache, &focused_window);
+        let forwarded =
+            process_daemon_message(DaemonMessage::ToggleAgents, &cache, &focused_window);
 
         assert!(matches!(
             forwarded,
             Some(NiriMessage::Daemon {
-                msg: DaemonMessage::Toggle,
+                msg: DaemonMessage::ToggleAgents,
                 ..
             })
         ));

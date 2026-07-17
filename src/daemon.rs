@@ -28,7 +28,6 @@ pub enum AgentState {
 
 impl AgentState {
     /// Get display label for the state (used by niri GTK overlay)
-    #[cfg_attr(not(feature = "niri"), allow(dead_code))]
     pub fn icon(&self) -> &'static str {
         match self {
             Self::Responding => "\u{f013}", // nf-fa-cog (gear)
@@ -61,7 +60,6 @@ pub struct AgentSession {
 
 #[derive(Debug)]
 pub enum DaemonMessage {
-    Toggle,
     ToggleAgents,
     Track(TrackEvent),
     List(std::sync::mpsc::Sender<ListResponse>),
@@ -134,10 +132,6 @@ pub struct TrackEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum SocketRequest {
-    Toggle {
-        #[serde(default)]
-        requested_at_ms: Option<u64>,
-    },
     ToggleAgents {
         #[serde(default)]
         requested_at_ms: Option<u64>,
@@ -356,16 +350,9 @@ pub(crate) fn send_socket_request_to_path(
     read_socket_frame(&mut stream, "response")
 }
 
-#[cfg_attr(not(feature = "niri"), allow(dead_code))]
-pub(crate) fn send_toggle_request(agents_only: bool) -> io::Result<()> {
-    let request = if agents_only {
-        SocketRequest::ToggleAgents {
-            requested_at_ms: Some(unix_now_ms()),
-        }
-    } else {
-        SocketRequest::Toggle {
-            requested_at_ms: Some(unix_now_ms()),
-        }
+pub(crate) fn send_toggle_agents_request() -> io::Result<()> {
+    let request = SocketRequest::ToggleAgents {
+        requested_at_ms: Some(unix_now_ms()),
     };
     match send_socket_request(&request)? {
         SocketResponse::Ok => Ok(()),
@@ -463,17 +450,8 @@ fn handle_socket_request(
     cache: &Arc<Mutex<SessionCache>>,
 ) -> SocketResponse {
     match request {
-        SocketRequest::Toggle { requested_at_ms } => {
-            log_toggle_request_delay(requested_at_ms, false);
-            match tx.send(DaemonMessage::Toggle) {
-                Ok(()) => SocketResponse::Ok,
-                Err(err) => SocketResponse::Error {
-                    message: format!("daemon not responding: {err}"),
-                },
-            }
-        }
         SocketRequest::ToggleAgents { requested_at_ms } => {
-            log_toggle_request_delay(requested_at_ms, true);
+            log_toggle_request_delay(requested_at_ms);
             match tx.send(DaemonMessage::ToggleAgents) {
                 Ok(()) => SocketResponse::Ok,
                 Err(err) => SocketResponse::Error {
@@ -529,16 +507,13 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn log_toggle_request_delay(requested_at_ms: Option<u64>, agents_only: bool) {
+fn log_toggle_request_delay(requested_at_ms: Option<u64>) {
     let Some(requested_at_ms) = requested_at_ms else {
         return;
     };
     let now_ms = unix_now_ms();
     let delay_ms = now_ms.saturating_sub(requested_at_ms);
-    debug!(
-        "toggle request delay: {}ms agents_only={}",
-        delay_ms, agents_only
-    );
+    debug!("toggle request delay: {}ms", delay_ms);
 }
 
 fn start_socket_listener_at_paths(
@@ -668,7 +643,7 @@ pub fn run_headless() {
         };
 
         match msg {
-            DaemonMessage::Toggle | DaemonMessage::ToggleAgents => {
+            DaemonMessage::ToggleAgents => {
                 // No-op in headless mode
             }
             DaemonMessage::Track(event) => {
@@ -1140,7 +1115,7 @@ mod tests {
                         let mut cache = worker_cache.lock().unwrap();
                         cache.reload_agent_sessions_from_path(&worker_state_path);
                     }
-                    DaemonMessage::Toggle | DaemonMessage::ToggleAgents => {}
+                    DaemonMessage::ToggleAgents => {}
                     DaemonMessage::Shutdown => break,
                 }
             }

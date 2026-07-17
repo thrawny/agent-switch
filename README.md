@@ -5,9 +5,9 @@ Track and switch between AI coding agent sessions (Claude, Codex, Pi, OpenCode) 
 ## What it does
 
 - Tracks agent session state (`waiting`, `responding`, `idle`) from hook events
-- Shows a niri GTK overlay for switching workspaces and configured app windows
-- Provides an agents-only overlay for jumping between active agent sessions
+- Provides a GTK overlay for jumping between active agent sessions
 - Merges agent state into one daemon-backed session cache
+- Exposes session state as JSON (`list`, `focused`) for status bars and scripts
 
 ---
 
@@ -22,9 +22,7 @@ This installs `agent-switch` to `~/.cargo/bin/agent-switch`.
 
 ---
 
-## niri usage (Linux)
-
-`niri` overlay requires the Cargo `niri` feature.
+## Usage
 
 ### Start daemon + overlay
 
@@ -35,30 +33,24 @@ agent-switch serve --niri
 From source:
 
 ```bash
-cargo run --features niri -- serve --niri
+cargo run -- serve --niri
 ```
 
-### Toggle overlay
+### Toggle the agents overlay
 
-```bash
-agent-switch niri --toggle
-```
-
-### Toggle agents-only view
-
-Opens the overlay filtered to only show windows with active agent sessions:
+Opens the overlay listing windows with active agent sessions:
 
 ```bash
 agent-switch niri --toggle-agents
 ```
 
-In agents-only view, press `Space` to smart-jump to the most relevant agent window.
+Press `Space` to smart-jump to the most relevant agent window, or the shown
+key to jump to a specific session. `q`/`Escape` closes the overlay.
 
 Optional niri binds:
 
 ```kdl
-Mod+S { spawn "agent-switch" "niri" "--toggle"; }
-Mod+A { spawn "agent-switch" "niri" "--toggle-agents"; }
+Mod+S { spawn "agent-switch" "niri" "--toggle-agents"; }
 ```
 
 Optional startup entry:
@@ -75,39 +67,13 @@ Example:
 ignore = ["games", "web"]
 ignoreUnnamedWorkspaces = true
 ignoreNumericSessions = true
-
-[bindings.workspaces]
-h = "dotfiles"
-
-[[bindings.apps]]
-key = "s"
-label = "slack"
-appId = "Slack"
-
-[[bindings.apps]]
-key = "t"
-label = "teams"
-titleContains = "Microsoft Teams"
-
-[[project]]
-dir = "~/dotfiles"
-static_workspace = true
-
-[[project]]
-name = "company"
-dir = "~/code/the-office"
-
-[[project]]
-dir = "~/code/agent-switch" # name inferred from folder if omitted
+theme = "molokai"
 ```
 
 Notes:
+- `ignore` hides matching discovered niri workspaces
 - `ignoreUnnamedWorkspaces` defaults to `true`
 - `ignoreNumericSessions` defaults to `false`
-- `ignore` hides matching discovered niri workspaces
-- if `project.name` is omitted, name is inferred from `dir` basename
-- `static_workspace = true` means “focus existing workspace, don’t auto-create”
-- app bindings are explicit only and hidden when no matching window is open
 
 ---
 
@@ -179,6 +145,7 @@ Notes:
 
 ```bash
 agent-switch list      # dump tracked sessions as JSON
+agent-switch focused   # dump the focused window's session as JSON
 agent-switch cleanup   # remove stale sessions
 ```
 
