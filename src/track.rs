@@ -88,7 +88,11 @@ fn process_tree_has_noninteractive_agent(_agent: &str) -> bool {
 fn argv_is_noninteractive_agent(agent: &str, argv: &[String]) -> bool {
     match agent {
         "codex" => {
-            argv_invokes_agent(argv, "codex") && argv.iter().skip(1).any(|arg| arg == "exec")
+            argv_invokes_agent(argv, "codex")
+                && argv
+                    .iter()
+                    .skip(1)
+                    .any(|arg| arg == "exec" || arg == "app-server")
         }
         "claude" => {
             argv_invokes_agent(argv, "claude")
@@ -225,6 +229,18 @@ mod tests {
         assert!(!argv_is_noninteractive_agent(
             "codex",
             &argv(&["/home/me/.cargo/bin/codex"]),
+        ));
+    }
+
+    #[test]
+    fn detects_codex_app_server_as_noninteractive() {
+        assert!(argv_is_noninteractive_agent(
+            "codex",
+            &argv(&["/etc/profiles/per-user/me/bin/codex", "app-server"]),
+        ));
+        assert!(!argv_is_noninteractive_agent(
+            "codex",
+            &argv(&["codex", "--dangerously-bypass-approvals-and-sandbox"]),
         ));
     }
 
