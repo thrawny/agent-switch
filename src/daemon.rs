@@ -60,7 +60,7 @@ pub struct AgentSession {
 
 #[derive(Debug)]
 pub enum DaemonMessage {
-    ToggleAgents,
+    Toggle,
     Track(TrackEvent),
     List(std::sync::mpsc::Sender<ListResponse>),
     SessionsChanged,
@@ -132,7 +132,7 @@ pub struct TrackEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum SocketRequest {
-    ToggleAgents {
+    Toggle {
         #[serde(default)]
         requested_at_ms: Option<u64>,
     },
@@ -350,8 +350,8 @@ pub(crate) fn send_socket_request_to_path(
     read_socket_frame(&mut stream, "response")
 }
 
-pub(crate) fn send_toggle_agents_request() -> io::Result<()> {
-    let request = SocketRequest::ToggleAgents {
+pub(crate) fn send_toggle_request() -> io::Result<()> {
+    let request = SocketRequest::Toggle {
         requested_at_ms: Some(unix_now_ms()),
     };
     match send_socket_request(&request)? {
@@ -450,9 +450,9 @@ fn handle_socket_request(
     cache: &Arc<Mutex<SessionCache>>,
 ) -> SocketResponse {
     match request {
-        SocketRequest::ToggleAgents { requested_at_ms } => {
+        SocketRequest::Toggle { requested_at_ms } => {
             log_toggle_request_delay(requested_at_ms);
-            match tx.send(DaemonMessage::ToggleAgents) {
+            match tx.send(DaemonMessage::Toggle) {
                 Ok(()) => SocketResponse::Ok,
                 Err(err) => SocketResponse::Error {
                     message: format!("daemon not responding: {err}"),
@@ -643,7 +643,7 @@ pub fn run_headless() {
         };
 
         match msg {
-            DaemonMessage::ToggleAgents => {
+            DaemonMessage::Toggle => {
                 // No-op in headless mode
             }
             DaemonMessage::Track(event) => {
@@ -1115,7 +1115,7 @@ mod tests {
                         let mut cache = worker_cache.lock().unwrap();
                         cache.reload_agent_sessions_from_path(&worker_state_path);
                     }
-                    DaemonMessage::ToggleAgents => {}
+                    DaemonMessage::Toggle => {}
                     DaemonMessage::Shutdown => break,
                 }
             }

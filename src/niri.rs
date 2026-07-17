@@ -1,6 +1,5 @@
-use crate::app_labels;
+use crate::config;
 use crate::daemon::{self, AgentSession, AgentState, DaemonMessage, SessionCache};
-use crate::projects;
 use crate::state;
 use crate::themes;
 use gtk4::prelude::*;
@@ -27,23 +26,23 @@ use std::time::{Duration, Instant};
 
 const APP_ID: &str = "com.thrawny.agent-switch";
 const KEYS: [char; 12] = ['h', 'j', 'k', 'l', 'u', 'i', 'o', 'p', 'n', 'm', ',', '.'];
-const NIRI_OVERLAY_WIDTH_RATIO: f64 = 0.45;
-const NIRI_OVERLAY_HEIGHT_RATIO: f64 = 0.70;
-const NIRI_OVERLAY_MIN_WIDTH: i32 = 340;
-const NIRI_OVERLAY_MAX_WIDTH: i32 = 1100;
-const NIRI_OVERLAY_MAX_HEIGHT: i32 = 900;
-const NIRI_OVERLAY_FALLBACK_WIDTH: i32 = 420;
-const NIRI_OVERLAY_FALLBACK_HEIGHT: i32 = 520;
-const NIRI_AGENTS_OVERLAY_WIDTH_RATIO: f64 = 0.62;
-const NIRI_AGENTS_OVERLAY_HEIGHT_RATIO: f64 = 0.82;
-const NIRI_AGENTS_OVERLAY_MIN_WIDTH: i32 = 560;
-const NIRI_AGENTS_OVERLAY_MAX_WIDTH: i32 = 1450;
-const NIRI_AGENTS_OVERLAY_MAX_HEIGHT: i32 = 1100;
-const NIRI_AGENTS_OVERLAY_FALLBACK_WIDTH: i32 = 780;
-const NIRI_AGENTS_OVERLAY_FALLBACK_HEIGHT: i32 = 700;
-const NIRI_OVERLAY_MARGIN: i32 = 80;
-const NIRI_OVERLAY_STEP_SCROLL: f64 = 64.0;
-const NIRI_OVERLAY_PAGE_SCROLL: f64 = 320.0;
+const OVERLAY_WIDTH_RATIO: f64 = 0.45;
+const OVERLAY_HEIGHT_RATIO: f64 = 0.70;
+const OVERLAY_MIN_WIDTH: i32 = 340;
+const OVERLAY_MAX_WIDTH: i32 = 1100;
+const OVERLAY_MAX_HEIGHT: i32 = 900;
+const OVERLAY_FALLBACK_WIDTH: i32 = 420;
+const OVERLAY_FALLBACK_HEIGHT: i32 = 520;
+const OVERLAY_WIDE_WIDTH_RATIO: f64 = 0.62;
+const OVERLAY_WIDE_HEIGHT_RATIO: f64 = 0.82;
+const OVERLAY_WIDE_MIN_WIDTH: i32 = 560;
+const OVERLAY_WIDE_MAX_WIDTH: i32 = 1450;
+const OVERLAY_WIDE_MAX_HEIGHT: i32 = 1100;
+const OVERLAY_WIDE_FALLBACK_WIDTH: i32 = 780;
+const OVERLAY_WIDE_FALLBACK_HEIGHT: i32 = 700;
+const OVERLAY_MARGIN: i32 = 80;
+const OVERLAY_STEP_SCROLL: f64 = 64.0;
+const OVERLAY_PAGE_SCROLL: f64 = 320.0;
 const WAITING_PRIORITY_WINDOW_SECS: f64 = 30.0 * 60.0;
 const GTK_MAIN_LOOP_HEARTBEAT_MS: u64 = 100;
 const GTK_MAIN_LOOP_STALL_WARN_MS: u128 = 200;
@@ -67,16 +66,13 @@ enum NiriMessage {
 struct WorkspaceColumn {
     workspace_name: String,
     workspace_ref: WorkspaceReferenceArg,
-    workspace_key: char,
     column_index: u32,
-    column_key: char,
-    app_label: String,
     window_title: Option<String>,
     window_id: Option<u64>,
 }
 
 struct AppState {
-    config: projects::Config,
+    config: config::Config,
     theme: &'static themes::Theme,
     agent_entries: Vec<WorkspaceColumn>,
     focused_at_open: Option<u64>,
@@ -181,7 +177,7 @@ fn process_daemon_message(
     focused_window: &Arc<Mutex<Option<u64>>>,
 ) -> Option<NiriMessage> {
     match msg {
-        DaemonMessage::ToggleAgents => Some(NiriMessage::Daemon {
+        DaemonMessage::Toggle => Some(NiriMessage::Daemon {
             msg,
             enqueued_at: Instant::now(),
         }),
@@ -216,7 +212,7 @@ fn process_daemon_message(
     }
 }
 
-fn request_workspace_refresh(tx: mpsc::Sender<NiriMessage>, config: projects::Config) {
+fn request_workspace_refresh(tx: mpsc::Sender<NiriMessage>, config: config::Config) {
     thread::spawn(move || {
         let refresh_start = Instant::now();
         let entries = get_agent_workspace_columns(&config);
@@ -356,20 +352,16 @@ fn niri_windows() -> Vec<Window> {
 fn should_skip_discovered_workspace(
     name_opt: Option<&str>,
     display_name: &str,
-    config: &projects::Config,
+    config: &config::Config,
     seen_workspaces: &std::collections::HashSet<String>,
 ) -> bool {
     (name_opt.is_none() && config.ignore_unnamed_workspaces)
-        || (config.ignore_numeric_sessions && projects::is_numeric_name(display_name))
+        || (config.ignore_numeric_sessions && config::is_numeric_name(display_name))
         || seen_workspaces.contains(display_name)
         || config.ignore.iter().any(|ignored| ignored == display_name)
 }
 
-fn workspace_key_for_index(index: usize) -> char {
-    KEYS.get(index).copied().unwrap_or('\0')
-}
-
-fn get_agent_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn> {
+fn get_agent_workspace_columns(config: &config::Config) -> Vec<WorkspaceColumn> {
     use std::collections::{BTreeMap, HashSet};
 
     let workspaces = niri_workspaces();
@@ -377,13 +369,11 @@ fn get_agent_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn
 
     let mut entries = Vec::new();
     let mut seen_workspaces: HashSet<String> = HashSet::new();
-    let mut key_idx = 0;
 
     let add_workspace_entries = |entries: &mut Vec<WorkspaceColumn>,
                                  ws_id: u64,
                                  ws_name: &str,
                                  workspace_ref: WorkspaceReferenceArg,
-                                 workspace_key: char,
                                  windows_arr: &[&Window]| {
         let mut columns: BTreeMap<usize, Vec<&Window>> = BTreeMap::new();
 
@@ -400,26 +390,14 @@ fn get_agent_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn
         }
 
         for (&col_idx, col_windows) in &columns {
-            let column_key = workspace_key_for_index(col_idx.saturating_sub(1));
-
             let first_window = col_windows.first();
-            let title = first_window.and_then(|w| w.title.as_deref()).unwrap_or("?");
-            let app_id = first_window
-                .and_then(|w| w.app_id.as_deref())
-                .unwrap_or("?");
-            let window_id = first_window.map(|w| w.id);
-            let window_title = first_window.and_then(|w| w.title.clone());
-            let app_label = app_labels::simplify_label(title, app_id);
 
             entries.push(WorkspaceColumn {
                 workspace_name: ws_name.to_string(),
                 workspace_ref: workspace_ref.clone(),
-                workspace_key,
                 column_index: col_idx as u32,
-                column_key,
-                app_label,
-                window_title,
-                window_id,
+                window_title: first_window.and_then(|w| w.title.clone()),
+                window_id: first_window.map(|w| w.id),
             });
         }
     };
@@ -455,18 +433,13 @@ fn get_agent_workspace_columns(config: &projects::Config) -> Vec<WorkspaceColumn
     discovered.sort_by_key(|(idx, _, _, _)| *idx);
 
     for (_, ws_id, display_name, workspace_ref) in discovered {
-        let workspace_key = workspace_key_for_index(key_idx);
-
         add_workspace_entries(
             &mut entries,
             ws_id,
             &display_name,
             workspace_ref,
-            workspace_key,
             &windows_refs,
         );
-
-        key_idx += 1;
     }
 
     entries
@@ -518,7 +491,7 @@ fn switch_to_entry(entry: &WorkspaceColumn) {
 }
 
 fn start_config_watcher(tx: mpsc::Sender<NiriMessage>) {
-    let watched_paths = projects::config_paths();
+    let watched_paths = config::config_paths();
     let watched_dirs: Vec<_> = watched_paths
         .iter()
         .filter_map(|path| path.parent().map(|parent| parent.to_path_buf()))
@@ -645,32 +618,32 @@ fn overlay_monitor(window: &ApplicationWindow) -> Option<gtk4::gdk::Monitor> {
 }
 
 fn overlay_size_caps_for_geometry(width: i32, height: i32, wide_agents_layout: bool) -> (i32, i32) {
-    let available_width = (width - NIRI_OVERLAY_MARGIN).max(320);
-    let available_height = (height - NIRI_OVERLAY_MARGIN).max(200);
+    let available_width = (width - OVERLAY_MARGIN).max(320);
+    let available_height = (height - OVERLAY_MARGIN).max(200);
     let width_ratio = if wide_agents_layout {
-        NIRI_AGENTS_OVERLAY_WIDTH_RATIO
+        OVERLAY_WIDE_WIDTH_RATIO
     } else {
-        NIRI_OVERLAY_WIDTH_RATIO
+        OVERLAY_WIDTH_RATIO
     };
     let height_ratio = if wide_agents_layout {
-        NIRI_AGENTS_OVERLAY_HEIGHT_RATIO
+        OVERLAY_WIDE_HEIGHT_RATIO
     } else {
-        NIRI_OVERLAY_HEIGHT_RATIO
+        OVERLAY_HEIGHT_RATIO
     };
     let min_width = if wide_agents_layout {
-        NIRI_AGENTS_OVERLAY_MIN_WIDTH
+        OVERLAY_WIDE_MIN_WIDTH
     } else {
-        NIRI_OVERLAY_MIN_WIDTH
+        OVERLAY_MIN_WIDTH
     };
     let max_width_cap = if wide_agents_layout {
-        NIRI_AGENTS_OVERLAY_MAX_WIDTH
+        OVERLAY_WIDE_MAX_WIDTH
     } else {
-        NIRI_OVERLAY_MAX_WIDTH
+        OVERLAY_MAX_WIDTH
     };
     let max_height_cap = if wide_agents_layout {
-        NIRI_AGENTS_OVERLAY_MAX_HEIGHT
+        OVERLAY_WIDE_MAX_HEIGHT
     } else {
-        NIRI_OVERLAY_MAX_HEIGHT
+        OVERLAY_MAX_HEIGHT
     };
     let max_width = clamp_i32(
         (width as f64 * width_ratio).round() as i32,
@@ -724,12 +697,9 @@ fn update_overlay_size(
             overlay_size_caps_for_geometry(geometry.width(), geometry.height(), wide_agents_layout)
         })
         .unwrap_or(if wide_agents_layout {
-            (
-                NIRI_AGENTS_OVERLAY_FALLBACK_WIDTH,
-                NIRI_AGENTS_OVERLAY_FALLBACK_HEIGHT,
-            )
+            (OVERLAY_WIDE_FALLBACK_WIDTH, OVERLAY_WIDE_FALLBACK_HEIGHT)
         } else {
-            (NIRI_OVERLAY_FALLBACK_WIDTH, NIRI_OVERLAY_FALLBACK_HEIGHT)
+            (OVERLAY_FALLBACK_WIDTH, OVERLAY_FALLBACK_HEIGHT)
         });
 
     scroller.set_max_content_width(max_width);
@@ -743,9 +713,9 @@ fn update_overlay_size(
     let width = clamp_i32(
         natural.width(),
         if wide_agents_layout {
-            NIRI_AGENTS_OVERLAY_MIN_WIDTH.min(max_width)
+            OVERLAY_WIDE_MIN_WIDTH.min(max_width)
         } else {
-            NIRI_OVERLAY_MIN_WIDTH.min(max_width)
+            OVERLAY_MIN_WIDTH.min(max_width)
         },
         max_width,
     );
@@ -768,7 +738,7 @@ fn scroll_overlay(scroller: &ScrolledWindow, delta: f64) {
 
 fn scroll_overlay_by_step(scroller: &ScrolledWindow, direction: f64) {
     let adjustment = scroller.vadjustment();
-    let delta = adjustment.step_increment().max(NIRI_OVERLAY_STEP_SCROLL) * direction;
+    let delta = adjustment.step_increment().max(OVERLAY_STEP_SCROLL) * direction;
     scroll_overlay(scroller, delta);
 }
 
@@ -777,7 +747,7 @@ fn scroll_overlay_by_page(scroller: &ScrolledWindow, direction: f64) {
     let delta = adjustment
         .page_increment()
         .max(adjustment.page_size() * 0.9)
-        .max(NIRI_OVERLAY_PAGE_SCROLL)
+        .max(OVERLAY_PAGE_SCROLL)
         * direction;
     scroll_overlay(scroller, delta);
 }
@@ -835,8 +805,8 @@ fn build_ui(
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .default_width(NIRI_OVERLAY_FALLBACK_WIDTH)
-        .default_height(NIRI_OVERLAY_FALLBACK_HEIGHT)
+        .default_width(OVERLAY_FALLBACK_WIDTH)
+        .default_height(OVERLAY_FALLBACK_HEIGHT)
         .build();
 
     window.init_layer_shell();
@@ -847,11 +817,11 @@ fn build_ui(
     window.set_anchor(Edge::Left, false);
     window.set_anchor(Edge::Right, false);
 
-    let (config, last_config_error) = match projects::load_config() {
+    let (config, last_config_error) = match config::load_config() {
         Ok(config) => (config, None),
         Err(err) => {
             notify_config_error(&err);
-            (projects::Config::default(), Some(err))
+            (config::Config::default(), Some(err))
         }
     };
     let theme = themes::get(&config.theme);
@@ -1054,7 +1024,7 @@ fn build_ui(
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     NiriMessage::Daemon {
-                        msg: DaemonMessage::ToggleAgents,
+                        msg: DaemonMessage::Toggle,
                         enqueued_at,
                     } => {
                         log::info!(
@@ -1079,7 +1049,7 @@ fn build_ui(
                             let first_rebuild_start = Instant::now();
                             rebuild_for_poll(&main_box_for_poll, &state, false);
                             let first_rebuild_elapsed = first_rebuild_start.elapsed();
-                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            let wide_agents_layout = uses_wide_layout(&state);
                             drop(state);
                             reset_overlay_scroll(&scroller_for_poll);
                             let resize_start = Instant::now();
@@ -1117,7 +1087,7 @@ fn build_ui(
                     }
                     NiriMessage::ReloadConfig => {
                         let mut state = state_for_poll.borrow_mut();
-                        let reloaded = match projects::load_config() {
+                        let reloaded = match config::load_config() {
                             Ok(config) => {
                                 state.theme = themes::get(&config.theme);
                                 apply_theme_css(&css_provider_for_poll, state.theme);
@@ -1139,7 +1109,7 @@ fn build_ui(
 
                         if reloaded && window_for_poll.is_visible() {
                             rebuild_for_poll(&main_box_for_poll, &state, false);
-                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            let wide_agents_layout = uses_wide_layout(&state);
                             let config = state.config.clone();
                             drop(state);
                             update_overlay_size(
@@ -1171,7 +1141,7 @@ fn build_ui(
                         if needs_rebuild {
                             let apply_start = Instant::now();
                             rebuild_for_poll(&main_box_for_poll, &state, false);
-                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            let wide_agents_layout = uses_wide_layout(&state);
                             drop(state);
                             update_overlay_size(
                                 &window_for_poll,
@@ -1202,7 +1172,7 @@ fn build_ui(
                         state.agent_sessions = agent_sessions;
                         if window_for_poll.is_visible() {
                             rebuild_for_poll(&main_box_for_poll, &state, false);
-                            let wide_agents_layout = uses_wide_agents_layout(&state);
+                            let wide_agents_layout = uses_wide_layout(&state);
                             drop(state);
                             update_overlay_size(
                                 &window_for_poll,
@@ -1248,7 +1218,7 @@ fn build_ui(
                     );
 
                     rebuild_for_poll(&main_box_for_poll, &state, false);
-                    let wide_agents_layout = uses_wide_agents_layout(&state);
+                    let wide_agents_layout = uses_wide_layout(&state);
                     drop(state);
                     update_overlay_size(
                         &window_for_poll,
@@ -1312,7 +1282,11 @@ fn agent_info_for_entry(
         return Some(info);
     }
 
-    if entry.app_label == "Claude Code" {
+    if entry
+        .window_title
+        .as_deref()
+        .is_some_and(is_untracked_claude_title)
+    {
         return Some(AgentInfo {
             agent: "claude".to_string(),
             state: AgentState::Idle,
@@ -1322,6 +1296,15 @@ fn agent_info_for_entry(
     }
 
     None
+}
+
+/// A window whose title is exactly "Claude Code" (ignoring leading status
+/// glyphs like "✳") is a Claude session we have no hook data for yet.
+fn is_untracked_claude_title(title: &str) -> bool {
+    title
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim()
+        == "Claude Code"
 }
 
 fn agents_view_has_titles(
@@ -1335,7 +1318,7 @@ fn agents_view_has_titles(
         })
 }
 
-fn uses_wide_agents_layout(state: &AppState) -> bool {
+fn uses_wide_layout(state: &AppState) -> bool {
     agents_view_has_titles(&state.agent_entries, &state.agent_sessions)
 }
 
@@ -1472,9 +1455,8 @@ fn sorted_agent_entries<'a>(
                     .partial_cmp(&updated_a)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then_with(|| a.workspace_key.cmp(&b.workspace_key))
+            .then_with(|| a.workspace_name.cmp(&b.workspace_name))
             .then_with(|| a.column_index.cmp(&b.column_index))
-            .then_with(|| a.column_key.cmp(&b.column_key))
             .then_with(|| {
                 a.window_title
                     .as_deref()
@@ -1581,7 +1563,7 @@ pub fn run_with_daemon() -> glib::ExitCode {
                 Ok(msg) => msg,
                 Err(_) => break,
             };
-            let is_toggle = matches!(msg, DaemonMessage::ToggleAgents);
+            let is_toggle = matches!(msg, DaemonMessage::Toggle);
 
             let forwarded = match msg {
                 DaemonMessage::Track(_) | DaemonMessage::SessionsChanged => {
@@ -1650,7 +1632,7 @@ fn mock_workspace_columns() -> Vec<WorkspaceColumn> {
         ("notes", 1),
     ];
 
-    let app_labels = [
+    let titles = [
         "ghostty", "claude", "codex", "ghostty", "firefox", "zed", "ghostty", "codex",
     ];
 
@@ -1658,21 +1640,13 @@ fn mock_workspace_columns() -> Vec<WorkspaceColumn> {
     let mut window_id = 100u64;
 
     for (proj_idx, &(name, num_columns)) in projects.iter().enumerate() {
-        if proj_idx >= KEYS.len() {
-            break;
-        }
-        let workspace_key = KEYS[proj_idx];
-
-        for (col, &column_key) in KEYS.iter().enumerate().take(num_columns) {
-            let label_idx = (proj_idx + col) % app_labels.len();
+        for col in 0..num_columns {
+            let title_idx = (proj_idx + col) % titles.len();
             entries.push(WorkspaceColumn {
                 workspace_name: name.to_string(),
                 workspace_ref: WorkspaceReferenceArg::Name(name.to_string()),
-                workspace_key,
                 column_index: (col + 2) as u32,
-                column_key,
-                app_label: app_labels[label_idx].to_string(),
-                window_title: Some(app_labels[label_idx].to_string()),
+                window_title: Some(titles[title_idx].to_string()),
                 window_id: Some(window_id),
             });
             window_id += 1;
@@ -1720,8 +1694,8 @@ fn mock_agent_sessions(entries: &[WorkspaceColumn], cycle: usize) -> HashMap<u64
 fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .default_width(NIRI_OVERLAY_FALLBACK_WIDTH)
-        .default_height(NIRI_OVERLAY_FALLBACK_HEIGHT)
+        .default_width(OVERLAY_FALLBACK_WIDTH)
+        .default_height(OVERLAY_FALLBACK_HEIGHT)
         .build();
 
     window.init_layer_shell();
@@ -1732,7 +1706,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     window.set_anchor(Edge::Left, false);
     window.set_anchor(Edge::Right, false);
 
-    let mut config = projects::load_config().unwrap_or_default();
+    let mut config = config::load_config().unwrap_or_default();
     if let Some(t) = theme_override {
         config.theme = t;
     }
@@ -1821,7 +1795,7 @@ fn build_demo_ui(app: &Application, theme_override: Option<String>) {
     });
 
     // First pass used natural widths for sizing; now compute overlay size
-    let wide = uses_wide_agents_layout(&state.borrow());
+    let wide = uses_wide_layout(&state.borrow());
     update_overlay_size(&window, &scroller, &outer_box, wide);
 
     // Second pass: lock label widths so content changes don't shift layout
@@ -1844,8 +1818,8 @@ pub fn run_demo(theme_override: Option<&str>) -> glib::ExitCode {
     app.run_with_args::<&str>(&[])
 }
 
-pub fn run_toggle_agents() -> glib::ExitCode {
-    if let Err(e) = daemon::send_toggle_agents_request() {
+pub fn run_toggle() -> glib::ExitCode {
+    if let Err(e) = daemon::send_toggle_request() {
         log::error!("Failed to toggle agents: {} (is daemon running?)", e);
         std::process::exit(1);
     }
@@ -1857,39 +1831,19 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
-    fn workspace_entry(
-        name: &str,
-        workspace_key: char,
-        column_key: char,
-        window_id: u64,
-    ) -> WorkspaceColumn {
-        WorkspaceColumn {
-            workspace_name: name.to_string(),
-            workspace_ref: WorkspaceReferenceArg::Name(name.to_string()),
-            workspace_key,
-            column_index: 2,
-            column_key,
-            app_label: "Claude Code".to_string(),
-            window_title: Some("Claude Code".to_string()),
-            window_id: Some(window_id),
-        }
+    fn workspace_entry(name: &str, window_id: u64) -> WorkspaceColumn {
+        workspace_entry_with_window(name, window_id, "Claude Code")
     }
 
     fn workspace_entry_with_window(
         name: &str,
-        workspace_key: char,
-        column_key: char,
         window_id: u64,
-        app_label: &str,
         window_title: &str,
     ) -> WorkspaceColumn {
         WorkspaceColumn {
             workspace_name: name.to_string(),
             workspace_ref: WorkspaceReferenceArg::Name(name.to_string()),
-            workspace_key,
             column_index: 2,
-            column_key,
-            app_label: app_label.to_string(),
             window_title: Some(window_title.to_string()),
             window_id: Some(window_id),
         }
@@ -1897,7 +1851,7 @@ mod tests {
 
     #[test]
     fn unnamed_workspaces_are_ignored_by_default() {
-        let config: projects::Config = toml::from_str("").expect("default config should parse");
+        let config: config::Config = toml::from_str("").expect("default config should parse");
         let seen = HashSet::new();
 
         assert!(should_skip_discovered_workspace(
@@ -1909,7 +1863,7 @@ mod tests {
 
     #[test]
     fn ignore_numeric_sessions_hides_numeric_named_workspaces() {
-        let config: projects::Config = toml::from_str(
+        let config: config::Config = toml::from_str(
             r#"
 ignoreUnnamedWorkspaces = false
 ignoreNumericSessions = true
@@ -1934,7 +1888,7 @@ ignoreNumericSessions = true
 
     #[test]
     fn ignore_list_and_seen_workspace_names_are_filtered() {
-        let config: projects::Config = toml::from_str(
+        let config: config::Config = toml::from_str(
             r#"
 ignoreUnnamedWorkspaces = false
 ignore = ["web"]
@@ -1980,14 +1934,7 @@ ignore = ["web"]
 
     #[test]
     fn agent_info_uses_session_name_for_tracked_session() {
-        let entry = workspace_entry_with_window(
-            "dotfiles",
-            'a',
-            'h',
-            292,
-            "debug-helium-launch-issues",
-            "✳ debug-helium-launch-issues",
-        );
+        let entry = workspace_entry_with_window("dotfiles", 292, "✳ debug-helium-launch-issues");
         let agent_sessions = HashMap::from([(
             292,
             AgentSession {
@@ -2008,8 +1955,7 @@ ignore = ["web"]
 
     #[test]
     fn agent_info_hides_redundant_title_matching_workspace_name() {
-        let entry =
-            workspace_entry_with_window("dotfiles", 'a', 'h', 292, "dotfiles", "✳ dotfiles");
+        let entry = workspace_entry_with_window("dotfiles", 292, "✳ dotfiles");
         let agent_sessions = HashMap::from([(
             292,
             AgentSession {
@@ -2034,14 +1980,7 @@ ignore = ["web"]
 
     #[test]
     fn pi_window_title_fallback_does_not_show_title_without_tracking() {
-        let entry = workspace_entry_with_window(
-            "agent-switch",
-            'a',
-            'h',
-            293,
-            "π - test-foo - agent-switch",
-            "π - test-foo - agent-switch",
-        );
+        let entry = workspace_entry_with_window("agent-switch", 293, "π - test-foo - agent-switch");
 
         let info = agent_info_for_entry(&entry, &HashMap::new())
             .expect("pi title should be treated as an agent window");
@@ -2052,15 +1991,9 @@ ignore = ["web"]
 
     #[test]
     fn agents_view_only_uses_wide_layout_when_titles_are_present() {
-        let untitled = workspace_entry("kanel-backend", 'a', 'h', 148);
-        let titled = workspace_entry_with_window(
-            "agent-switch",
-            'b',
-            'j',
-            293,
-            "π - test-foo - agent-switch",
-            "π - test-foo - agent-switch",
-        );
+        let untitled = workspace_entry("kanel-backend", 148);
+        let titled =
+            workspace_entry_with_window("agent-switch", 293, "π - test-foo - agent-switch");
         let agent_sessions = HashMap::from([(
             148,
             AgentSession {
@@ -2095,7 +2028,7 @@ ignore = ["web"]
     #[test]
     fn overlay_size_caps_allow_compact_windows() {
         let (max_width, max_height) = overlay_size_caps_for_geometry(2560, 1440, false);
-        let compact_width = clamp_i32(380, NIRI_OVERLAY_MIN_WIDTH.min(max_width), max_width);
+        let compact_width = clamp_i32(380, OVERLAY_MIN_WIDTH.min(max_width), max_width);
         let compact_height = clamp_i32(170, 1, max_height);
 
         assert_eq!(compact_width, 380);
@@ -2116,9 +2049,9 @@ ignore = ["web"]
     #[test]
     fn sorted_agent_entries_demotes_stale_waiting_below_responding() {
         let entries = vec![
-            workspace_entry("fresh-waiting", 'a', 'h', 1),
-            workspace_entry("responding", 'b', 'j', 2),
-            workspace_entry("stale-waiting", 'c', 'k', 3),
+            workspace_entry("fresh-waiting", 1),
+            workspace_entry("responding", 2),
+            workspace_entry("stale-waiting", 3),
         ];
         let now = state::now();
         let agent_sessions = HashMap::from([
@@ -2166,10 +2099,10 @@ ignore = ["web"]
     #[test]
     fn agent_selection_keys_skip_current_and_space_target() {
         let entries = vec![
-            workspace_entry("current", 'a', 'h', 1),
-            workspace_entry("space-target", 'b', 'j', 2),
-            workspace_entry("first-direct", 'c', 'k', 3),
-            workspace_entry("second-direct", 'd', 'l', 4),
+            workspace_entry("current", 1),
+            workspace_entry("space-target", 2),
+            workspace_entry("first-direct", 3),
+            workspace_entry("second-direct", 4),
         ];
         let now = state::now();
         let agent_sessions = HashMap::from([
@@ -2248,45 +2181,6 @@ ignore = ["web"]
     }
 
     #[test]
-    fn sorted_agent_entries_include_overflow_workspaces_without_normal_keys() {
-        let entries = vec![
-            workspace_entry("agent-switch", 'a', 'h', 1),
-            workspace_entry("quotabar", '\0', '\0', 2),
-        ];
-        let now = state::now();
-        let agent_sessions = HashMap::from([
-            (
-                1,
-                AgentSession {
-                    agent: "claude".to_string(),
-                    session_name: None,
-                    state: AgentState::Responding,
-                    cwd: Some("/tmp/agent-switch".to_string()),
-                    state_updated: now - 30.0,
-                },
-            ),
-            (
-                2,
-                AgentSession {
-                    agent: "claude".to_string(),
-                    session_name: None,
-                    state: AgentState::Responding,
-                    cwd: Some("/tmp/quotabar".to_string()),
-                    state_updated: now - 60.0,
-                },
-            ),
-        ]);
-
-        let sorted = sorted_agent_entries(&entries, &agent_sessions);
-        let ids: Vec<_> = sorted
-            .into_iter()
-            .filter_map(|entry| entry.window_id)
-            .collect();
-
-        assert_eq!(ids, vec![1, 2]);
-    }
-
-    #[test]
     fn process_daemon_message_answers_list_without_forwarding_to_gtk() {
         let cache = Arc::new(Mutex::new(SessionCache::new()));
         cache.lock().unwrap().store.sessions.insert(
@@ -2348,13 +2242,12 @@ ignore = ["web"]
         let cache = Arc::new(Mutex::new(SessionCache::new()));
         let focused_window = Arc::new(Mutex::new(None));
 
-        let forwarded =
-            process_daemon_message(DaemonMessage::ToggleAgents, &cache, &focused_window);
+        let forwarded = process_daemon_message(DaemonMessage::Toggle, &cache, &focused_window);
 
         assert!(matches!(
             forwarded,
             Some(NiriMessage::Daemon {
-                msg: DaemonMessage::ToggleAgents,
+                msg: DaemonMessage::Toggle,
                 ..
             })
         ));

@@ -41,7 +41,7 @@ cargo run -- serve --niri
 Opens the overlay listing windows with active agent sessions:
 
 ```bash
-agent-switch niri --toggle-agents
+agent-switch toggle
 ```
 
 Press `Space` to smart-jump to the most relevant agent window, or the shown
@@ -50,7 +50,7 @@ key to jump to a specific session. `q`/`Escape` closes the overlay.
 Optional niri binds:
 
 ```kdl
-Mod+S { spawn "agent-switch" "niri" "--toggle-agents"; }
+Mod+S { spawn "agent-switch" "toggle"; }
 ```
 
 Optional startup entry:

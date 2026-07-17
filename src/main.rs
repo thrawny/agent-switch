@@ -1,7 +1,6 @@
-mod app_labels;
+mod config;
 mod daemon;
 mod niri;
-mod projects;
 mod state;
 mod themes;
 mod track;
@@ -60,14 +59,10 @@ enum Command {
         #[arg(long)]
         niri: bool,
     },
-    /// Niri GTK daemon (deprecated, use `serve --niri`)
-    Niri {
-        /// Toggle the agents overlay (send to running daemon)
-        #[arg(long)]
-        toggle_agents: bool,
-        /// Show demo overlay with mock data
-        #[arg(long)]
-        demo: bool,
+    /// Toggle the agents overlay (sends to the running daemon)
+    Toggle,
+    /// Show a demo overlay with mock data
+    Demo {
         /// Override theme (e.g. "default", "molokai")
         #[arg(long)]
         theme: Option<String>,
@@ -149,18 +144,12 @@ fn main() {
                 daemon::run_headless();
             }
         }
-        Command::Niri {
-            toggle_agents,
-            demo,
-            theme,
-        } => {
-            let exit_code = if demo {
-                niri::run_demo(theme.as_deref())
-            } else if toggle_agents {
-                niri::run_toggle_agents()
-            } else {
-                niri::run_with_daemon()
-            };
+        Command::Toggle => {
+            let exit_code = niri::run_toggle();
+            std::process::exit(exit_code.into());
+        }
+        Command::Demo { theme } => {
+            let exit_code = niri::run_demo(theme.as_deref());
             std::process::exit(exit_code.into());
         }
     }

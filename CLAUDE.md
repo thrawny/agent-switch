@@ -38,7 +38,8 @@ Single binary with subcommands:
 | `track <event>` | Called by agent hooks, updates session state via daemon socket |
 | `serve` | Run headless daemon (session cache + file watchers + Unix socket) |
 | `serve --niri` | Daemon with the GTK agents overlay |
-| `niri --toggle-agents` | Toggle the agents overlay (sends to running daemon) |
+| `toggle` | Toggle the agents overlay (sends to running daemon) |
+| `demo [--theme <name>]` | Show the overlay with mock data |
 | `list` | Dump all sessions as JSON |
 | `focused` | Dump the focused niri window's session as JSON |
 | `cleanup` | Remove stale sessions |
@@ -55,14 +56,13 @@ src/
 ├── state.rs       # Session store (load/save ~/.local/state/agent-switch/sessions.json)
 ├── track.rs       # Hook event handler (stdin JSON → daemon socket)
 ├── niri.rs        # GTK4 layer-shell agents overlay
-├── projects.rs    # config.toml loading (workspace ignore rules, theme)
-├── app_labels.rs  # Window title/app-id → short label heuristics
+├── config.rs      # config.toml loading (workspace ignore rules, theme)
 └── themes.rs      # Overlay color themes
 ```
 
 ## State
 
-Sessions stored in `~/.local/state/agent-switch/sessions.json`, keyed by niri window ID. Daemon communicates via Unix socket at `$AGENT_SWITCH_SOCKET` if set, otherwise `$XDG_RUNTIME_DIR/agent-switch.sock` (or `/tmp/agent-switch.sock`).
+Sessions stored in `~/.local/state/agent-switch/sessions.json`, keyed by niri window ID. Daemon communicates via Unix socket at `$AGENT_SWITCH_SOCKET` if set, otherwise `$XDG_RUNTIME_DIR/agent-switch/agent-switch.sock` (or `/tmp/agent-switch/agent-switch.sock`).
 
 ## Hook Integration
 
