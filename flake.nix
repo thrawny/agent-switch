@@ -26,7 +26,6 @@
             packages =
               with pkgs;
               lib.optionals stdenv.isLinux [
-                bashInteractive
                 pkg-config
                 gtk4
                 gtk4-layer-shell
