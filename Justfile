@@ -21,7 +21,7 @@ watch:
     sleep 0.2
     cargo build
     touch {{ _build_stamp }}
-    zmx run agent-switch-build -d watchexec -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build && touch {{ _build_stamp }}'
+    zmx run agent-switch-build -d watchexec --postpone -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build && touch {{ _build_stamp }}'
     sleep 0.2
     if [ "$${ZMX_SESSION:-}" = "agent-switch-niri" ]; then env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve --niri; else zmx attach agent-switch-niri env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve --niri; fi
 
