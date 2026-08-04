@@ -26,9 +26,11 @@ Glossary for the thread/mission-control domain. Terms are added as they are reso
 
 **Un-settle** — leaving settled. Exactly two triggers: summon (engagement) and agent hand-raise (any attention-worthy event). Symmetry rule: attention-worthy events un-settle; attention-free time settles. Viewing the settled list is neither.
 
-**Attention** *(derived axis — fused, Codex-style)* — one value per thread, priority-ordered: **Needs input** (agent waiting on permission/answer) > **Unread** (activity since `last_read_at` AND not currently working) > **Working** (running; never unread by definition) > **Idle** (read and quiet). "Attention-worthy" means Needs input or Unread — these block auto-settle and trigger un-settle.
+**Attention** *(derived axis — fused, Codex-style)* — one value per thread, priority-ordered: **Approval** (waiting on a permission decision) > **Input** (agent asked a question and waits on the answer; best-effort — harnesses that can't signal it never emit it) > **Working** (running; never unread by definition) > **Failed** (runtime reported an error; best-effort) > **Unread** (activity since `last_read_at`, rendered as "Done") > **Idle** (read and quiet, unlabeled). "Attention-worthy" means anything except Working and Idle — these block auto-settle and trigger un-settle. (Refined in ticket 06, 2026-08-04, from 03's Needs input > Unread > Working > Idle: Needs-input split into Approval/Input, Failed added, vocabulary copied from t3code sidebar v2.)
 
 **Read marker** — the single stored `last_read_at` per thread. Advances on summon or opening the thread's detail; viewing a list never advances it. A working thread cannot be unread; only finished work demands reading.
+
+**Sidebar** — the summoned surface: toggled into view per area (bind to show with keyboard, dismiss to reclaim space), never persistent. Lists the area's threads and carries the verbs. Rows sit in static creation order (newest first); activity never reorders the list — attention is expressed by brightness and a trailing status label, and the screen only moves at lifecycle transitions. (Decided in ticket 06, 2026-08-04: toggled-only, always-visible rejected; ordering copied from t3code sidebar v2, tier-sorting rejected.)
 
 **Runtime** — the living processes of a thread (agent + shell), wherever they are hosted (today: inside the thread's windows; possibly a zmx session later). Liveness is derived, never stored, and is **relative to the runtime's host**: a laptop reboot kills local runtimes only; a remote thread's ssh+zmx runtime survives it.
 
