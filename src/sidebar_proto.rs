@@ -2,7 +2,7 @@
 //
 // Question this answers (ticket 06 / docs/mission-control/issues/06-surface-content.md):
 // does the resolved sidebar design — t3code sidebar-v2 copied onto a GTK4 layer-shell
-// surface — actually feel right on niri? Exclusive zone on the left, static creation
+// surface — actually feel right on niri? Temporary overlay on the left, static creation
 // order (activity never reorders), brightness-not-position attention, settled/archived
 // shelves, keyboard verbs.
 //
@@ -715,10 +715,10 @@ fn build_proto_ui(app: &Application) {
     window.set_anchor(Edge::Left, true);
     window.set_anchor(Edge::Top, true);
     window.set_anchor(Edge::Bottom, true);
-    // Explicit zone, not auto_exclusive_zone_enable(): auto follows the measured
-    // surface width, which races with content sizing — the drawn surface and the
-    // reserved zone could disagree (sidebar overlapping windows, or stale gap).
-    window.set_exclusive_zone(SIDEBAR_WIDTH);
+    // Temporary workaround for niri retaining a stale horizontal viewport offset
+    // after a left exclusive zone disappears. Overlay instead of changing the
+    // compositor working area; opening and closing then leave window layout untouched.
+    window.set_exclusive_zone(0);
     window.set_size_request(SIDEBAR_WIDTH, -1);
 
     let provider = gtk4::CssProvider::new();
