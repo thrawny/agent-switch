@@ -67,7 +67,7 @@ Content follows the focused workspace via the niri event stream (layer surfaces 
 
 ### Jump-to-next-needing-me
 
-**Mod+Shift+S.** (Mod+A was the user's first pick but their xremap macOS layer maps Super-a→Ctrl-a outside Ghostty; Super-Shift-S is unmapped so the jump works from any app. Mod+S itself shares the Ghostty-only caveat via Super-s→Ctrl-s.) Target selection: highest attention tier (Approval > Input > Failed > Unread), longest-waiting first within a tier (FIFO — nothing starves). Go-to if visible, summon if parked (marks read + un-settles per 03). When nothing needs you: **opens the sidebar** — the bind never feels dead.
+**Mod+Shift+S.** (Mod+A was the user's first pick but their xremap macOS layer maps Super-a→Ctrl-a outside Ghostty; Super-Shift-S is unmapped so the jump works from any app. A Ghostty-only caveat was suspected for Mod+S via Super-s→Ctrl-s, but empirically — 08 prototype bind, 2026-08-04 — Mod+S reaches niri from any app.) Target selection: highest attention tier (Approval > Input > Failed > Unread), longest-waiting first within a tier (FIFO — nothing starves). Go-to if visible, summon if parked (marks read + un-settles per 03). When nothing needs you: **opens the sidebar** — the bind never feels dead.
 
 ### Area rename
 
