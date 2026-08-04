@@ -33,6 +33,7 @@ Every design decision for "glue v1" mission control is resolved and captured in 
 
 ## Not yet specified
 
+- [Harness-derived thread content](issues/09-harness-derived-content.md) — what the card/tooltip surfaces from harness-written data (Claude's `away_summary` recap, `ai-title`, `last-prompt`, live window titles; found readable from transcript JSONL during the 08 prototype, 2026-08-04); precedence vs the registry's user-owned `title`.
 - Thread creation flow (picker → project / harness / host / worktree-vs-stable-checkout; tenancy via path convention) — sharpens after scope cut + registry design.
 - Worktree GC / archive automation details — after lifecycle verbs.
 - Hand-raise + ntfy phone approval — likely remote-phase; after scope cut.
