@@ -48,6 +48,10 @@ test:
 demo theme="":
     cargo run -- demo {{ if theme != "" { "--theme " + theme } else { "" } }}
 
+# PROTOTYPE: ticket-06 sidebar demo with mock data (throwaway)
+demo-sidebar:
+    cargo run -- demo-sidebar
+
 # Format code
 fmt:
     cargo fmt

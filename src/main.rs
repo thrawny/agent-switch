@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod niri;
+mod sidebar_proto;
 mod state;
 mod themes;
 mod track;
@@ -67,6 +68,8 @@ enum Command {
         #[arg(long)]
         theme: Option<String>,
     },
+    /// PROTOTYPE: ticket-06 sidebar with mock data (throwaway)
+    DemoSidebar,
 }
 
 fn main() {
@@ -150,6 +153,10 @@ fn main() {
         }
         Command::Demo { theme } => {
             let exit_code = niri::run_demo(theme.as_deref());
+            std::process::exit(exit_code.into());
+        }
+        Command::DemoSidebar => {
+            let exit_code = sidebar_proto::run();
             std::process::exit(exit_code.into());
         }
     }
