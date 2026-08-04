@@ -32,6 +32,10 @@ Glossary for the thread/mission-control domain. Terms are added as they are reso
 
 **Sidebar** — the summoned surface: toggled into view per area (bind to show with keyboard, dismiss to reclaim space), never persistent. Lists the area's threads and carries the verbs. Rows sit in static creation order (newest first); activity never reorders the list — attention is expressed by brightness and a trailing status label, and the screen only moves at lifecycle transitions. (Decided in ticket 06, 2026-08-04: toggled-only, always-visible rejected; ordering copied from t3code sidebar v2, tier-sorting rejected.)
 
+**Registry** — the durable record of every thread: identity, manifest, lifecycle, read marker. The single source of durable truth — every other thread fact is derived, never reconciled. Each thread's record is owned by exactly one host; other hosts only read it, and a verb aimed at a remote thread travels to the owning host. (Decided in ticket 04, 2026-08-04.)
+
+**Manifest** — the stored part of a thread that resurrection needs: which harness and conversation to resume, where (directory, host), and under what name (title, area). If the manifest survives, the thread survives — everything else about a thread can be regrown.
+
 **Runtime** — the living processes of a thread (agent + shell), wherever they are hosted (today: inside the thread's windows; possibly a zmx session later). Liveness is derived, never stored, and is **relative to the runtime's host**: a laptop reboot kills local runtimes only; a remote thread's ssh+zmx runtime survives it.
 
 **archive** — lifecycle verb, defined by contract independent of runtime substrate: terminate the runtime, reclaim the worktree (refcount + confirm), tombstone the registry row. Transcript pointer and branch ref survive.
