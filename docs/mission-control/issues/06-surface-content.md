@@ -37,7 +37,7 @@ Flat per-area inbox, no grouping. Sections in order:
 
 ### Card anatomy (v2 mapped to our domain)
 
-- **Line 1**: repo/project name (the area is already the scope; within a multi-repo area like "kanel" this is the repo) + trailing slot: **status label or compact relative time** (`now`/`5m`/`3h`/`2d`); on hover the label yields to action buttons (v2 pattern).
+- **Line 1**: repo/project name (the area is already the scope; within a multi-repo area this is the repo) + trailing slot: **status label or compact relative time** (`now`/`5m`/`3h`/`2d`); on hover the label yields to action buttons (v2 pattern).
 - **Line 2**: thread title; inline rename (double-click or `r`).
 - **Line 3**: branch name + host icon when the thread lives on a non-local host (registry `host`, v2's server icon) + harness icon (pi/claude/codex, v2's provider icon).
 - **PR badge `#123` and diff stats: empty layout seams in v1** — both need PR/diff tracking that belongs with the future merge-automation design.

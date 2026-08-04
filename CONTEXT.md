@@ -6,7 +6,7 @@ Glossary for the thread/mission-control domain. Terms are added as they are reso
 
 **Thread** — a unit of agent work: registry entry + zmx session (+ optionally a worktree). Not spatial; a thread at rest has zero windows.
 
-**Area** — a niri workspace understood as a domain of work (e.g. "kanel"). Threads belong to an area; threads visit the area's workspace while engaged. (Name provisional — user: "project / area / domain, name tbd".)
+**Area** — a niri workspace understood as a domain of work (e.g. "work", "dotfiles"). Threads belong to an area; threads visit the area's workspace while engaged. (Name provisional — user: "project / area / domain, name tbd".)
 
 **Visibility** *(derived axis — never stored)* — whether a thread currently has windows on some workspace. Values: **summoned** (windows present) / **parked** (no windows). Derived from compositor facts; park/summon are spatial verbs that only touch windows and never write registry state. (Decided in ticket 03, 2026-08-03: "park" as a lifecycle state was an artifact of the fzf prototype.)
 
