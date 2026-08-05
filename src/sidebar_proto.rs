@@ -693,48 +693,49 @@ fn rebuild(list_box: &GtkBox, header_box: &GtkBox, footer: &Label, state: &mut P
 }
 
 const PROTO_CSS: &str = "
+/* Monokai Pro Spectrum, kept deliberately low-chroma outside status. */
 window { background-color: transparent; }
 .proto-outer {
-    background-color: rgba(24, 25, 30, 0.97);
-    border-right: 1px solid rgba(255, 255, 255, 0.12);
+    background-color: rgba(31, 31, 31, 0.97);
+    border-right: 1px solid rgba(105, 103, 108, 0.38);
 }
 .proto-header { padding: 14px 16px 10px 16px; }
-label.proto-scope { color: #d4d4d4; font-size: 15px; font-weight: bold; font-family: monospace; }
-label.proto-agg-waiting { color: #ff9e3b; font-size: 13px; font-family: monospace; }
-label.proto-agg-quiet { color: #6a6f7a; font-size: 13px; font-family: monospace; }
+label.proto-scope { color: #fce566; font-size: 15px; font-weight: bold; font-family: monospace; }
+label.proto-agg-waiting { color: #fc9867; font-size: 13px; font-family: monospace; }
+label.proto-agg-quiet { color: #69676c; font-size: 13px; font-family: monospace; }
 
 .proto-card { padding: 10px 16px; border-radius: 6px; margin: 2px 8px; }
-.proto-card.proto-selected, .proto-slim.proto-selected { background-color: rgba(255, 255, 255, 0.09); }
+.proto-card.proto-selected, .proto-slim.proto-selected { background-color: #343745; }
 .proto-card.proto-recede { opacity: 0.62; }
 
-label { color: #c8ccd4; }
-label.proto-repo { color: #8a8f9a; font-size: 13px; font-family: monospace; }
-label.proto-title { color: #d8dce4; font-size: 16px; }
-label.proto-title-unread { color: #ffffff; font-weight: bold; }
-label.proto-branch { color: #6a6f7a; font-size: 13px; font-family: monospace; }
-label.proto-host { color: #7aa2f7; font-size: 13px; }
-label.proto-harness { color: #8a8f9a; font-size: 14px; }
-label.proto-jump { color: #565b66; font-size: 12px; font-family: monospace; }
-label.proto-debug { color: #565b66; font-size: 11px; font-family: monospace; }
+label { color: #d9d5df; }
+label.proto-repo { color: #8b888f; font-size: 13px; font-family: monospace; }
+label.proto-title { color: #e5e0e9; font-size: 16px; }
+label.proto-title-unread { color: #f7f1ff; font-weight: bold; }
+label.proto-branch { color: #69676c; font-size: 13px; font-family: monospace; }
+label.proto-host { color: #5ad4e6; font-size: 13px; }
+label.proto-harness { color: #948ae3; font-size: 14px; }
+label.proto-jump { color: #69676c; font-size: 12px; font-family: monospace; }
+label.proto-debug { color: #69676c; font-size: 11px; font-family: monospace; }
 
-/* Colorblind-safe status hues: orange=act-now, blue family=info/motion,
-   magenta=failed, brightness+check=done. No red/green pairs. */
-label.proto-approval { color: #ff9e3b; font-size: 13px; font-weight: bold; }
-label.proto-input { color: #7aa2f7; font-size: 13px; font-weight: bold; }
-label.proto-working { color: #7dcfff; font-size: 13px; font-family: monospace; }
-label.proto-failed { color: #d27ce0; font-size: 13px; font-weight: bold; }
-label.proto-done { color: #ffffff; font-size: 13px; font-weight: bold; }
-label.proto-time { color: #6a6f7a; font-size: 13px; font-family: monospace; }
+/* Spectrum status hues remain structurally distinct: orange=act-now,
+   purple=input, cyan=motion, pink=failed, brightness+check=done. */
+label.proto-approval { color: #fc9867; font-size: 13px; font-weight: bold; }
+label.proto-input { color: #948ae3; font-size: 13px; font-weight: bold; }
+label.proto-working { color: #5ad4e6; font-size: 13px; font-family: monospace; }
+label.proto-failed { color: #fc618d; font-size: 13px; font-weight: bold; }
+label.proto-done { color: #f7f1ff; font-size: 13px; font-weight: bold; }
+label.proto-time { color: #69676c; font-size: 13px; font-family: monospace; }
 
 .proto-shelf { padding: 12px 16px 5px 16px; }
-label.proto-shelf-title { color: #6a6f7a; font-size: 13px; font-family: monospace; }
-separator.proto-shelf-rule { background-color: rgba(255, 255, 255, 0.08); min-height: 1px; }
+label.proto-shelf-title { color: #69676c; font-size: 13px; font-family: monospace; }
+separator.proto-shelf-rule { background-color: rgba(105, 103, 108, 0.28); min-height: 1px; }
 .proto-slim { padding: 7px 16px; margin: 0px 8px; border-radius: 6px; }
-label.proto-slim-title { color: #8a8f9a; font-size: 14px; }
-.proto-ghost label.proto-slim-title { color: #565b66; font-style: italic; }
+label.proto-slim-title { color: #8b888f; font-size: 14px; }
+.proto-ghost label.proto-slim-title { color: #69676c; font-style: italic; }
 
-label.proto-footer { color: #8a8f9a; font-size: 12px; font-family: monospace; padding: 5px 16px; }
-label.proto-help { color: #565b66; font-size: 11px; font-family: monospace; padding: 0px 16px 12px 16px; }
+label.proto-footer { color: #8b888f; font-size: 12px; font-family: monospace; padding: 5px 16px; }
+label.proto-help { color: #69676c; font-size: 11px; font-family: monospace; padding: 0px 16px 12px 16px; }
 ";
 
 /// Live summon: the sidebar's exclusive keyboard grab makes niri treat "no
