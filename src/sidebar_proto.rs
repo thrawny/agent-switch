@@ -463,7 +463,7 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
         hint.add_css_class("proto-jump");
         line1.append(&hint);
     }
-    let repo_text = if global {
+    let repo_text = if global && thread.area != thread.repo {
         format!("{} · {}", thread.area, thread.repo)
     } else {
         thread.repo.to_string()
