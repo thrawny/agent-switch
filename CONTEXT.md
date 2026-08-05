@@ -30,6 +30,8 @@ Glossary for the thread/mission-control domain. Terms are added as they are reso
 
 **Read marker** — the single stored `last_read_at` per thread. Advances on summon or opening the thread's detail; viewing a list never advances it. A working thread cannot be unread; only finished work demands reading.
 
+**Thread title** — the stable human-facing name. An explicit sidebar rename owns it; otherwise a one-shot automatic title generated from the next prompt owns it. Owned titles propagate into harnesses that support names and survive session succession. A harness session name and then live window/repo text are fallbacks only; they never overwrite an owned title.
+
 **Sidebar** — the summoned surface: toggled into view on demand, never persistently visible. It shows all areas by default and can narrow to the focused area; it carries the thread verbs. Rows sit in static creation order (newest first); activity never reorders the list — attention is expressed by brightness and a trailing status label, and the screen only moves at lifecycle transitions. (Decided in ticket 06, 2026-08-04 and refined by live feel test.)
 
 **Registry** — the durable record of every thread: identity, manifest, lifecycle, read marker. The single source of durable truth — every other thread fact is derived, never reconciled. Each thread's record is owned by exactly one host; other hosts only read it, and a verb aimed at a remote thread travels to the owning host. (Decided in ticket 04, 2026-08-04.)

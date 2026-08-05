@@ -19,7 +19,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+
+use wait_timeout::ChildExt;
 
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -52,6 +55,13 @@ pub struct LiveThread {
     /// True once the user renamed the thread (r): the title is theirs and
     /// harness-provided session names stop updating it.
     pub renamed: bool,
+    /// A generated first-prompt title has the same ownership behavior as a
+    /// manual rename, but stays distinguishable for future policy changes.
+    pub auto_named: bool,
+    /// Fingerprint of the latest prompt observed for one-shot generation.
+    pub auto_title_prompt_hash: u64,
+    /// Current producer explicitly supplied a harness session name.
+    pub harness_named: bool,
 }
 
 impl LiveThread {
@@ -64,6 +74,16 @@ pub struct LiveWorld {
     threads: Vec<LiveThread>,
     next_seq: u64,
     branch_cache: HashMap<String, (Instant, String)>,
+    auto_title_tx: Sender<AutoTitleResult>,
+    auto_title_rx: Receiver<AutoTitleResult>,
+    auto_title_jobs: HashSet<u64>,
+    initializing: bool,
+}
+
+struct AutoTitleResult {
+    seq: u64,
+    harness_session_id: String,
+    result: Result<String, String>,
 }
 
 /// Persisted slice of a thread — what the sidecar registry keeps so identity,
@@ -86,6 +106,10 @@ struct ProtoRecord {
     archived_at: Option<f64>,
     #[serde(default)]
     renamed: bool,
+    #[serde(default)]
+    auto_named: bool,
+    #[serde(default)]
+    auto_title_prompt_hash: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -277,6 +301,223 @@ fn stable_window_title(title: &str) -> String {
     }
 }
 
+fn title_prompt(message: &str) -> String {
+    let message: String = message.chars().take(8_000).collect();
+    [
+        "You write concise thread titles for coding conversations.",
+        "Return only the title, with no JSON, quotes, or explanation.",
+        "Rules:",
+        "- Title should summarize the user's request, not restate it verbatim.",
+        "- Keep it short and specific (3-8 words).",
+        "- Avoid quotes, filler, prefixes, and trailing punctuation.",
+        "",
+        "User message:",
+        &message,
+    ]
+    .join("\n")
+}
+
+fn sanitize_auto_title(raw: &str) -> Option<String> {
+    let first = raw.lines().next()?.trim();
+    let title = first
+        .trim_matches(|c| matches!(c, '\'' | '"' | '`'))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    if title.chars().count() <= 50 {
+        return Some(title);
+    }
+    let shortened: String = title.chars().take(47).collect();
+    Some(format!("{}...", shortened.trim_end()))
+}
+
+fn prompt_hash(prompt: &str) -> u64 {
+    // Stable FNV-1a: persisted sidecars must not depend on randomized hash keys.
+    prompt
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn text_from_content(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    let text = value
+        .as_array()?
+        .iter()
+        .filter(|entry| entry.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .filter_map(|entry| entry.get("text").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn latest_prompt_from_jsonl(harness: &str, jsonl: &str) -> Option<String> {
+    for line in jsonl.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let prompt = match harness {
+            "claude" if value.get("type").and_then(|v| v.as_str()) == Some("last-prompt") => {
+                value.get("lastPrompt").and_then(text_from_content)
+            }
+            "pi" if value.get("type").and_then(|v| v.as_str()) == Some("message")
+                && value.pointer("/message/role").and_then(|v| v.as_str()) == Some("user") =>
+            {
+                value
+                    .pointer("/message/content")
+                    .and_then(text_from_content)
+            }
+            "codex"
+                if value.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+                    && value.pointer("/payload/type").and_then(|v| v.as_str())
+                        == Some("user_message") =>
+            {
+                value
+                    .pointer("/payload/message")
+                    .and_then(text_from_content)
+            }
+            _ => None,
+        };
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            return Some(prompt);
+        }
+    }
+    None
+}
+
+fn latest_transcript_prompt(harness: &str, path: &str) -> Option<String> {
+    let output = Command::new("tail")
+        .args(["-n", "500", path])
+        .output()
+        .ok()?
+        .stdout;
+    latest_prompt_from_jsonl(harness, &String::from_utf8_lossy(&output))
+}
+
+fn run_title_process(command: &mut Command) -> Result<std::process::Output, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    match child
+        .wait_timeout(Duration::from_secs(90))
+        .map_err(|err| err.to_string())?
+    {
+        Some(_) => child.wait_with_output().map_err(|err| err.to_string()),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err("title generation timed out after 90s".into())
+        }
+    }
+}
+
+fn generate_auto_title(
+    harness: &str,
+    cwd: &str,
+    message: &str,
+    seq: u64,
+) -> Result<String, String> {
+    let prompt = title_prompt(message);
+    let mut cleanup_path = None;
+    let mut command = match harness {
+        "pi" => {
+            let mut command = Command::new("pi");
+            command.args([
+                "--print",
+                "--mode",
+                "text",
+                "--model",
+                "openai-codex/gpt-5.4-mini",
+                "--thinking",
+                "off",
+                "--no-session",
+                "--no-tools",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                &prompt,
+            ]);
+            command
+        }
+        "claude" => {
+            let mut command = Command::new("claude");
+            command.args([
+                "-p",
+                "--output-format",
+                "text",
+                "--model",
+                "claude-haiku-4-5",
+                "--no-session-persistence",
+                "--disable-slash-commands",
+                &prompt,
+            ]);
+            command
+        }
+        "codex" => {
+            let path = std::env::temp_dir().join(format!(
+                "agent-switch-title-{}-{seq}.txt",
+                std::process::id()
+            ));
+            let mut command = Command::new("codex");
+            command
+                .args([
+                    "exec",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--ignore-rules",
+                    "--ignore-user-config",
+                    "-s",
+                    "read-only",
+                    "--model",
+                    "gpt-5.6-luna",
+                    "--config",
+                    "model_reasoning_effort=\"low\"",
+                    "--output-last-message",
+                ])
+                .arg(&path)
+                .arg(&prompt);
+            cleanup_path = Some(path);
+            command
+        }
+        other => return Err(format!("no title generator for harness '{other}'")),
+    };
+    command.current_dir(cwd);
+
+    let output = run_title_process(&mut command);
+    let raw = match (&output, cleanup_path.as_ref()) {
+        (Ok(output), Some(path)) if output.status.success() => {
+            std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))
+        }
+        (Ok(output), _) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into())
+        }
+        (Ok(output), _) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if detail.is_empty() {
+                format!("title generator exited with {}", output.status)
+            } else {
+                detail
+            })
+        }
+        (Err(err), _) => Err(err.clone()),
+    };
+    if let Some(path) = cleanup_path {
+        let _ = std::fs::remove_file(path);
+    }
+    sanitize_auto_title(&raw?).ok_or_else(|| "title generator returned an empty title".into())
+}
+
 fn spawn_detached(program: &str, args: &[String]) -> Result<(), String> {
     Command::new(program)
         .args(args)
@@ -309,13 +550,19 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
 
 impl LiveWorld {
     pub fn new() -> Self {
+        let (auto_title_tx, auto_title_rx) = mpsc::channel();
         let mut world = Self {
             threads: Vec::new(),
             next_seq: 0,
             branch_cache: HashMap::new(),
+            auto_title_tx,
+            auto_title_rx,
+            auto_title_jobs: HashSet::new(),
+            initializing: true,
         };
         world.load_registry();
         world.refresh();
+        world.initializing = false;
         world
     }
 
@@ -356,6 +603,9 @@ impl LiveWorld {
                 settled_at: r.settled_at,
                 archived_at: r.archived_at,
                 renamed: r.renamed,
+                auto_named: r.auto_named,
+                auto_title_prompt_hash: r.auto_title_prompt_hash,
+                harness_named: false,
             });
         }
     }
@@ -378,6 +628,8 @@ impl LiveWorld {
                 settled_at: t.settled_at,
                 archived_at: t.archived_at,
                 renamed: t.renamed,
+                auto_named: t.auto_named,
+                auto_title_prompt_hash: t.auto_title_prompt_hash,
             })
             .collect();
         if let Ok(json) = serde_json::to_string_pretty(&records)
@@ -495,11 +747,97 @@ impl LiveWorld {
         branch
     }
 
+    fn apply_auto_title_results(&mut self) {
+        while let Ok(completion) = self.auto_title_rx.try_recv() {
+            self.auto_title_jobs.remove(&completion.seq);
+            let Some(thread) = self.get_mut(completion.seq) else {
+                continue;
+            };
+            if thread.harness_session_id != completion.harness_session_id
+                || thread.renamed
+                || thread.auto_named
+            {
+                continue;
+            }
+            match completion.result {
+                Ok(title) => {
+                    thread.title = title;
+                    thread.auto_named = true;
+                    thread.harness_named = true;
+                    let propagated = propagate_rename(thread).unwrap_or("sidebar only");
+                    info!(
+                        "auto-title: '{}' (#{} via {}, → {propagated})",
+                        thread.title, thread.seq, thread.harness
+                    );
+                }
+                Err(err) => warn!(
+                    "auto-title: generation failed for '{}' (#{} via {}): {err}",
+                    thread.title, thread.seq, thread.harness
+                ),
+            }
+        }
+    }
+
+    fn schedule_auto_titles(&mut self) {
+        let candidates: Vec<_> = self
+            .threads
+            .iter()
+            .filter(|thread| {
+                thread.archived_at.is_none()
+                    && !thread.renamed
+                    && !thread.auto_named
+                    && !thread.harness_named
+                    && !self.auto_title_jobs.contains(&thread.seq)
+            })
+            .filter_map(|thread| {
+                Some((
+                    thread.seq,
+                    thread.harness_session_id.clone(),
+                    thread.harness.clone(),
+                    thread.cwd.clone()?,
+                    thread.transcript_path.clone()?,
+                    thread.auto_title_prompt_hash,
+                ))
+            })
+            .collect();
+
+        for (seq, harness_session_id, harness, cwd, transcript_path, previous_hash) in candidates {
+            let Some(prompt) = latest_transcript_prompt(&harness, &transcript_path) else {
+                continue;
+            };
+            let hash = prompt_hash(&prompt);
+            if hash == previous_hash {
+                continue;
+            }
+            if let Some(thread) = self.get_mut(seq) {
+                thread.auto_title_prompt_hash = hash;
+            }
+            // Sidecars written before auto-title existed establish their
+            // baseline on startup; they are named from the next prompt, not
+            // retroactively from an old transcript.
+            if self.initializing && previous_hash == 0 {
+                continue;
+            }
+
+            self.auto_title_jobs.insert(seq);
+            let tx = self.auto_title_tx.clone();
+            std::thread::spawn(move || {
+                let result = generate_auto_title(&harness, &cwd, &prompt, seq);
+                let _ = tx.send(AutoTitleResult {
+                    seq,
+                    harness_session_id,
+                    result,
+                });
+            });
+        }
+    }
+
     /// Re-join sessions.json + niri windows/workspaces + nirius scratchpad
     /// into the in-memory registry. Identity (seq) is stable across refreshes;
     /// a session that reappears under a new ppid suffix (resume) rebinds to
     /// its cold thread instead of minting a new one.
     pub fn refresh(&mut self) {
+        self.apply_auto_title_results();
         let mut store = match state::load_from_path(&state::state_file()) {
             Ok(store) => store,
             Err(_) => return,
@@ -649,15 +987,16 @@ impl LiveWorld {
                     // conversation's transcript has never seen the title, so
                     // re-assert it. Resume-rebinds (same bare id, same
                     // transcript) already carry it.
-                    if succeeded && t.renamed {
+                    if succeeded && (t.renamed || t.auto_named) {
                         propagate_rename(t);
                     }
                     t.branch = branch;
                     // Harness session names (pi --name, claude) are the
-                    // default title; a manual rename owns it forever. Heal
-                    // older Codex rows minted while its Braille spinner was
-                    // present in the terminal title.
-                    if !t.renamed {
+                    // default title; a manual or generated rename owns it
+                    // forever. Heal older Codex rows minted while its Braille
+                    // spinner was present in the terminal title.
+                    t.harness_named = session.session_name.is_some();
+                    if !t.renamed && !t.auto_named {
                         if let Some(name) = &session.session_name {
                             t.title = name.clone();
                         } else {
@@ -722,6 +1061,9 @@ impl LiveWorld {
                         settled_at: None,
                         archived_at: None,
                         renamed: false,
+                        auto_named: false,
+                        auto_title_prompt_hash: 0,
+                        harness_named: session.session_name.is_some(),
                     });
                 }
             }
@@ -764,6 +1106,7 @@ impl LiveWorld {
                 t.last_read_at = now;
             }
         }
+        self.schedule_auto_titles();
         self.save();
     }
 
@@ -1011,6 +1354,7 @@ impl LiveWorld {
         };
         t.title = title;
         t.renamed = true;
+        t.auto_named = false;
         let msg = match propagate_rename(t) {
             Some(harness) => format!("renamed to '{}' (→ {harness})", t.title),
             None => format!("renamed to '{}'", t.title),
@@ -1072,11 +1416,41 @@ pub fn focused_area() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::stable_window_title;
+    use super::{latest_prompt_from_jsonl, sanitize_auto_title, stable_window_title};
 
     #[test]
     fn stable_window_title_strips_codex_braille_spinner() {
         assert_eq!(stable_window_title("⠇ agent-switch"), "agent-switch");
         assert_eq!(stable_window_title("agent-switch"), "agent-switch");
+    }
+
+    #[test]
+    fn latest_prompt_reads_each_harness_transcript_shape() {
+        let pi = r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"pi ask"}]}}"#;
+        let claude = r#"{"type":"last-prompt","lastPrompt":"claude ask"}"#;
+        let codex =
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"codex ask"}}"#;
+
+        assert_eq!(
+            latest_prompt_from_jsonl("pi", pi).as_deref(),
+            Some("pi ask")
+        );
+        assert_eq!(
+            latest_prompt_from_jsonl("claude", claude).as_deref(),
+            Some("claude ask")
+        );
+        assert_eq!(
+            latest_prompt_from_jsonl("codex", codex).as_deref(),
+            Some("codex ask")
+        );
+    }
+
+    #[test]
+    fn auto_title_sanitization_matches_t3code_shape() {
+        assert_eq!(
+            sanitize_auto_title("  `Fix reconnect spinner`\nextra").as_deref(),
+            Some("Fix reconnect spinner")
+        );
+        assert_eq!(sanitize_auto_title("  "), None);
     }
 }

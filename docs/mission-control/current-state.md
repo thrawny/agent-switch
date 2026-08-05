@@ -15,7 +15,7 @@ Implemented feel-test behavior:
 - Park, summon/go-to, settle, archive, mark-read, rename, reorder, and minimal new-Pi-thread creation.
 - Thread succession: a new conversation taking over the same live window adopts the existing row instead of archive-plus-mint.
 - Cold resurrection through harness resume (`pi --session`, `claude --resume`, `codex resume`).
-- Manual titles persist and propagate to Pi (`setSessionName` through a drop-file watcher) and Claude (`custom-title` transcript append), including re-assertion after session succession.
+- Manual and automatic titles persist and propagate to Pi (`setSessionName` through a drop-file watcher) and Claude (`custom-title` transcript append), including re-assertion after session succession. Unnamed threads generate once from their next prompt using the same harness CLI with a deliberately cheap model: Pi via `openai-codex/gpt-5.4-mini`, Claude via Haiku 4.5, and Codex via Luna at low effort.
 - A Waybar snapshot refreshed while the sidebar is visible or hidden. Its headline shows the highest nonzero count only: literal unread Done, then Working, then open Idle. Settled and archived threads are excluded.
 
 ## Prototype storage and identity
@@ -57,7 +57,7 @@ The daemon also inspects transcript progress to clear answered permission/questi
 - Build the ticket-04 durable registry and migrate prototype sidecar behavior into it.
 - Define and build the real creation flow (project, harness, host, checkout/worktree).
 - Implement honest worktree reclaim/unarchive and future PR-assisted confirmation removal.
-- Finish harness-derived content policy (ticket 09): recap, latest ask, and live activity beyond session names.
+- Finish the remaining harness-derived content policy (ticket 09): recap and live activity beyond session/automatic names.
 - Implement the Mod+Shift+S jump-to-next action.
 - Resolve background-work/agent-hand-raise semantics so waiting on managed tasks is not mislabeled Idle.
 - Make cold resurrection honor the sandbox wrapper and direnv environment.

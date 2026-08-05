@@ -28,11 +28,14 @@ Discovered 2026-08-04 (ticket 08 prototype session), all in the Claude Code tran
 
 ## Current checkpoint (2026-08-05)
 
-One precedence slice is implemented:
+The stable-title precedence is implemented:
 
-1. A manual sidebar rename owns the stable title permanently.
-2. Otherwise a harness session name is preferred.
-3. Otherwise the live window title is used at discovery.
-4. Otherwise fall back to repo name.
+1. An explicit sidebar rename owns the title.
+2. Otherwise a one-shot title generated from the thread's next prompt owns it.
+3. Otherwise a harness session name is preferred.
+4. Otherwise the sanitized live window title is used at discovery.
+5. Otherwise fall back to repo name.
 
-Manual renames propagate back to Pi and Claude and are re-asserted when a new harness session succeeds to the same thread. Codex has no session-name concept. Claude `away_summary`, `ai-title`, and `last-prompt` are still not parsed for cards or tooltips, so the broader content-mapping question remains open.
+Automatic generation copies T3Code's 3–8-word title prompt and shells out asynchronously through the same harness, never its expensive model: Pi uses `openai-codex/gpt-5.4-mini`, Claude uses `claude-haiku-4-5`, and Codex uses `gpt-5.6-luna` at low effort. Existing threads establish a prompt baseline instead of being backfilled; the next new prompt triggers one attempt. Explicit harness names are preserved.
+
+Owned titles propagate back to Pi and Claude and are re-asserted when a new harness session succeeds to the same thread. Codex has no session-name concept. Claude `away_summary` and broader live-activity/recap content are still not parsed for cards or tooltips, so that content-mapping question remains open.
