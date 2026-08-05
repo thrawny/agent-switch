@@ -95,9 +95,30 @@ fn harness_glyph(harness: &str) -> &'static str {
     match harness {
         "pi" => "π",
         "claude" => "✳",
-        "codex" => "◆",
+        // Text fallback when the embedded OpenAI texture cannot be decoded.
+        "codex" => "✺",
         _ => "·",
     }
+}
+
+fn build_harness_icon(harness: &str) -> gtk4::Widget {
+    if harness == "codex" {
+        // OpenAI mark sourced from quotabar's LobeHub Icons asset (MIT),
+        // recolored to the sidebar's Monokai purple.
+        let bytes = gtk4::glib::Bytes::from_static(include_bytes!("../assets/openai.png"));
+        if let Ok(texture) = gtk4::gdk::Texture::from_bytes(&bytes) {
+            let image = gtk4::Image::from_paintable(Some(&texture));
+            image.set_pixel_size(14);
+            image.set_tooltip_text(Some("Codex"));
+            image.add_css_class("proto-harness-icon");
+            return image.upcast();
+        }
+    }
+
+    let label = Label::new(Some(harness_glyph(harness)));
+    label.add_css_class("proto-harness");
+    label.set_tooltip_text(Some(harness));
+    label.upcast()
 }
 
 fn rel_time(mins: u32) -> String {
@@ -514,9 +535,7 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
         host_label.add_css_class("proto-host");
         line3.append(&host_label);
     }
-    let harness = Label::new(Some(harness_glyph(&thread.harness)));
-    harness.add_css_class("proto-harness");
-    line3.append(&harness);
+    line3.append(&build_harness_icon(&thread.harness));
     card.append(&line3);
 
     // Line 4 (live only): diagnostics — seq · window id · harness session id.

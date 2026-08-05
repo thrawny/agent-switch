@@ -262,6 +262,21 @@ fn repo_name(cwd: &str) -> String {
         .unwrap_or_else(|| cwd.to_string())
 }
 
+/// Codex prefixes its live terminal title with an animated Braille spinner.
+/// That activity glyph is ephemeral display state, not part of a stable
+/// thread title (e.g. `⠇ agent-switch` should mint as `agent-switch`).
+fn stable_window_title(title: &str) -> String {
+    let title = title.trim();
+    let Some(first) = title.chars().next() else {
+        return String::new();
+    };
+    if ('\u{2800}'..='\u{28ff}').contains(&first) {
+        title[first.len_utf8()..].trim_start().to_string()
+    } else {
+        title.to_string()
+    }
+}
+
 fn spawn_detached(program: &str, args: &[String]) -> Result<(), String> {
     Command::new(program)
         .args(args)
@@ -634,11 +649,18 @@ impl LiveWorld {
                     }
                     t.branch = branch;
                     // Harness session names (pi --name, claude) are the
-                    // default title; a manual rename owns it forever.
-                    if !t.renamed
-                        && let Some(name) = &session.session_name
-                    {
-                        t.title = name.clone();
+                    // default title; a manual rename owns it forever. Heal
+                    // older Codex rows minted while its Braille spinner was
+                    // present in the terminal title.
+                    if !t.renamed {
+                        if let Some(name) = &session.session_name {
+                            t.title = name.clone();
+                        } else {
+                            let stable = stable_window_title(&t.title);
+                            if !stable.is_empty() {
+                                t.title = stable;
+                            }
+                        }
                     }
                     if let Some(area) = area {
                         t.area = area;
@@ -665,7 +687,12 @@ impl LiveWorld {
                     let title = session
                         .session_name
                         .clone()
-                        .or_else(|| window.and_then(|w| w.title.clone()))
+                        .or_else(|| {
+                            window
+                                .and_then(|w| w.title.as_deref())
+                                .map(stable_window_title)
+                                .filter(|title| !title.is_empty())
+                        })
                         .unwrap_or_else(|| repo.clone());
                     self.threads.push(LiveThread {
                         seq: self.next_seq,
@@ -1036,4 +1063,15 @@ pub fn focused_area() -> Option<String> {
         .into_iter()
         .find(|ws| ws.is_focused)
         .and_then(|ws| ws.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stable_window_title;
+
+    #[test]
+    fn stable_window_title_strips_codex_braille_spinner() {
+        assert_eq!(stable_window_title("⠇ agent-switch"), "agent-switch");
+        assert_eq!(stable_window_title("agent-switch"), "agent-switch");
+    }
 }
