@@ -753,19 +753,25 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
 
         match event.event {
             TrackEventKind::SessionStart => {
-                remove_other_session_bindings(store, agent, session_id, &window_key);
-                let session = state::Session {
-                    agent: agent.to_string(),
-                    session_id: session_id.to_string(),
-                    session_name: normalized_session_name(event.session_name.as_deref()),
-                    cwd: event.cwd.clone(),
-                    state: state::SessionState::Idle,
-                    state_updated: state::now(),
-                    waiting_reason: None,
-                    transcript_path: event.transcript_path.clone(),
-                    window: window_id,
-                };
-                store.sessions.insert(window_key, session);
+                if let Some(session) = state::find_by_session_id_mut(store, agent, session_id) {
+                    // SessionStart hooks re-fire on compaction, while the stored window binding
+                    // outlives whichever window is focused when the hook runs.
+                    update_session_metadata(session, event);
+                } else {
+                    remove_other_session_bindings(store, agent, session_id, &window_key);
+                    let session = state::Session {
+                        agent: agent.to_string(),
+                        session_id: session_id.to_string(),
+                        session_name: normalized_session_name(event.session_name.as_deref()),
+                        cwd: event.cwd.clone(),
+                        state: state::SessionState::Idle,
+                        state_updated: state::now(),
+                        waiting_reason: None,
+                        transcript_path: event.transcript_path.clone(),
+                        window: window_id,
+                    };
+                    store.sessions.insert(window_key, session);
+                }
             }
             TrackEventKind::SessionEnd => {
                 let key = store
@@ -1372,6 +1378,58 @@ mod tests {
             .expect("prompt-submit should backfill the actual niri window");
         assert_eq!(session.session_id, session_id);
         assert_eq!(session.window.niri_id.as_deref(), Some("47"));
+    }
+
+    #[test]
+    fn repeated_session_start_preserves_original_window_binding() {
+        let state_path = test_state_path("repeated-session-start-window-binding");
+        let session_id = "claude-session-1";
+
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::SessionStart,
+                session_id: session_id.to_string(),
+                session_name: None,
+                agent: Some("claude".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                transcript_path: None,
+                notification_type: None,
+                niri_id: Some("47".to_string()),
+            },
+            Some(47),
+            &state_path,
+        );
+
+        handle_track_event_at_path(
+            &TrackEvent {
+                event: TrackEventKind::SessionStart,
+                session_id: session_id.to_string(),
+                session_name: None,
+                agent: Some("claude".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                transcript_path: None,
+                notification_type: None,
+                niri_id: Some("56".to_string()),
+            },
+            Some(56),
+            &state_path,
+        );
+
+        let store =
+            state::load_from_path(&state_path).expect("state should load after session-start");
+        let matching_sessions = store
+            .sessions
+            .values()
+            .filter(|session| session.agent == "claude" && session.session_id == session_id)
+            .count();
+        let session = store
+            .sessions
+            .get("47")
+            .expect("session should remain at the original window");
+
+        assert_eq!(matching_sessions, 1);
+        assert_eq!(session.window.niri_id.as_deref(), Some("47"));
+        assert!(!store.sessions.contains_key("56"));
     }
 
     #[test]
