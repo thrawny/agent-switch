@@ -1308,14 +1308,17 @@ fn build_proto_ui(app: &Application, live: bool) {
     let mut tick: u64 = 0;
     gtk4::glib::timeout_add_local(Duration::from_secs(1), move || {
         tick += 1;
+        let mut s = state_for_timer.borrow_mut();
+        // The live process also owns the Waybar snapshot. Keep its join fresh
+        // while the sidebar is hidden; only the GTK rebuild is visibility-
+        // gated. LiveWorld::refresh writes the snapshot every other tick.
+        if s.live.is_some() && tick.is_multiple_of(2) {
+            s.live.as_mut().unwrap().refresh();
+        }
         if !window_for_timer.is_visible() {
             return gtk4::glib::ControlFlow::Continue;
         }
-        let mut s = state_for_timer.borrow_mut();
         if s.live.is_some() {
-            if tick.is_multiple_of(2) {
-                s.live.as_mut().unwrap().refresh();
-            }
             regen_live(&mut s);
             rebuild(
                 &list_for_timer,

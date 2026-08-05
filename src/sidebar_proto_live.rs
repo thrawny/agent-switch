@@ -88,8 +88,51 @@ struct ProtoRecord {
     renamed: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WaybarAttention {
+    Done,
+    Working,
+    Approval,
+    Input,
+    Idle,
+}
+
+impl WaybarAttention {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Done => "Done",
+            Self::Working => "Working",
+            Self::Approval => "Approval",
+            Self::Input => "Input",
+            Self::Idle => "Idle",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Done => "✓",
+            Self::Working => "⚙",
+            Self::Approval => "!",
+            Self::Input => "?",
+            Self::Idle => "○",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WaybarOutput {
+    text: String,
+    tooltip: String,
+    class: &'static str,
+    updated_at: f64,
+}
+
 fn registry_path() -> std::path::PathBuf {
     state::state_file().with_file_name("sidebar-proto-registry.json")
+}
+
+fn waybar_status_path() -> std::path::PathBuf {
+    state::state_file().with_file_name("sidebar-proto-waybar.json")
 }
 
 /// Go to the named area workspace. False when the area is unnamed ("other")
@@ -326,6 +369,90 @@ impl LiveWorld {
             && let Err(err) = std::fs::write(registry_path(), json)
         {
             warn!("proto registry save failed: {err}");
+        }
+        self.save_waybar_status();
+    }
+
+    fn waybar_attention(t: &LiveThread) -> Option<WaybarAttention> {
+        if t.archived_at.is_some() || t.settled_at.is_some() {
+            return None;
+        }
+        Some(match t.state {
+            SessionState::Responding => WaybarAttention::Working,
+            SessionState::Waiting => match t.waiting_reason {
+                Some(WaitingReason::PermissionPrompt) => WaybarAttention::Approval,
+                None if t.state_updated > t.last_read_at => WaybarAttention::Input,
+                None => WaybarAttention::Idle,
+            },
+            _ if t.state_updated > t.last_read_at => WaybarAttention::Done,
+            _ => WaybarAttention::Idle,
+        })
+    }
+
+    fn waybar_output(&self) -> WaybarOutput {
+        let mut rows: Vec<_> = self
+            .threads
+            .iter()
+            .filter_map(|thread| {
+                Self::waybar_attention(thread).map(|attention| (attention, thread))
+            })
+            .collect();
+        rows.sort_by_key(|(attention, thread)| (*attention, std::cmp::Reverse(thread.order)));
+
+        let count = |wanted| {
+            rows.iter()
+                .filter(|(attention, _)| *attention == wanted)
+                .count()
+        };
+        let done = count(WaybarAttention::Done);
+        let working = count(WaybarAttention::Working);
+        let idle = count(WaybarAttention::Idle);
+        let (text, class) = if done > 0 {
+            (format!("✓ {done}"), "done")
+        } else if working > 0 {
+            (format!("⚙ {working}"), "working")
+        } else if idle > 0 {
+            (format!("○ {idle}"), "idle")
+        } else {
+            (String::new(), "idle")
+        };
+        let tooltip = rows
+            .iter()
+            .map(|(attention, thread)| {
+                let repo = if thread.repo.is_empty() {
+                    "?"
+                } else {
+                    &thread.repo
+                };
+                format!(
+                    "{} {} · {} ({})",
+                    attention.glyph(),
+                    thread.title,
+                    repo,
+                    attention.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        WaybarOutput {
+            text,
+            tooltip,
+            class,
+            updated_at: state::now(),
+        }
+    }
+
+    fn save_waybar_status(&self) {
+        let path = waybar_status_path();
+        let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        let result = serde_json::to_vec(&self.waybar_output())
+            .map_err(std::io::Error::other)
+            .and_then(|json| std::fs::write(&temp, json))
+            .and_then(|()| std::fs::rename(&temp, &path));
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(temp);
+            warn!("proto waybar status save failed: {err}");
         }
     }
 
