@@ -2,7 +2,7 @@
 //
 // Question this answers (ticket 06 / docs/mission-control/issues/06-surface-content.md):
 // does the resolved sidebar design — t3code sidebar-v2 copied onto a GTK4 layer-shell
-// surface — actually feel right on niri? Temporary overlay on the left, static creation
+// surface — actually feel right on niri? Persistent dock on the left, static creation
 // order (activity never reorders), brightness-not-position attention, settled/archived
 // shelves, keyboard verbs.
 //
@@ -11,12 +11,13 @@
 // Live mode (`just demo-sidebar-live`, ticket 08's window-hosted leg): rows are real
 // agent sessions joined with niri windows via sidebar_proto_live::LiveWorld; Enter/p
 // act on the real desktop (focus, nirius scratchpad, cold resurrection via harness
-// resume), n spawns a new pi thread. Re-running the command toggles the sidebar,
-// so it can sit on a keybind.
+// resume), n spawns a new pi thread. By default the live sidebar stays visible and
+// reserves its width; re-running the command toggles keyboard command mode. Pass
+// --popup to restore the original transient overlay for quick A/B testing.
 //
 // Keys: j/k move · Shift+J/K reorder · 1-9 jump · Enter summon · s settle · p park
 //       a archive (confirm) · r rename · m toggle read · g area/global scope
-//       Tab settled shelf · z archived shelf · n new thread (live) · q/Esc quit
+//       Tab settled shelf · z archived shelf · n new thread (live) · q/Esc release
 
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, ScrolledWindow};
@@ -80,6 +81,8 @@ enum Scope {
 struct ProtoState {
     threads: Vec<ProtoThread>,
     live: Option<LiveWorld>,
+    /// Restore the original transient overlay behavior for A/B feel-testing.
+    popup: bool,
     scope: Scope,
     selected: Option<u64>,
     visible: Vec<u64>,
@@ -718,6 +721,9 @@ window { background-color: transparent; }
     background-color: rgba(31, 31, 31, 0.97);
     border-right: 1px solid rgba(105, 103, 108, 0.38);
 }
+window.proto-interactive .proto-outer {
+    border-right-color: rgba(148, 138, 227, 0.72);
+}
 .proto-header { padding: 14px 16px 10px 16px; }
 label.proto-scope { color: #fce566; font-size: 15px; font-weight: bold; font-family: monospace; }
 label.proto-agg-waiting { color: #fc9867; font-size: 13px; font-family: monospace; }
@@ -757,12 +763,30 @@ label.proto-footer { color: #8b888f; font-size: 12px; font-family: monospace; pa
 label.proto-help { color: #69676c; font-size: 11px; font-family: monospace; padding: 0px 16px 12px 16px; }
 ";
 
+fn set_interactive<W>(window: &W, interactive: bool)
+where
+    W: IsA<gtk4::Window> + IsA<gtk4::Widget>,
+{
+    if interactive {
+        window.add_css_class("proto-interactive");
+        window.set_keyboard_mode(KeyboardMode::Exclusive);
+        window.present();
+    } else {
+        window.remove_css_class("proto-interactive");
+        window.set_keyboard_mode(KeyboardMode::None);
+    }
+}
+
 /// Live summon: the sidebar's exclusive keyboard grab makes niri treat "no
 /// window" as focused, so focus changes only stick once the grab is gone.
-/// Dismiss first (Enter dismisses anyway per 06), let the unmap commit, then
-/// run the verb. Outcome goes to the log — the footer is hidden by then.
+/// Release command mode, let that layer-shell commit, then run the verb. The
+/// dock stays mapped and continues reserving its width.
 fn schedule_summon(state: Rc<RefCell<ProtoState>>, window: ApplicationWindow, seq: u64) {
-    window.set_visible(false);
+    if state.borrow().popup {
+        window.set_visible(false);
+    } else {
+        set_interactive(&window, false);
+    }
     gtk4::glib::timeout_add_local_once(Duration::from_millis(80), move || {
         if let Some(world) = state.borrow_mut().live.as_mut() {
             world.summon(seq);
@@ -790,7 +814,7 @@ fn schedule_park(
         .into_iter()
         .find(|ws| ws.is_focused)
         .map(|ws| ws.id);
-    window.set_keyboard_mode(KeyboardMode::None);
+    set_interactive(&window, false);
     gtk4::glib::timeout_add_local_once(Duration::from_millis(60), move || {
         let focused = crate::niri::focus_window(target);
         gtk4::glib::timeout_add_local_once(Duration::from_millis(90), move || {
@@ -809,7 +833,7 @@ fn schedule_park(
                     reference: niri_ipc::WorkspaceReferenceArg::Id(ws),
                 });
             }
-            window.set_keyboard_mode(KeyboardMode::Exclusive);
+            set_interactive(&window, true);
             let mut s = state.borrow_mut();
             s.message = msg;
             regen_live(&mut s);
@@ -818,7 +842,8 @@ fn schedule_park(
     });
 }
 
-fn build_proto_ui(app: &Application, live: bool) {
+fn build_proto_ui(app: &Application, live: bool, popup: bool) {
+    let docked = live && !popup;
     let window = ApplicationWindow::builder()
         .application(app)
         .default_width(SIDEBAR_WIDTH)
@@ -826,14 +851,17 @@ fn build_proto_ui(app: &Application, live: bool) {
 
     window.init_layer_shell();
     window.set_layer(Layer::Top);
-    window.set_keyboard_mode(KeyboardMode::Exclusive);
+    window.set_keyboard_mode(if docked {
+        KeyboardMode::None
+    } else {
+        KeyboardMode::Exclusive
+    });
     window.set_anchor(Edge::Left, true);
     window.set_anchor(Edge::Top, true);
     window.set_anchor(Edge::Bottom, true);
-    // Temporary workaround for niri retaining a stale horizontal viewport offset
-    // after a left exclusive zone disappears. Overlay instead of changing the
-    // compositor working area; opening and closing then leave window layout untouched.
-    window.set_exclusive_zone(0);
+    // Live mode is a Waybar-style dock: it stays mapped and removes its width
+    // from niri's usable area. Mock mode remains a transient overlay.
+    window.set_exclusive_zone(if docked { SIDEBAR_WIDTH } else { 0 });
     window.set_size_request(SIDEBAR_WIDTH, -1);
 
     let provider = gtk4::CssProvider::new();
@@ -868,6 +896,7 @@ fn build_proto_ui(app: &Application, live: bool) {
     let state = Rc::new(RefCell::new(ProtoState {
         threads,
         live: world,
+        popup,
         scope,
         selected: None,
         visible: Vec::new(),
@@ -902,9 +931,12 @@ fn build_proto_ui(app: &Application, live: bool) {
     footer.set_hexpand(true);
     footer.set_xalign(0.0);
     outer.append(&footer);
-    let help = Label::new(Some(
-        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · r rename · m read · n new · g scope · Tab/z shelves · q quit",
-    ));
+    let help_text = if docked {
+        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · r rename · m read · n new · g scope · Tab/z shelves · q release"
+    } else {
+        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · r rename · m read · n new · g scope · Tab/z shelves · q close"
+    };
+    let help = Label::new(Some(help_text));
     help.add_css_class("proto-help");
     help.set_halign(gtk4::Align::Start);
     help.set_wrap(true);
@@ -982,7 +1014,11 @@ fn build_proto_ui(app: &Application, live: bool) {
         match (ch, name.as_deref()) {
             (Some('q'), _) | (_, Some("escape")) => {
                 if s.live.is_some() {
-                    window_for_keys.set_visible(false);
+                    if s.popup {
+                        window_for_keys.set_visible(false);
+                    } else {
+                        set_interactive(&window_for_keys, false);
+                    }
                 } else {
                     window_for_keys.close();
                 }
@@ -1380,29 +1416,25 @@ fn build_proto_ui(app: &Application, live: bool) {
         rebuild(&list_for_map, &header_for_map, &footer_for_map, &mut s);
     });
 
-    if live {
-        // Realize the layer surface, then start hidden (daemon-style start in
-        // zmx); the first Mod+S summons it.
-        window.present();
+    window.present();
+    if live && popup {
         window.set_visible(false);
-    } else {
-        window.present();
     }
 }
 
-pub fn run(live: bool) -> gtk4::glib::ExitCode {
+pub fn run(live: bool, popup: bool) -> gtk4::glib::ExitCode {
     // Single-instance: re-invocations (e.g. the Mod+S bind) forward activation
-    // to the running instance, which toggles the sidebar's visibility — the
-    // window persists, only its mapping changes (the production overlay's
-    // pattern). In live mode the process is persistent (zmx-hosted, logs via
-    // `zmx history agent-switch-sidebar`) and starts hidden, daemon-style;
-    // mock mode shows immediately and exits on q/Esc.
+    // to the running instance. Live mode stays mapped as a passive dock and
+    // activation toggles its exclusive keyboard command mode; q/Esc releases
+    // the grab. Popup and mock modes retain the old visibility toggle.
     let app = Application::builder()
         .application_id("com.thrawny.agent-switch.sidebar-proto")
         .build();
     app.connect_activate(move |app| {
         if let Some(window) = app.windows().first() {
-            if window.is_visible() {
+            if live && !popup {
+                set_interactive(window, window.keyboard_mode() != KeyboardMode::Exclusive);
+            } else if window.is_visible() {
                 window.set_visible(false);
             } else {
                 window.present();
@@ -1412,7 +1444,7 @@ pub fn run(live: bool) -> gtk4::glib::ExitCode {
                 // Keep the process alive while the window is hidden.
                 std::mem::forget(app.hold());
             }
-            build_proto_ui(app, live);
+            build_proto_ui(app, live, popup);
         }
     });
     app.run_with_args::<&str>(&[])

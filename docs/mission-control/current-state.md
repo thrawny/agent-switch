@@ -4,7 +4,7 @@ Updated 2026-08-05. This is the implementation checkpoint; the issue documents r
 
 ## What is live
 
-A persistent GTK4 layer-shell sidebar runs from `target/debug/agent-switch demo-sidebar --live` under the `just watch` loop. Mod+S toggles it. It joins the existing hook-fed `sessions.json` cache with niri windows/workspaces, nirius scratchpad membership, transcript-derived state, and a prototype registry sidecar.
+A persistent GTK4 layer-shell sidebar runs from `target/debug/agent-switch demo-sidebar --live` under the `just watch` loop. It stays visible, reserves 480 px on the left like Waybar, and Mod+S toggles its exclusive keyboard command mode. `--popup` (or `just demo-sidebar-live popup`) restores the previous transient overlay for A/B testing. It joins the existing hook-fed `sessions.json` cache with niri windows/workspaces, nirius scratchpad membership, transcript-derived state, and a prototype registry sidecar.
 
 Implemented feel-test behavior:
 
@@ -39,7 +39,7 @@ The latest spatial rule is **threads never move**:
 - Cold thread → visit its area and spawn a harness resume there.
 - A named area with no workspace does not silently move the thread elsewhere.
 
-Parking hides a still-live window; it does not achieve the aspirational zero-window-at-rest model. The sidebar itself currently overlays with exclusive zone `0`, rather than changing niri's working area, because removing a left exclusive zone left stale horizontal viewport offsets during testing.
+Parking hides a still-live window; it does not achieve the aspirational zero-window-at-rest model. The default dock changes niri's working area with a 480 px exclusive zone. Removing that zone can leave a stale horizontal viewport offset; the user accepted that prototype trade-off because scrolling right clears it. Popup mode keeps exclusive zone `0`.
 
 Archive currently closes the runtime window and leaves a prototype tombstone. It does **not** reclaim a worktree. Settle parks the window and shelves the row. The designed 36-hour auto-settle and settled-runtime reaper are not implemented. Closing a thread outside the sidebar is treated as an explicit abandonment signal and auto-tombstones it once both window and producer session are gone.
 

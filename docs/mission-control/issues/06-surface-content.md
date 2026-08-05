@@ -3,7 +3,7 @@
 Type: grilling
 Status: resolved
 
-Reframed 2026-08-03 (surface pivot, see map): the picker is now a GTK layer-shell **sidebar** in agent-switch, toggled by Mod+S. The later live prototype uses a left overlay and global-default content; the Answer below records those superseding feel-test calls. Ticket 03 resolved the vocabulary (lifecycle, attention tiers, verbs); this ticket designs what the sidebar shows and how it behaves.
+Reframed 2026-08-03 (surface pivot, see map): the picker is now a GTK layer-shell **sidebar** in agent-switch. The live prototype now defaults to an always-visible left dock with global-default content; Mod+S toggles keyboard command mode. The Answer below records the evolving feel-test calls. Ticket 03 resolved the vocabulary (lifecycle, attention tiers, verbs); this ticket designs what the sidebar shows and how it behaves.
 
 ## Question
 
@@ -23,7 +23,7 @@ The user's call mid-grilling: **copy t3code's sidebar v2** (`~/code/t3code`, `ap
 
 ### Interaction model
 
-**Toggled-only.** Mod+S summons with an exclusive keyboard grab; Esc or Mod+S dismisses it. Always-visible dashboard rejected (permanent space cost; the glanceable role belongs to Waybar). The live prototype currently overlays on the left with exclusive zone `0`: changing and then removing a left exclusive zone left a stale horizontal niri viewport offset during testing. Because the sidebar is summoned, it *could* rank — but v2's ordering rule was adopted instead (below), which supersedes the earlier "attention tiers as sort key" sketch in this ticket's Question.
+**Always-visible dock, revised by feel test 2026-08-05.** The live sidebar reserves 480 px on the left. It is normally passive; Mod+S toggles an exclusive keyboard command mode, and Esc/q releases that grab without hiding the dock. The prior toggled overlay remains available through `--popup` or `just demo-sidebar-live popup` for immediate A/B testing. Removing a left exclusive zone can leave a stale horizontal niri viewport offset, but the user accepted that trial trade-off because scrolling right clears it. The stable v2 ordering rule remains unchanged.
 
 ### List structure (v2 copy)
 
@@ -63,7 +63,7 @@ The latest feel-test call is **global all-areas view by default** — all thread
 
 ### Waybar
 
-**Highest nonzero count only**, global across areas: literal unread Done (`✓ n`) first, then Working (`⚙ n`), then open Idle (`○ n`). Settled and archived threads are excluded. Approval/Input remain visible in the tooltip but do not get folded into the literal Done count. The persistent sidebar writes an atomic projection every two seconds even while hidden; the Waybar module reads that projection rather than recomputing from legacy `agent-switch list`. Click toggles the sidebar. Per-row detail remains in the sidebar/tooltip.
+**Highest nonzero count only**, global across areas: literal unread Done (`✓ n`) first, then Working (`⚙ n`), then open Idle (`○ n`). Settled and archived threads are excluded. Approval/Input remain visible in the tooltip but do not get folded into the literal Done count. The persistent sidebar writes an atomic projection every two seconds even while hidden; the Waybar module reads that projection rather than recomputing from legacy `agent-switch list`. Click toggles the dock's keyboard command mode (or popup visibility in popup mode). Per-row detail remains in the sidebar/tooltip.
 
 ### Jump-to-next-needing-me
 
@@ -79,4 +79,4 @@ Deferred. Sidebar verbs stay thread-scoped in v1; the registry stores the worksp
 
 ## Implementation checkpoint (2026-08-05)
 
-The live GTK prototype implements the toggled overlay, static rows, active/settled/archived sections, attention rendering, Monokai Spectrum palette, global/area scope toggle, keyboard verbs, inline rename, and Waybar projection. Shelf pagination, hover action buttons, right-click menus, PR/diff seams, host support, and Mod+Shift+S jump-to-next are not implemented. Diagnostic row content and the 480px width are temporary feel-test instrumentation.
+The live GTK prototype implements the persistent dock plus optional popup mode, static rows, active/settled/archived sections, attention rendering, Monokai Spectrum palette, global/area scope toggle, keyboard verbs, inline rename, and Waybar projection. Shelf pagination, hover action buttons, right-click menus, PR/diff seams, host support, and Mod+Shift+S jump-to-next are not implemented. Diagnostic row content and the 480px width are temporary feel-test instrumentation.

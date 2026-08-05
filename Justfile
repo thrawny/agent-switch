@@ -54,14 +54,15 @@ demo theme="":
 demo-sidebar:
     cargo run -- demo-sidebar
 
-# PROTOTYPE: ticket-08 live sidebar daemon in zmx; Mod+S toggles it.
-# `just watch` runs this under the same build-stamp restart loop — use this
-# recipe only to (re)start the sidebar without the full watch stack.
+# PROTOTYPE: ticket-08 live sidebar daemon in zmx. Default is the persistent
+# dock; `just demo-sidebar-live popup` restores the transient overlay for A/B.
+# `just watch` runs the dock under the same build-stamp restart loop — use this
+# recipe only to switch/restart the sidebar without the full watch stack.
 # Logs: zmx history agent-switch-sidebar
-demo-sidebar-live:
+demo-sidebar-live mode="dock":
     cargo build
     -zmx kill agent-switch-sidebar
-    zmx run agent-switch-sidebar -d watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch demo-sidebar --live
+    zmx run agent-switch-sidebar -d watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch demo-sidebar --live {{ if mode == "popup" { "--popup" } else { "" } }}
 
 # Format code
 fmt:
