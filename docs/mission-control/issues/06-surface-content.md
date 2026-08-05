@@ -31,7 +31,7 @@ Flat per-area inbox, no grouping. Sections in order:
 
 1. **Active cards** — every live thread is a full 3-line card (~78px). **Static creation order, newest first; activity NEVER reorders the list — the screen only moves at lifecycle transitions.** (This revised an initial tier-sort decision during grilling; the tier order survives only in the jump bind and waybar aggregation.)
 2. **`Settled (n)` shelf** — expanded by default, slim dim one-line rows (36px), sorted by settle-recency, paged: 10 initially + `Show 25 more`. Collapsed state hides all settled rows except the currently open thread (never hide the open thread — carried constraint).
-3. **`Archived (n)` shelf** — collapsed by default, ghost rows with unarchive and permanent sidebar-delete actions. Deviation from v2 (which hides archived entirely): our archive is a sidebar verb, so its undo stays discoverable in the same surface. `d` twice hides the tombstone permanently while retaining an internal suppression record.
+3. **`Archived (n)` shelf** — collapsed by default, ghost rows with unarchive and permanent sidebar-delete actions. Deviation from v2 (which hides archived entirely): our archive is a sidebar verb, so its undo stays discoverable in the same surface. `d` twice hides one tombstone permanently while retaining an internal suppression record; `D` twice deletes all archived rows across all areas.
 
 **Snooze: deferred to v2 of the glue.** v2's snooze/wake/woke (hide until time T, hand-raise wakes early, `Woke` pill since static order won't surface it) is a good concept but adds a stored field, a daemon wake timer, and a fourth verb. Reserve a `snoozedUntil` schema seam (→ ticket 04) and the shelf slot in the layout; no verb in v1.
 
@@ -55,7 +55,7 @@ Unread semantics from v2 confirmed: never-visited counts as read; visiting/summo
 
 ### Keyboard scheme (exclusive grab makes the sidebar keyboard-first)
 
-`j/k` or arrows navigate; `1–9` jump to Nth visible row (v2's ⌘1–9, modifier-free); `Enter` = summon/go-to selected and release command mode; `s` = settle/un-settle; `p` = park; `a` = archive/unarchive (archive confirms); `d` twice = permanently hide an archived tombstone; `r` = inline rename; `n` = new thread (creation flow itself is a separate unspecified ticket); `Tab` = cycle shelf expand/collapse; `Esc` dismisses. Mouse hover actions + right-click context menu copied from v2. No type-to-filter in v1 (per-area lists are short; a palette can land later). **Dropped from v2**: multi-select/bulk verbs (GTK cost, short lists). Delete was later restored for archived rows only; it hides the row and its resurrection affordance but does not delete harness files.
+`j/k` or arrows navigate; `1–9` jump to Nth visible row (v2's ⌘1–9, modifier-free); `Enter` = summon/go-to selected and release command mode; `s` = settle/un-settle; `p` = park; `a` = archive/unarchive (archive confirms); `d` twice = permanently hide an archived tombstone; `D` twice = hide all archived tombstones globally; `r` = inline rename; `n` = new thread (creation flow itself is a separate unspecified ticket); `Tab` = cycle shelf expand/collapse; `Esc` dismisses. Mouse hover actions + right-click context menu copied from v2. No type-to-filter in v1 (per-area lists are short; a palette can land later). **Dropped from v2**: multi-select/bulk verbs (GTK cost, short lists). Delete was later restored for archived rows only; it hides the row and its resurrection affordance but does not delete harness files.
 
 ### Per-workspace illusion
 

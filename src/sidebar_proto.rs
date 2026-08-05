@@ -16,8 +16,9 @@
 // --popup to restore the original transient overlay for quick A/B testing.
 //
 // Keys: j/k move · Shift+J/K reorder · 1-9 jump · Enter summon · s settle · p park
-//       a archive (confirm) · d delete archived (confirm) · r rename · m toggle read
-//       g area/global scope · Tab settled shelf · z archived shelf · n new thread
+//       a archive (confirm) · d delete archived (confirm) · D delete all archived
+//       (confirm) · r rename · m toggle read · g area/global scope · Tab settled
+//       shelf · z archived shelf · n new thread
 //       (live) · q/Esc release
 
 use gtk4::prelude::*;
@@ -91,6 +92,7 @@ struct ProtoState {
     archived_expanded: bool,
     confirm_archive: Option<u64>,
     confirm_delete: Option<u64>,
+    confirm_delete_all: bool,
     /// Some(buffer) while typing a new title for the selected row (`r`).
     rename_buffer: Option<String>,
     message: String,
@@ -917,6 +919,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
         archived_expanded: false,
         confirm_archive: None,
         confirm_delete: None,
+        confirm_delete_all: false,
         rename_buffer: None,
         message,
     }));
@@ -946,9 +949,9 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
     footer.set_xalign(0.0);
     outer.append(&footer);
     let help_text = if docked {
-        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · d delete archived · r rename · m read · n new · g scope · Tab/z shelves · q release"
+        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · d delete archived · D delete all archived · r rename · m read · n new · g scope · Tab/z shelves · q release"
     } else {
-        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · d delete archived · r rename · m read · n new · g scope · Tab/z shelves · q close"
+        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · d delete archived · D delete all archived · r rename · m read · n new · g scope · Tab/z shelves · q close"
     };
     let help = Label::new(Some(help_text));
     help.add_css_class("proto-help");
@@ -981,6 +984,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
         // Any different key disarms the destructive double-press confirms.
         let confirm_archive = s.confirm_archive.take();
         let confirm_delete = s.confirm_delete.take();
+        let confirm_delete_all = std::mem::take(&mut s.confirm_delete_all);
 
         // Rename mode captures every key until commit/cancel.
         if s.rename_buffer.is_some() {
@@ -1314,6 +1318,27 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
                     _ => s.message = "delete only applies to archived threads".into(),
                 }
             }
+            (Some('D'), _) => {
+                let count = s
+                    .threads
+                    .iter()
+                    .filter(|t| t.lifecycle == Lifecycle::Archived)
+                    .count();
+                if count == 0 {
+                    s.message = "no archived threads to delete".into();
+                } else if confirm_delete_all {
+                    if let Some(world) = s.live.as_mut() {
+                        s.message = world.delete_all_archived();
+                    } else {
+                        s.threads.retain(|t| t.lifecycle != Lifecycle::Archived);
+                        s.message = format!("deleted all {count} archived threads");
+                    }
+                } else {
+                    s.confirm_delete_all = true;
+                    s.message =
+                        format!("delete all {count} archived threads permanently — press D again");
+                }
+            }
             (Some('m'), _) => {
                 if s.live.is_some() {
                     if let Some(id) = s.selected {
@@ -1462,6 +1487,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
         let mut s = state_for_map.borrow_mut();
         s.confirm_archive = None;
         s.confirm_delete = None;
+        s.confirm_delete_all = false;
         if s.live.is_some() {
             s.live.as_mut().unwrap().refresh();
             s.scope = Scope::Global;

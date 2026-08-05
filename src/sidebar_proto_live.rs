@@ -1367,6 +1367,27 @@ impl LiveWorld {
         format!("deleted '{title}' from the sidebar")
     }
 
+    pub fn delete_all_archived(&mut self) -> String {
+        let now = state::now();
+        let mut deleted_seqs = Vec::new();
+        for thread in &mut self.threads {
+            if thread.deleted_at.is_none() && thread.archived_at.is_some() {
+                thread.deleted_at = Some(now);
+                deleted_seqs.push(thread.seq);
+            }
+        }
+        if deleted_seqs.is_empty() {
+            return "no archived threads to delete".into();
+        }
+        for seq in &deleted_seqs {
+            self.auto_title_jobs.remove(seq);
+        }
+        let count = deleted_seqs.len();
+        info!("delete: hiding all {count} archived sidebar tombstones");
+        self.save();
+        format!("deleted all {count} archived threads from the sidebar")
+    }
+
     pub fn toggle_read(&mut self, seq: u64) -> String {
         let now = state::now();
         let Some(t) = self.get_mut(seq) else {

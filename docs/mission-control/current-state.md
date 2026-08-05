@@ -41,7 +41,7 @@ The latest spatial rule is **threads never move**:
 
 Parking hides a still-live window; it does not achieve the aspirational zero-window-at-rest model. The default dock changes niri's working area with a 480 px exclusive zone. Removing that zone can leave a stale horizontal viewport offset; the user accepted that prototype trade-off because scrolling right clears it. Popup mode keeps exclusive zone `0`.
 
-Archive currently closes the runtime window and leaves a prototype tombstone. On an archived row, `d` twice permanently removes it from the UI; a hidden `deleted_at` suppression tombstone remains so stale producer state cannot rediscover it. This sidebar delete does not remove transcripts or other files. Archive does **not** reclaim a worktree. Settle parks the window and shelves the row. The designed 36-hour auto-settle and settled-runtime reaper are not implemented. Closing a thread outside the sidebar is treated as an explicit abandonment signal and auto-tombstones it once both window and producer session are gone.
+Archive currently closes the runtime window and leaves a prototype tombstone. On an archived row, `d` twice permanently removes it from the UI; `D` twice does the same for every archived thread across all areas. A hidden `deleted_at` suppression tombstone remains so stale producer state cannot rediscover it. This sidebar delete does not remove transcripts or other files. Archive does **not** reclaim a worktree. Settle parks the window and shelves the row. The designed 36-hour auto-settle and settled-runtime reaper are not implemented. Closing a thread outside the sidebar is treated as an explicit abandonment signal and auto-tombstones it once both window and producer session are gone.
 
 ## Producers today
 
