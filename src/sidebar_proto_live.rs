@@ -133,6 +133,57 @@ fn bare_session_id(id: &str) -> &str {
     }
 }
 
+/// Push a sidebar rename down to the harness so its own session picker shows
+/// the same name. Pi: drop the name in the renames dir — the agent-switch pi
+/// extension watches it and applies `pi.setSessionName`; a cold session picks
+/// it up on its next session-start (resume). Claude: append a `custom-title`
+/// entry to the transcript JSONL — the same append the SDK's renameSession()
+/// and /rename make (verified 2026-08-05); the resume picker reads the last
+/// one. Codex has no session-name concept. Returns the harness name on
+/// successful hand-off, None when there is no rename path.
+fn propagate_rename(t: &LiveThread) -> Option<&'static str> {
+    match t.harness.as_str() {
+        "pi" => {
+            let dir = state::state_file().with_file_name("renames");
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                warn!("rename propagate: create {}: {err}", dir.display());
+                return None;
+            }
+            let path = dir.join(bare_session_id(&t.harness_session_id));
+            match std::fs::write(&path, &t.title) {
+                Ok(()) => Some("pi"),
+                Err(err) => {
+                    warn!("rename propagate: write {}: {err}", path.display());
+                    None
+                }
+            }
+        }
+        "claude" => {
+            use std::io::Write;
+            let path = t.transcript_path.as_ref()?;
+            let entry = serde_json::json!({
+                "type": "custom-title",
+                "customTitle": t.title,
+                "sessionId": bare_session_id(&t.harness_session_id),
+            });
+            // O_APPEND keeps the single-line write atomic alongside the
+            // harness's own appends.
+            let result = std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|mut f| writeln!(f, "{entry}"));
+            match result {
+                Ok(()) => Some("claude"),
+                Err(err) => {
+                    warn!("rename propagate: append {path}: {err}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn scratchpad_window_ids() -> HashSet<u64> {
     let output = Command::new("nirius").arg("list-scratchpad").output();
     let Ok(output) = output else {
@@ -792,7 +843,10 @@ impl LiveWorld {
         };
         t.title = title;
         t.renamed = true;
-        let msg = format!("renamed to '{}'", t.title);
+        let msg = match propagate_rename(t) {
+            Some(harness) => format!("renamed to '{}' (→ {harness})", t.title),
+            None => format!("renamed to '{}'", t.title),
+        };
         self.save();
         msg
     }
