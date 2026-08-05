@@ -25,3 +25,14 @@ Discovered 2026-08-04 (ticket 08 prototype session), all in the Claude Code tran
 
 - 04: registry stores identity + manifest; derived content is never persisted (re-derivable from transcript at read time).
 - 02: titles are display-only; identity stays window/session-keyed.
+
+## Current checkpoint (2026-08-05)
+
+One precedence slice is implemented:
+
+1. A manual sidebar rename owns the stable title permanently.
+2. Otherwise a harness session name is preferred.
+3. Otherwise the live window title is used at discovery.
+4. Otherwise fall back to repo name.
+
+Manual renames propagate back to Pi and Claude and are re-asserted when a new harness session succeeds to the same thread. Codex has no session-name concept. Claude `away_summary`, `ai-title`, and `last-prompt` are still not parsed for cards or tooltips, so the broader content-mapping question remains open.

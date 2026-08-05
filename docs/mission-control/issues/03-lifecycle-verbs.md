@@ -38,12 +38,12 @@ Full vocabulary lives in `CONTEXT.md` at the repo root. The model:
 
 1. **Visibility** (derived from compositor/host facts, never stored): summoned / parked. Park and summon are spatial verbs; "park as a lifecycle state" was an artifact of the fzf prototype.
 2. **Lifecycle** (stored in registry): live → settled → archived (tombstone).
-3. **Attention** (derived, fused Codex-style): Needs input > Unread > Working > Idle, from hook-authored status + one stored `last_read_at` (advances on summon/peek, never on list viewing). A working thread can never be unread.
+3. **Attention** (derived, fused Codex-style; refined by ticket 06): Approval > Input > Working > Failed > Unread/Done > Idle, from producer-authored status + one stored `last_read_at` (advances on summon/open, never on list viewing). A working thread can never be unread.
 
 **Verb contracts** (substrate-independent — the zmx-vs-window question was flagged as unvalidated design fiction and spun out to [08](08-thread-runtime-substrate.md)):
 
 - **park** — hide windows. Destroys nothing.
-- **summon** — bring the thread here: show windows if the runtime is warm, resurrect from the registry manifest + harness resume if cold. Clears settled, marks read. Resurrection is always lazy (through summon), never bulk-at-boot. Liveness is host-relative: remote ssh+zmx runtimes survive a laptop reboot.
+- **summon** — engage the thread without relocating it: focus a visible runtime, visit the thread's area and show a parked runtime there, or visit its area and resurrect from the registry manifest + harness resume if cold. Clears settled, marks read. Resurrection is always lazy (through summon), never bulk-at-boot. Liveness is host-relative: remote ssh+zmx runtimes may survive a laptop reboot.
 - **settle** — registry bit + hide. Promises **recoverability, not warmth**: worktree/registry/conversation kept, runtime may be cooled later by an internal reaper. Destruction gradient: park (nothing) → settle (warmth may lapse) → archive (state reclaimed).
 - **archive** — terminate runtime, reclaim worktree (refcount + confirm on the one one-way door), tombstone with transcript pointer + branch ref. Exists because settle keeps resources alive forever — archive is the reclaim verb. **Manual-only in v1; unarchive ships before any automation**; the future automation is merge-removes-confirmation (ownership-keyed: worktree branch == PR head, terminal state required), never merge-triggers-archive.
 - **rename** — registry title edit, no lifecycle interaction, available on settled threads and tombstones. Area rename out of scope here.
@@ -55,3 +55,7 @@ Full vocabulary lives in `CONTEXT.md` at the repo root. The model:
 - **Reboot**: registry + harness resume is the only durability layer (zmx is processes too). Nothing auto-spawns; threads show live-with-dead-runtime and resurrect on summon.
 
 **Flows into 04 (registry)**: resume manifest (harness, harness session id, cwd, host, area, title), `last_read_at`, settled bit, tombstones. Everything else derived — no stored visibility, no stored liveness, no stored attention.
+
+## Implementation checkpoint (2026-08-05)
+
+The live prototype implements manual park/summon, settle/un-settle, archive/unarchive, read markers, lazy resurrection, and shelves. Settle currently parks the window; archive closes it but does not reclaim a worktree. Auto-settle, the reaper, and production unarchive/worktree recreation remain unbuilt. The producer model also cannot yet distinguish an agent waiting on managed background work from genuine Idle; that hand-raise/in-flight gap must be resolved before automatic lifecycle transitions are safe.

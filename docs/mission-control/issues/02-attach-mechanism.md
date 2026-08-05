@@ -5,11 +5,11 @@ Status: resolved
 
 ## Answer (2026-08-03, decided by feel on the real desktop)
 
-The attach verb set is **park / summon / go-to**, implemented on nirius scratchpad + raw niri IPC, keyed by window id via agent-switch's session store:
+The attach verb set is **park / summon/go-to**, implemented on nirius scratchpad + raw niri IPC, keyed by window id via agent-switch's session store. The latest feel-test rule is **threads never move**:
 
-- **Park** (Mod+Shift+S, `bin/thread-dismiss`): one keystroke, window floats into the nirius scratchpad (bottom-most workspace). Verdict: good — "I don't want to see you now", for long-running work.
-- **Summon** (picker, `bin/thread-summon` on Mod+S): only *parked* threads are summoned to the current workspace; they arrive **tiled** (tiling also evicts nirius scratchpad membership, which fixes niriusd dragging summoned windows around).
-- **Go-to**: threads *visible* in another workspace are visited, not pulled — this walked back the charted "summon-to-me only" premise; pulling an already-placed window felt wrong. Summon-to-me survives only as the exit from the parked state.
+- **Park**: hide the warm window in the nirius scratchpad. Verdict: good — "I don't want to see you now", for long-running work.
+- **Summon/go-to**: visible thread → focus it where it is; parked thread → visit its recorded area, show it from the scratchpad, and tile it there; cold thread → visit its area and resurrect it there. A missing named-area workspace is not permission to relocate the thread silently.
+- The earlier prototype behavior "parked → summon to the caller's current workspace" is superseded. Pulling either visible or parked threads across areas felt wrong; summon is now engagement with the thread in its own area.
 - Window↔thread identification was already solved: agent-switch keys sessions by niri window id (hooks). No env handshake needed; titles are display-only (shells/agents rewrite them).
 - Verdict on the fzf surface: workable after the readability pass (aligned columns, state-sorted, sized floating window), but probably not the end state — if the picker needs live state or richer rows, build it into agent-switch as a GTK overlay.
 - Feel-testing also surfaced the missing **settle** state ("work has been done, keep the thread around, out of sight") — recorded in [03 — Lifecycle verbs](03-lifecycle-verbs.md); a mark-based settle prototype rides along in the same scripts.
@@ -42,4 +42,4 @@ Scoping refined 2026-08-03 (discussion before build):
   - Shell prompts / agents rewrite window titles; titles are display-only, identity must stay window-id keyed.
   - fzf verdict: readable after round 2, but if more surface is wanted (live state refresh, richer rows), the fallback is building the picker into agent-switch as a GTK overlay.
 
-Open: continued feel test on real desktop (`just switch`, then Mod+S / Mod+Shift+S), keybind ergonomics.
+The throwaway `bin/thread-*` scripts were later deleted; their mechanism findings now live in the GTK live sidebar. See [current implementation state](../current-state.md).

@@ -3,7 +3,7 @@
 Type: grilling
 Status: resolved
 
-Reframed 2026-08-03 (surface pivot, see map): the picker is now a GTK layer-shell **sidebar** in agent-switch — Mod+S summons it, exclusive zone on the left, per-area content. Ticket 03 resolved the vocabulary (lifecycle, attention tiers, verbs); this ticket designs what the sidebar shows and how it behaves.
+Reframed 2026-08-03 (surface pivot, see map): the picker is now a GTK layer-shell **sidebar** in agent-switch, toggled by Mod+S. The later live prototype uses a left overlay and global-default content; the Answer below records those superseding feel-test calls. Ticket 03 resolved the vocabulary (lifecycle, attention tiers, verbs); this ticket designs what the sidebar shows and how it behaves.
 
 ## Question
 
@@ -23,7 +23,7 @@ The user's call mid-grilling: **copy t3code's sidebar v2** (`~/code/t3code`, `ap
 
 ### Interaction model
 
-**Toggled-only.** Mod+S summons with exclusive keyboard grab + exclusive zone (left, waybar-style); Esc or Mod+S dismisses and reclaims the space. Always-visible dashboard rejected (permanent space cost; layer-surface refocus-by-bind is the weak spot; the glanceable role belongs to waybar). Because the sidebar is summoned, it *could* rank — but v2's ordering rule was adopted instead (below), which supersedes the earlier "attention tiers as sort key" sketch in this ticket's Question.
+**Toggled-only.** Mod+S summons with an exclusive keyboard grab; Esc or Mod+S dismisses it. Always-visible dashboard rejected (permanent space cost; the glanceable role belongs to Waybar). The live prototype currently overlays on the left with exclusive zone `0`: changing and then removing a left exclusive zone left a stale horizontal niri viewport offset during testing. Because the sidebar is summoned, it *could* rank — but v2's ordering rule was adopted instead (below), which supersedes the earlier "attention tiers as sort key" sketch in this ticket's Question.
 
 ### List structure (v2 copy)
 
@@ -59,11 +59,11 @@ Unread semantics from v2 confirmed: never-visited counts as read; visiting/summo
 
 ### Per-workspace illusion
 
-Content follows the focused workspace via the niri event stream (layer surfaces are per-output; per-area sidebar is rendered content, not a compositor feature). On a workspace that isn't a named area, Mod+S shows the **global all-areas view** — all threads, cards gaining an area label (v2's "All projects" analog). `g` toggles area↔global from anywhere. Mod+S always answers "what's happening".
+The latest feel-test call is **global all-areas view by default** — all threads, with cards gaining an area label when it differs from the repo. `g` narrows to the currently focused named area; an unnamed workspace leaves the scope global. This replaced the earlier area-first default and makes Mod+S consistently answer "what's happening everywhere?"
 
 ### Waybar
 
-**Aggregate counts only** — `2 waiting · 3 running` (FleetView-style, global across areas): orange segment when anything is attention-worthy, dim when only working, module hidden when nothing live. Click toggles the sidebar. Satisfies "the glanceable surface never reorders" trivially. Per-row detail lives only in the sidebar.
+**Highest nonzero count only**, global across areas: literal unread Done (`✓ n`) first, then Working (`⚙ n`), then open Idle (`○ n`). Settled and archived threads are excluded. Approval/Input remain visible in the tooltip but do not get folded into the literal Done count. The persistent sidebar writes an atomic projection every two seconds even while hidden; the Waybar module reads that projection rather than recomputing from legacy `agent-switch list`. Click toggles the sidebar. Per-row detail remains in the sidebar/tooltip.
 
 ### Jump-to-next-needing-me
 
@@ -76,3 +76,7 @@ Deferred. Sidebar verbs stay thread-scoped in v1; the registry stores the worksp
 ### Flows into 04 (registry)
 
 `snoozedUntil` seam (deferred snooze); area referenced by workspace name (rename deferred — name-vs-stable-id flagged); per-thread repo/branch/host for card lines; PR association stays in schema as the badge seam's future feed.
+
+## Implementation checkpoint (2026-08-05)
+
+The live GTK prototype implements the toggled overlay, static rows, active/settled/archived sections, attention rendering, Monokai Spectrum palette, global/area scope toggle, keyboard verbs, inline rename, and Waybar projection. Shelf pagination, hover action buttons, right-click menus, PR/diff seams, host support, and Mod+Shift+S jump-to-next are not implemented. Diagnostic row content and the 480px width are temporary feel-test instrumentation.

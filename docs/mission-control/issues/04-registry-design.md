@@ -55,3 +55,7 @@ The registry is durable truth (identity, manifest, lifecycle, read marker). `ses
 ### Flows onward
 
 Ticket 08 fills the `runtime` manifest slot; the blueprint gets this schema verbatim; `CONTEXT.md` gains **Registry** and **Manifest** terms.
+
+## Implementation checkpoint (2026-08-05)
+
+The live sidebar deliberately uses a disposable single-file sidecar, `sidebar-proto-registry.json`, with numeric `seq` identity and a separate `order` key. It proves stable rows, lifecycle/read persistence, succession, and resurrection manifests, but it is **not** this registry design. ULIDs, per-thread atomic files, per-host ownership, worktree metadata, daemon-only verb writes, and remote mirrors remain unimplemented. `sessions.json` is still the hot producer cache, matching the intended two-store split.

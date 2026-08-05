@@ -26,3 +26,9 @@ Resolved 2026-08-03. Full findings: [research/05-codex-status-surface.md](../res
 - **Do not use** `notify` (single event, silently dies on long threads via E2BIG) or `tui.notifications` (terminal escapes = scraping). Rollout JSONL is a recovery oracle, not a live signal (no needs-input, no pid, no heartbeat).
 - **Liveness**: no pid anywhere — record `$PPID` in the `SessionStart` hook and gate on `kill -0`.
 - **Operational risk**: hook trust is content-hashed; editing a hook command (e.g. via `just switch` on the store-backed file) silently untrusts it until re-approved via `/hooks`. The producer must surface "hook untrusted" as a distinct degraded state.
+
+## Implementation checkpoint (2026-08-05)
+
+Codex currently emits SessionStart, UserPromptSubmit, and Stop into `agent-switch track`. PermissionRequest, SessionEnd, PPID-backed liveness, and degraded hook-trust reporting are still missing. The optional app-server observer has not been adopted.
+
+For comparison, agent-switch currently continues to use Claude lifecycle hooks too; Claude's native `~/.claude/sessions/<pid>.json` files are a documented zero-hook alternative but are not consumed by the implementation.

@@ -23,3 +23,15 @@ The cold-resurrection path (recreate from registry manifest + harness resume aft
 Refinement from ticket 03 (2026-08-03): liveness is host-relative — remote threads via ssh+zmx survive a laptop reboot, so zmx is essentially mandatory for remote runtimes. The likely shape is per-host substrate (window-hosted locally, zmx-backed remotely) behind the same verb interface; validate zmx locally only if it earns its keep.
 
 Feeds ticket 04 (registry manifest shape differs: window ids vs zmx session names).
+
+## Current checkpoint (2026-08-05)
+
+The window-hosted leg is now validated far beyond the original throwaway scripts:
+
+- Warm park/show works through nirius scratchpad membership.
+- Visible, parked, and cold summon paths compose behind one go-to verb.
+- Closing the window makes the runtime cold; harness resume recreates it and the producer rebinds the stable prototype row.
+- Session succession in one terminal preserves thread identity.
+- A compositor restart still loses warmth, as expected.
+
+The zmx-backed leg has not been prototyped for thread runtimes, so this ticket stays open. Before choosing it, test interactive Pi/Claude/Codex attach-detach, resize/scrollback behavior, hook/window rebinding, and whether local warm persistence justifies the extra layer. Cold resurrection remains mandatory either way and must account for the user's sandbox wrapper and direnv environment.
