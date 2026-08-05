@@ -484,6 +484,8 @@ impl LiveWorld {
                     // Succession can hand the seat to a different harness
                     // (quit claude, start pi in the same terminal) — the
                     // thread follows the seat, so its harness and cwd do too.
+                    let succeeded = bare_session_id(&t.harness_session_id)
+                        != bare_session_id(&session.session_id);
                     t.harness = session.agent;
                     t.harness_session_id = session.session_id;
                     if session.cwd.is_some() {
@@ -496,6 +498,13 @@ impl LiveWorld {
                     t.waiting_reason = session.waiting_reason;
                     t.state_updated = session.state_updated;
                     t.transcript_path = session.transcript_path;
+                    // Reconcile a manual rename across succession: the new
+                    // conversation's transcript has never seen the title, so
+                    // re-assert it. Resume-rebinds (same bare id, same
+                    // transcript) already carry it.
+                    if succeeded && t.renamed {
+                        propagate_rename(t);
+                    }
                     t.branch = branch;
                     // Harness session names (pi --name, claude) are the
                     // default title; a manual rename owns it forever.
