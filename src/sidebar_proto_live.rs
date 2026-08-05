@@ -504,6 +504,11 @@ impl LiveWorld {
             Ok(store) => store,
             Err(_) => return,
         };
+        // A terminal can disappear without SessionEnd (Codex currently has
+        // no such hook wired, and abrupt closes can skip hooks regardless).
+        // Treat producer entries bound to windows niri no longer knows as
+        // stale before deciding whether a cold thread should tombstone.
+        state::cleanup_stale(&mut store);
         daemon::refresh_transcript_derived_states(&mut store);
 
         let windows: HashMap<u64, niri_ipc::Window> = niri::niri_windows()
