@@ -16,8 +16,9 @@
 // --popup to restore the original transient overlay for quick A/B testing.
 //
 // Keys: j/k move · Shift+J/K reorder · 1-9 jump · Enter summon · s settle · p park
-//       a archive (confirm) · r rename · m toggle read · g area/global scope
-//       Tab settled shelf · z archived shelf · n new thread (live) · q/Esc release
+//       a archive (confirm) · d delete archived (confirm) · r rename · m toggle read
+//       g area/global scope · Tab settled shelf · z archived shelf · n new thread
+//       (live) · q/Esc release
 
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, ScrolledWindow};
@@ -89,6 +90,7 @@ struct ProtoState {
     settled_expanded: bool,
     archived_expanded: bool,
     confirm_archive: Option<u64>,
+    confirm_delete: Option<u64>,
     /// Some(buffer) while typing a new title for the selected row (`r`).
     rename_buffer: Option<String>,
     message: String,
@@ -364,8 +366,7 @@ fn regen_live(state: &mut ProtoState) {
     let now = crate::state::now();
     let threads: Vec<ProtoThread> = match &state.live {
         Some(world) => world
-            .threads()
-            .iter()
+            .visible_threads()
             .map(|t| proto_from_live(t, now))
             .collect(),
         None => return,
@@ -889,8 +890,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
         let world = LiveWorld::new();
         let now = crate::state::now();
         let threads: Vec<ProtoThread> = world
-            .threads()
-            .iter()
+            .visible_threads()
             .map(|t| proto_from_live(t, now))
             .collect();
         // Default to the global all-areas view for now (user call, 2026-08-04);
@@ -916,6 +916,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
         settled_expanded: true,
         archived_expanded: false,
         confirm_archive: None,
+        confirm_delete: None,
         rename_buffer: None,
         message,
     }));
@@ -945,9 +946,9 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
     footer.set_xalign(0.0);
     outer.append(&footer);
     let help_text = if docked {
-        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · r rename · m read · n new · g scope · Tab/z shelves · q release"
+        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · d delete archived · r rename · m read · n new · g scope · Tab/z shelves · q release"
     } else {
-        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · r rename · m read · n new · g scope · Tab/z shelves · q close"
+        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · d delete archived · r rename · m read · n new · g scope · Tab/z shelves · q close"
     };
     let help = Label::new(Some(help_text));
     help.add_css_class("proto-help");
@@ -977,8 +978,9 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
         let mut s = state_for_keys.borrow_mut();
         let mut dirty = true;
 
-        // Anything except a second `a` disarms the archive confirmation.
-        let confirm = s.confirm_archive.take();
+        // Any different key disarms the destructive double-press confirms.
+        let confirm_archive = s.confirm_archive.take();
+        let confirm_delete = s.confirm_delete.take();
 
         // Rename mode captures every key until commit/cancel.
         if s.rename_buffer.is_some() {
@@ -1247,7 +1249,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
                             .iter()
                             .find(|t| t.seq == id)
                             .is_some_and(|t| t.archived_at.is_some());
-                        if is_archived || confirm == selected {
+                        if is_archived || confirm_archive == selected {
                             let msg = s.live.as_mut().unwrap().toggle_archive(id);
                             s.message = msg;
                         } else {
@@ -1264,7 +1266,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
                             t.settled_mins = None;
                             s.message = "unarchived — restored to live".into();
                         }
-                        _ if confirm == selected => {
+                        _ if confirm_archive == selected => {
                             t.lifecycle = Lifecycle::Archived;
                             t.attention = Attention::Idle;
                             t.settled_mins = Some(0);
@@ -1277,6 +1279,39 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
                                     .into();
                         }
                     }
+                }
+            }
+            (Some('d'), _) => {
+                let selected = s.selected;
+                let is_archived = selected.is_some_and(|id| {
+                    if let Some(world) = s.live.as_ref() {
+                        world
+                            .threads()
+                            .iter()
+                            .find(|t| t.seq == id)
+                            .is_some_and(|t| t.archived_at.is_some())
+                    } else {
+                        s.threads
+                            .iter()
+                            .find(|t| t.id == id)
+                            .is_some_and(|t| t.lifecycle == Lifecycle::Archived)
+                    }
+                });
+                match (selected, is_archived, confirm_delete == selected) {
+                    (Some(id), true, true) => {
+                        if let Some(world) = s.live.as_mut() {
+                            s.message = world.delete_archived(id);
+                        } else {
+                            s.threads.retain(|t| t.id != id);
+                            s.message = "deleted from the sidebar".into();
+                        }
+                    }
+                    (Some(_), true, false) => {
+                        s.confirm_delete = selected;
+                        s.message =
+                            "delete permanently hides this archived thread — press d again".into();
+                    }
+                    _ => s.message = "delete only applies to archived threads".into(),
                 }
             }
             (Some('m'), _) => {
@@ -1426,6 +1461,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
     window.connect_map(move |_| {
         let mut s = state_for_map.borrow_mut();
         s.confirm_archive = None;
+        s.confirm_delete = None;
         if s.live.is_some() {
             s.live.as_mut().unwrap().refresh();
             s.scope = Scope::Global;

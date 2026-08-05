@@ -52,6 +52,9 @@ pub struct LiveThread {
     pub last_read_at: f64,
     pub settled_at: Option<f64>,
     pub archived_at: Option<f64>,
+    /// Permanent sidebar deletion marker. The record remains as a hidden
+    /// tombstone so a stale producer cannot immediately rediscover it.
+    pub deleted_at: Option<f64>,
     /// True once the user renamed the thread (r): the title is theirs and
     /// harness-provided session names stop updating it.
     pub renamed: bool,
@@ -104,6 +107,8 @@ struct ProtoRecord {
     last_read_at: f64,
     settled_at: Option<f64>,
     archived_at: Option<f64>,
+    #[serde(default)]
+    deleted_at: Option<f64>,
     #[serde(default)]
     renamed: bool,
     #[serde(default)]
@@ -602,6 +607,7 @@ impl LiveWorld {
                 last_read_at: r.last_read_at,
                 settled_at: r.settled_at,
                 archived_at: r.archived_at,
+                deleted_at: r.deleted_at,
                 renamed: r.renamed,
                 auto_named: r.auto_named,
                 auto_title_prompt_hash: r.auto_title_prompt_hash,
@@ -627,6 +633,7 @@ impl LiveWorld {
                 last_read_at: t.last_read_at,
                 settled_at: t.settled_at,
                 archived_at: t.archived_at,
+                deleted_at: t.deleted_at,
                 renamed: t.renamed,
                 auto_named: t.auto_named,
                 auto_title_prompt_hash: t.auto_title_prompt_hash,
@@ -641,7 +648,7 @@ impl LiveWorld {
     }
 
     fn waybar_attention(t: &LiveThread) -> Option<WaybarAttention> {
-        if t.archived_at.is_some() || t.settled_at.is_some() {
+        if t.deleted_at.is_some() || t.archived_at.is_some() || t.settled_at.is_some() {
             return None;
         }
         Some(match t.state {
@@ -727,6 +734,12 @@ impl LiveWorld {
         &self.threads
     }
 
+    /// User-facing rows. Deleted records stay internal as suppression
+    /// tombstones and have no sidebar resurrection affordance.
+    pub fn visible_threads(&self) -> impl Iterator<Item = &LiveThread> {
+        self.threads.iter().filter(|t| t.deleted_at.is_none())
+    }
+
     fn get(&self, seq: u64) -> Option<&LiveThread> {
         self.threads.iter().find(|t| t.seq == seq)
     }
@@ -754,6 +767,7 @@ impl LiveWorld {
                 continue;
             };
             if thread.harness_session_id != completion.harness_session_id
+                || thread.deleted_at.is_some()
                 || thread.renamed
                 || thread.auto_named
             {
@@ -783,7 +797,8 @@ impl LiveWorld {
             .threads
             .iter()
             .filter(|thread| {
-                thread.archived_at.is_none()
+                thread.deleted_at.is_none()
+                    && thread.archived_at.is_none()
                     && !thread.renamed
                     && !thread.auto_named
                     && !thread.harness_named
@@ -1060,6 +1075,7 @@ impl LiveWorld {
                         last_read_at: session.state_updated,
                         settled_at: None,
                         archived_at: None,
+                        deleted_at: None,
                         renamed: false,
                         auto_named: false,
                         auto_title_prompt_hash: 0,
@@ -1329,6 +1345,28 @@ impl LiveWorld {
         msg
     }
 
+    /// Permanently remove an archived row from the sidebar. Keep its record as
+    /// a hidden suppression tombstone so lingering hook state cannot mint the
+    /// same conversation again. This prototype verb does not delete harness
+    /// transcripts or other files.
+    pub fn delete_archived(&mut self, seq: u64) -> String {
+        let now = state::now();
+        let title = {
+            let Some(t) = self.get_mut(seq) else {
+                return "no such thread".into();
+            };
+            if t.archived_at.is_none() {
+                return "delete only applies to archived threads".into();
+            }
+            t.deleted_at = Some(now);
+            t.title.clone()
+        };
+        self.auto_title_jobs.remove(&seq);
+        info!("delete: hiding archived sidebar tombstone #{seq} ('{title}')");
+        self.save();
+        format!("deleted '{title}' from the sidebar")
+    }
+
     pub fn toggle_read(&mut self, seq: u64) -> String {
         let now = state::now();
         let Some(t) = self.get_mut(seq) else {
@@ -1416,7 +1454,7 @@ pub fn focused_area() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{latest_prompt_from_jsonl, sanitize_auto_title, stable_window_title};
+    use super::{ProtoRecord, latest_prompt_from_jsonl, sanitize_auto_title, stable_window_title};
 
     #[test]
     fn stable_window_title_strips_codex_braille_spinner() {
@@ -1443,6 +1481,26 @@ mod tests {
             latest_prompt_from_jsonl("codex", codex).as_deref(),
             Some("codex ask")
         );
+    }
+
+    #[test]
+    fn legacy_registry_records_default_to_not_deleted() {
+        let record: ProtoRecord = serde_json::from_value(serde_json::json!({
+            "seq": 1,
+            "harness": "pi",
+            "harness_session_id": "session",
+            "cwd": null,
+            "transcript_path": null,
+            "area": "main",
+            "title": "thread",
+            "state_updated": 1.0,
+            "last_read_at": 1.0,
+            "settled_at": null,
+            "archived_at": 2.0
+        }))
+        .unwrap();
+
+        assert_eq!(record.deleted_at, None);
     }
 
     #[test]

@@ -12,7 +12,7 @@ Implemented feel-test behavior:
 - Global all-areas view by default; `g` narrows to the focused named area.
 - Static active-row ordering, Settled and Archived shelves, keyboard navigation and verbs.
 - Attention labels: Approval, Input, Working, Done/Unread, and Idle. Failed remains a display seam; no producer currently emits it reliably.
-- Park, summon/go-to, settle, archive, mark-read, rename, reorder, and minimal new-Pi-thread creation.
+- Park, summon/go-to, settle, archive, archived-thread delete, mark-read, rename, reorder, and minimal new-Pi-thread creation.
 - Thread succession: a new conversation taking over the same live window adopts the existing row instead of archive-plus-mint.
 - Cold resurrection through harness resume (`pi --session`, `claude --resume`, `codex resume`).
 - Manual and automatic titles persist and propagate to Pi (`setSessionName` through a drop-file watcher) and Claude (`custom-title` transcript append), including re-assertion after session succession. Unnamed threads generate once from their next prompt using the same harness CLI with a deliberately cheap model: Pi and Codex via Luna at low effort, and Claude via Haiku 4.5.
@@ -23,7 +23,7 @@ Implemented feel-test behavior:
 The durable registry from ticket 04 is **not implemented**. The prototype uses:
 
 - `~/.local/state/agent-switch/sessions.json` — existing hot producer cache.
-- `~/.local/state/agent-switch/sidebar-proto-registry.json` — single-file sidecar preserving `seq`, order, title, area, lifecycle timestamps, and read markers.
+- `~/.local/state/agent-switch/sidebar-proto-registry.json` — single-file sidecar preserving `seq`, order, title, area, lifecycle/deletion timestamps, and read markers.
 - `~/.local/state/agent-switch/sidebar-proto-waybar.json` — atomically replaced Waybar projection.
 
 This is scaffolding, not the planned `registry/<host>/<ulid>.json` store. Prototype `seq` is identity; production ULID identity, per-host ownership, host-aware manifests, worktree metadata, and remote mirrors remain unbuilt.
@@ -41,7 +41,7 @@ The latest spatial rule is **threads never move**:
 
 Parking hides a still-live window; it does not achieve the aspirational zero-window-at-rest model. The default dock changes niri's working area with a 480 px exclusive zone. Removing that zone can leave a stale horizontal viewport offset; the user accepted that prototype trade-off because scrolling right clears it. Popup mode keeps exclusive zone `0`.
 
-Archive currently closes the runtime window and leaves a prototype tombstone. It does **not** reclaim a worktree. Settle parks the window and shelves the row. The designed 36-hour auto-settle and settled-runtime reaper are not implemented. Closing a thread outside the sidebar is treated as an explicit abandonment signal and auto-tombstones it once both window and producer session are gone.
+Archive currently closes the runtime window and leaves a prototype tombstone. On an archived row, `d` twice permanently removes it from the UI; a hidden `deleted_at` suppression tombstone remains so stale producer state cannot rediscover it. This sidebar delete does not remove transcripts or other files. Archive does **not** reclaim a worktree. Settle parks the window and shelves the row. The designed 36-hour auto-settle and settled-runtime reaper are not implemented. Closing a thread outside the sidebar is treated as an explicit abandonment signal and auto-tombstones it once both window and producer session are gone.
 
 ## Producers today
 

@@ -10,7 +10,7 @@ Glossary for the thread/mission-control domain. Terms are added as they are reso
 
 **Visibility** *(derived axis — never stored)* — whether a thread is presented in its work area. Values: **summoned** (presented for engagement) / **parked** (hidden from the work area). Derived from runtime/compositor facts; a backend may preserve a hidden warm window. Park/summon are spatial verbs and never define lifecycle. (Decided in ticket 03, 2026-08-03: "park" as a lifecycle state was an artifact of the fzf prototype.)
 
-**Lifecycle** *(stored axis — registry-owned)* — the thread's position in its life: **live** → **settled** → **archived**. Settle/archive/unsettle are registry verbs, orthogonal to visibility.
+**Lifecycle** *(stored axis — registry-owned)* — the thread's position in its life: **live** → **settled** → **archived**, with optional terminal **deleted** suppression after archive. Settle/archive/unsettle are registry verbs, orthogonal to spatial visibility; delete removes the tombstone from user-facing surfaces.
 
 **park** — spatial verb: hide the thread's windows ("I don't want to see you now"). The thread stays live.
 
@@ -32,7 +32,7 @@ Glossary for the thread/mission-control domain. Terms are added as they are reso
 
 **Thread title** — the stable human-facing name. An explicit sidebar rename owns it; otherwise a one-shot automatic title generated from the next prompt owns it. Owned titles propagate into harnesses that support names and survive session succession. A harness session name and then live window/repo text are fallbacks only; they never overwrite an owned title.
 
-**Sidebar** — the summoned surface: toggled into view on demand, never persistently visible. It shows all areas by default and can narrow to the focused area; it carries the thread verbs. Rows sit in static creation order (newest first); activity never reorders the list — attention is expressed by brightness and a trailing status label, and the screen only moves at lifecycle transitions. (Decided in ticket 06, 2026-08-04 and refined by live feel test.)
+**Sidebar** — the thread surface, currently a persistent left dock with a popup mode available for A/B testing. Mod+S toggles keyboard command mode in dock mode. It shows all areas by default and can narrow to the focused area; it carries the thread verbs. Rows sit in static creation order (newest first); activity never reorders the list — attention is expressed by brightness and a trailing status label, and the screen only moves at lifecycle transitions. (Decided in ticket 06, 2026-08-04 and refined by live feel test.)
 
 **Registry** — the durable record of every thread: identity, manifest, lifecycle, read marker. The single source of durable truth — every other thread fact is derived, never reconciled. Each thread's record is owned by exactly one host; other hosts only read it, and a verb aimed at a remote thread travels to the owning host. (Decided in ticket 04, 2026-08-04.)
 
@@ -45,3 +45,5 @@ Glossary for the thread/mission-control domain. Terms are added as they are reso
 **Tombstone** — the registry remnant of an archived thread: identity, transcript pointer, branch ref. Enough to unarchive.
 
 **unarchive** — restore a tombstoned thread to live: registry entry back, worktree re-creatable from the branch; honest that the old processes don't return.
+
+**delete** — archived-only forgetting verb: remove the tombstone and its resurrection affordance from every user-facing surface. A minimal hidden suppression record remains so stale producer state cannot rediscover it; deleting does not imply transcript-file erasure.

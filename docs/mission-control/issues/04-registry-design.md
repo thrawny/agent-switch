@@ -27,14 +27,14 @@ Flags from [06](06-surface-content.md) (2026-08-04): reserve a `snoozedUntil` se
 
 - **identity**: `id` (ULID) · `title` (mutable, rename verb) · `area` (workspace *name*, per 06's deferral — revisit only if area rename becomes a verb) · `host` (day one, per 01)
 - **resume manifest** (what summon/resurrect needs, per 03): `harness` (open enum) · `harness_session_id` (mutable, updated on resume) · `transcript_path` (activity watching now, tombstone pointer later) · `cwd` · `worktree_path` (Option; None = stable checkout; feeds archive's refcount/GC) · `runtime` (reserved slot, shape pending [08](08-thread-runtime-substrate.md))
-- **lifecycle**: `created_at` · `settled_at` (Option) · `archived_at` (Option) — stored as timestamps, the enum is derived (both None = live)
+- **lifecycle**: `created_at` · `settled_at` (Option) · `archived_at` (Option) · `deleted_at` (Option) — stored as timestamps; both settle/archive absent means live, while deleted is a hidden terminal suppression record
 - **attention support**: `last_read_at` (the single stored read marker, per 03)
 - **seams, unused in v1**: `snoozed_until` (06) · `pr` association (badge + merge automation)
 - **tombstone extra**: `branch_ref`, written once at archive time
 
 **Derive rules**: repo name and current branch are *derived* while live (from cwd/worktree at read time — a stored branch goes stale on rebase); branch is only persisted at archive, when the worktree is about to be reclaimed. Never stored: visibility, liveness, attention, repo, live branch.
 
-**Tombstone** = the same row with `archived_at` set; manifest slims to identity + `transcript_path` + `branch_ref`. No separate tombstone store.
+**Tombstone** = the same row with `archived_at` set; manifest slims to identity + `transcript_path` + `branch_ref`. `deleted_at` hides that tombstone and removes its UI resurrection affordance without allowing stale producer state to rediscover it. No separate tombstone store.
 
 ### Storage
 
