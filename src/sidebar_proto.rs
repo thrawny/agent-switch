@@ -781,8 +781,15 @@ where
 /// window" as focused, so focus changes only stick once the grab is gone.
 /// Release command mode, let that layer-shell commit, then run the verb. The
 /// dock stays mapped and continues reserving its width.
-fn schedule_summon(state: Rc<RefCell<ProtoState>>, window: ApplicationWindow, seq: u64) {
-    if state.borrow().popup {
+fn schedule_summon(
+    state: Rc<RefCell<ProtoState>>,
+    window: ApplicationWindow,
+    seq: u64,
+    popup: bool,
+) {
+    // `popup` is passed by value because the key handler already holds the
+    // state's RefCell borrow while scheduling this callback.
+    if popup {
         window.set_visible(false);
     } else {
         set_interactive(&window, false);
@@ -1078,7 +1085,12 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
             (_, Some("return")) => {
                 if s.live.is_some() {
                     if let Some(seq) = s.selected {
-                        schedule_summon(state_for_keys.clone(), window_for_keys.clone(), seq);
+                        schedule_summon(
+                            state_for_keys.clone(),
+                            window_for_keys.clone(),
+                            seq,
+                            s.popup,
+                        );
                         return gtk4::glib::Propagation::Stop;
                     }
                 } else if let Some(t) = s.selected_thread_mut() {

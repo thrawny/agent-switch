@@ -18,6 +18,8 @@ run-niri:
 watch:
     -zmx kill agent-switch-build
     -zmx kill agent-switch-sidebar
+    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --popup)?$'
+    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --popup)?$'
     if [ "$${ZMX_SESSION:-}" != "agent-switch-niri" ]; then zmx kill agent-switch-niri || true; fi
     sleep 0.2
     cargo build
@@ -62,6 +64,8 @@ demo-sidebar:
 demo-sidebar-live mode="dock":
     cargo build
     -zmx kill agent-switch-sidebar
+    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --popup)?$'
+    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --popup)?$'
     zmx run agent-switch-sidebar -d watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch demo-sidebar --live {{ if mode == "popup" { "--popup" } else { "" } }}
 
 # Format code
