@@ -721,8 +721,11 @@ window { background-color: transparent; }
     background-color: rgba(31, 31, 31, 0.97);
     border-right: 1px solid rgba(105, 103, 108, 0.38);
 }
-window.proto-interactive .proto-outer {
-    border-right-color: rgba(148, 138, 227, 0.72);
+window.proto-docked .proto-outer {
+    border-right: 2px solid #3a3a3a;
+}
+window.proto-docked.proto-interactive .proto-outer {
+    border-right-color: #f92672;
 }
 .proto-header { padding: 14px 16px 10px 16px; }
 label.proto-scope { color: #fce566; font-size: 15px; font-weight: bold; font-family: monospace; }
@@ -870,6 +873,9 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
     // from niri's usable area. Mock mode remains a transient overlay.
     window.set_exclusive_zone(if docked { SIDEBAR_WIDTH } else { 0 });
     window.set_size_request(SIDEBAR_WIDTH, -1);
+    if docked {
+        window.add_css_class("proto-docked");
+    }
 
     let provider = gtk4::CssProvider::new();
     provider.load_from_data(PROTO_CSS);
