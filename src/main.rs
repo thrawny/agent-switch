@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod niri;
 mod sidebar_proto;
+mod sidebar_proto_live;
 mod state;
 mod themes;
 mod track;
@@ -68,8 +69,12 @@ enum Command {
         #[arg(long)]
         theme: Option<String>,
     },
-    /// PROTOTYPE: ticket-06 sidebar with mock data (throwaway)
-    DemoSidebar,
+    /// PROTOTYPE: ticket-06 sidebar (throwaway); --live joins real sessions
+    DemoSidebar {
+        /// Show real agent sessions and act on real windows (ticket 08)
+        #[arg(long)]
+        live: bool,
+    },
 }
 
 fn main() {
@@ -155,8 +160,8 @@ fn main() {
             let exit_code = niri::run_demo(theme.as_deref());
             std::process::exit(exit_code.into());
         }
-        Command::DemoSidebar => {
-            let exit_code = sidebar_proto::run();
+        Command::DemoSidebar { live } => {
+            let exit_code = sidebar_proto::run(live);
             std::process::exit(exit_code.into());
         }
     }

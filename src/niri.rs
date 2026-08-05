@@ -331,18 +331,18 @@ fn niri_request_name(request: &Request) -> &'static str {
     }
 }
 
-fn niri_action(action: Action) {
+pub(crate) fn niri_action(action: Action) {
     let _ = niri_request(Request::Action(action));
 }
 
-fn niri_workspaces() -> Vec<Workspace> {
+pub(crate) fn niri_workspaces() -> Vec<Workspace> {
     match niri_request(Request::Workspaces) {
         Some(Response::Workspaces(workspaces)) => workspaces,
         _ => Vec::new(),
     }
 }
 
-fn niri_windows() -> Vec<Window> {
+pub(crate) fn niri_windows() -> Vec<Window> {
     match niri_request(Request::Windows) {
         Some(Response::Windows(windows)) => windows,
         _ => Vec::new(),
@@ -455,7 +455,7 @@ fn focus_column(index: u32) {
     });
 }
 
-fn focus_window(id: u64) -> bool {
+pub(crate) fn focus_window(id: u64) -> bool {
     matches!(
         niri_request(Request::Action(Action::FocusWindow { id })),
         Some(Response::Handled)

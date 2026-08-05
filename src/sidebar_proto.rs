@@ -6,13 +6,17 @@
 // order (activity never reorders), brightness-not-position attention, settled/archived
 // shelves, keyboard verbs.
 //
-// Run: `just demo-sidebar`. All state is in-memory mock data. Press `t` repeatedly to
-// step a scripted simulation (thread finishes -> Done brightens in place, new thread
-// lands on top, settled thread raises a hand and un-settles, ...).
+// Run: `just demo-sidebar`. All state is in-memory mock data.
 //
-// Keys: j/k move · 1-9 jump · Enter summon · s settle · p park · a archive (confirm)
-//       m toggle read · g area/global scope · Tab settled shelf · z archived shelf
-//       t simulate · q/Esc quit
+// Live mode (`just demo-sidebar-live`, ticket 08's window-hosted leg): rows are real
+// agent sessions joined with niri windows via sidebar_proto_live::LiveWorld; Enter/p
+// act on the real desktop (focus, nirius scratchpad, cold resurrection via harness
+// resume), n spawns a new pi thread. Re-running the command toggles the sidebar,
+// so it can sit on a keybind.
+//
+// Keys: j/k move · Shift+J/K reorder · 1-9 jump · Enter summon · s settle · p park
+//       a archive (confirm) · r rename · m toggle read · g area/global scope
+//       Tab settled shelf · z archived shelf · n new thread (live) · q/Esc quit
 
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, ScrolledWindow};
@@ -21,6 +25,9 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+use crate::sidebar_proto_live::{LiveThread, LiveWorld, focused_area};
+use crate::state::{SessionState, WaitingReason};
 
 const SIDEBAR_WIDTH: i32 = 340;
 
@@ -45,15 +52,16 @@ enum Lifecycle {
 struct ProtoThread {
     id: u64,
     title: String,
-    area: &'static str,
-    repo: &'static str,
+    area: String,
+    repo: String,
     branch: String,
-    harness: &'static str,
+    harness: String,
     host: Option<&'static str>,
     created: u64,
     attention: Attention,
     lifecycle: Lifecycle,
     parked: bool,
+    cold: bool,
     working_since: Option<Instant>,
     idle_mins: u32,
     settled_mins: Option<u32>,
@@ -61,20 +69,21 @@ struct ProtoThread {
 
 #[derive(Clone, PartialEq, Eq)]
 enum Scope {
-    Area(&'static str),
+    Area(String),
     Global,
 }
 
 struct ProtoState {
     threads: Vec<ProtoThread>,
+    live: Option<LiveWorld>,
     scope: Scope,
     selected: Option<u64>,
     visible: Vec<u64>,
     settled_expanded: bool,
     archived_expanded: bool,
     confirm_archive: Option<u64>,
-    sim_step: usize,
-    next_id: u64,
+    /// Some(buffer) while typing a new title for the selected row (`r`).
+    rename_buffer: Option<String>,
     message: String,
 }
 
@@ -108,10 +117,10 @@ fn working_duration(since: Instant) -> String {
 fn mock_threads() -> Vec<ProtoThread> {
     let mut id = 0u64;
     let mut t = |title: &str,
-                 area: &'static str,
-                 repo: &'static str,
+                 area: &str,
+                 repo: &str,
                  branch: &str,
-                 harness: &'static str,
+                 harness: &str,
                  host: Option<&'static str>,
                  attention: Attention,
                  lifecycle: Lifecycle,
@@ -122,15 +131,16 @@ fn mock_threads() -> Vec<ProtoThread> {
         ProtoThread {
             id,
             title: title.to_string(),
-            area,
-            repo,
+            area: area.to_string(),
+            repo: repo.to_string(),
             branch: branch.to_string(),
-            harness,
+            harness: harness.to_string(),
             host,
             created: id,
             attention,
             lifecycle,
             parked: false,
+            cold: false,
             working_since: working_offset_secs.map(|s| Instant::now() - Duration::from_secs(s)),
             idle_mins,
             settled_mins,
@@ -140,8 +150,8 @@ fn mock_threads() -> Vec<ProtoThread> {
     vec![
         t(
             "menu importer cleanup",
-            "kanel",
-            "kanel-api",
+            "work",
+            "backend",
             "chore/importer",
             "codex",
             None,
@@ -153,8 +163,8 @@ fn mock_threads() -> Vec<ProtoThread> {
         ),
         t(
             "tenant onboarding emails",
-            "kanel",
-            "kanel-web",
+            "work",
+            "web",
             "feat/onboarding-mails",
             "pi",
             None,
@@ -166,8 +176,8 @@ fn mock_threads() -> Vec<ProtoThread> {
         ),
         t(
             "fix flaky order tests",
-            "kanel",
-            "kanel-api",
+            "work",
+            "backend",
             "fix/flaky-orders",
             "claude",
             Some("devbox"),
@@ -192,8 +202,8 @@ fn mock_threads() -> Vec<ProtoThread> {
         ),
         t(
             "webhook retry backoff",
-            "kanel",
-            "kanel-api",
+            "work",
+            "backend",
             "fix/webhook-retries",
             "pi",
             Some("devbox"),
@@ -218,8 +228,8 @@ fn mock_threads() -> Vec<ProtoThread> {
         ),
         t(
             "tenant db migration",
-            "kanel",
-            "kanel-api",
+            "work",
+            "backend",
             "feat/tenant-migration",
             "codex",
             None,
@@ -231,8 +241,8 @@ fn mock_threads() -> Vec<ProtoThread> {
         ),
         t(
             "invoice PDF layout",
-            "kanel",
-            "kanel-web",
+            "work",
+            "web",
             "feat/invoice-pdf",
             "claude",
             None,
@@ -258,11 +268,79 @@ fn mock_threads() -> Vec<ProtoThread> {
     ]
 }
 
+/// Map a live registry thread to a display row. Attention is derived Codex-style
+/// from hook-authored state + the read marker (03): a working thread can never
+/// be unread.
+fn proto_from_live(t: &LiveThread, now: f64) -> ProtoThread {
+    let shelved = t.archived_at.is_some() || t.settled_at.is_some();
+    let attention = if shelved {
+        Attention::Idle
+    } else {
+        match t.state {
+            SessionState::Responding => Attention::Working,
+            SessionState::Waiting => match t.waiting_reason {
+                // Approval stays sticky until actually answered (the daemon
+                // clears it from the transcript); a question you've visited
+                // stops shouting until new activity — visiting = read.
+                Some(WaitingReason::PermissionPrompt) => Attention::Approval,
+                None if t.state_updated > t.last_read_at => Attention::Input,
+                None => Attention::Idle,
+            },
+            _ => {
+                if t.state_updated > t.last_read_at {
+                    Attention::Unread
+                } else {
+                    Attention::Idle
+                }
+            }
+        }
+    };
+    let lifecycle = if t.archived_at.is_some() {
+        Lifecycle::Archived
+    } else if t.settled_at.is_some() {
+        Lifecycle::Settled
+    } else {
+        Lifecycle::Live
+    };
+    let working_since = (attention == Attention::Working)
+        .then(|| Instant::now() - Duration::from_secs((now - t.state_updated).max(0.0) as u64));
+    ProtoThread {
+        id: t.seq,
+        title: t.title.clone(),
+        area: t.area.clone(),
+        repo: t.repo.clone(),
+        branch: t.branch.clone(),
+        harness: t.harness.clone(),
+        host: None,
+        created: t.order,
+        attention,
+        lifecycle,
+        parked: t.parked,
+        cold: t.cold(),
+        working_since,
+        idle_mins: ((now - t.state_updated).max(0.0) / 60.0) as u32,
+        settled_mins: t.settled_at.map(|at| ((now - at).max(0.0) / 60.0) as u32),
+    }
+}
+
+fn regen_live(state: &mut ProtoState) {
+    let now = crate::state::now();
+    let threads: Vec<ProtoThread> = match &state.live {
+        Some(world) => world
+            .threads()
+            .iter()
+            .map(|t| proto_from_live(t, now))
+            .collect(),
+        None => return,
+    };
+    state.threads = threads;
+}
+
 impl ProtoState {
     fn in_scope(&self, thread: &ProtoThread) -> bool {
-        match self.scope {
+        match &self.scope {
             Scope::Global => true,
-            Scope::Area(area) => thread.area == area,
+            Scope::Area(area) => &thread.area == area,
         }
     }
 
@@ -274,7 +352,7 @@ impl ProtoState {
             .collect();
         match lifecycle {
             // Static creation order, newest first. Activity never reorders.
-            Lifecycle::Live => rows.sort_by(|a, b| b.created.cmp(&a.created)),
+            Lifecycle::Live => rows.sort_by_key(|t| std::cmp::Reverse(t.created)),
             // Shelves: most recently settled/archived first.
             _ => rows.sort_by_key(|t| t.settled_mins.unwrap_or(0)),
         }
@@ -332,85 +410,6 @@ impl ProtoState {
         }
         (waiting, running)
     }
-
-    fn simulate(&mut self) {
-        let step = self.sim_step % 6;
-        self.sim_step += 1;
-        let msg = match step {
-            0 => self
-                .threads
-                .iter_mut()
-                .find(|t| t.attention == Attention::Working && t.lifecycle == Lifecycle::Live)
-                .map(|t| {
-                    t.attention = Attention::Unread;
-                    t.working_since = None;
-                    t.idle_mins = 0;
-                    format!(
-                        "sim: '{}' finished → Done (brightens, does not move)",
-                        t.title
-                    )
-                }),
-            1 => self
-                .threads
-                .iter_mut()
-                .find(|t| t.attention == Attention::Idle && t.lifecycle == Lifecycle::Live)
-                .map(|t| {
-                    t.attention = Attention::Working;
-                    t.working_since = Some(Instant::now());
-                    format!("sim: '{}' started working (dims in place)", t.title)
-                }),
-            2 => self
-                .threads
-                .iter_mut()
-                .find(|t| t.attention == Attention::Working && t.lifecycle == Lifecycle::Live)
-                .map(|t| {
-                    t.attention = Attention::Approval;
-                    t.working_since = None;
-                    format!("sim: '{}' raised a hand → Approval", t.title)
-                }),
-            3 => {
-                self.next_id += 1;
-                let id = self.next_id;
-                self.threads.push(ProtoThread {
-                    id,
-                    title: format!("new thread #{id}"),
-                    area: "kanel",
-                    repo: "kanel-api",
-                    branch: format!("feat/new-{id}"),
-                    harness: "pi",
-                    host: None,
-                    created: id,
-                    attention: Attention::Working,
-                    lifecycle: Lifecycle::Live,
-                    parked: false,
-                    working_since: Some(Instant::now()),
-                    idle_mins: 0,
-                    settled_mins: None,
-                });
-                Some("sim: new thread created (lands on top — the only kind of move)".into())
-            }
-            4 => self
-                .threads
-                .iter_mut()
-                .find(|t| t.attention == Attention::Approval && t.lifecycle == Lifecycle::Live)
-                .map(|t| {
-                    t.attention = Attention::Working;
-                    t.working_since = Some(Instant::now());
-                    format!("sim: '{}' approved → Working again", t.title)
-                }),
-            _ => self
-                .threads
-                .iter_mut()
-                .find(|t| t.lifecycle == Lifecycle::Settled)
-                .map(|t| {
-                    t.lifecycle = Lifecycle::Live;
-                    t.attention = Attention::Approval;
-                    t.settled_mins = None;
-                    format!("sim: settled '{}' raised a hand → un-settled", t.title)
-                }),
-        };
-        self.message = msg.unwrap_or_else(|| "sim: no candidate for this step".into());
-    }
 }
 
 fn status_label(thread: &ProtoThread) -> (String, &'static str) {
@@ -467,6 +466,12 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
         parked.add_css_class("proto-time");
         line1.append(&parked);
     }
+    if thread.cold {
+        // Runtime gone (window closed / compositor restart): summon resurrects.
+        let cold = Label::new(Some("❆"));
+        cold.add_css_class("proto-time");
+        line1.append(&cold);
+    }
     let (status_text, status_class) = status_label(thread);
     let status = Label::new(Some(&status_text));
     status.add_css_class(status_class);
@@ -496,7 +501,7 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
         host_label.add_css_class("proto-host");
         line3.append(&host_label);
     }
-    let harness = Label::new(Some(harness_glyph(thread.harness)));
+    let harness = Label::new(Some(harness_glyph(&thread.harness)));
     harness.add_css_class("proto-harness");
     line3.append(&harness);
     card.append(&line3);
@@ -559,8 +564,8 @@ fn rebuild(list_box: &GtkBox, header_box: &GtkBox, footer: &Label, state: &mut P
     }
 
     // Header: scope name + waybar-style aggregate preview
-    let scope_label = Label::new(Some(match state.scope {
-        Scope::Area(area) => area,
+    let scope_label = Label::new(Some(match &state.scope {
+        Scope::Area(area) => area.as_str(),
         Scope::Global => "All areas",
     }));
     scope_label.add_css_class("proto-scope");
@@ -703,7 +708,57 @@ label.proto-footer { color: #8a8f9a; font-size: 10px; font-family: monospace; pa
 label.proto-help { color: #565b66; font-size: 9px; font-family: monospace; padding: 0px 14px 10px 14px; }
 ";
 
-fn build_proto_ui(app: &Application) {
+/// Live summon: the sidebar's exclusive keyboard grab makes niri treat "no
+/// window" as focused, so focus changes only stick once the grab is gone.
+/// Dismiss first (Enter dismisses anyway per 06), let the unmap commit, then
+/// run the verb. Outcome goes to the log — the footer is hidden by then.
+fn schedule_summon(state: Rc<RefCell<ProtoState>>, window: ApplicationWindow, seq: u64) {
+    window.set_visible(false);
+    gtk4::glib::timeout_add_local_once(Duration::from_millis(80), move || {
+        if let Some(world) = state.borrow_mut().live.as_mut() {
+            world.summon(seq);
+        }
+    });
+}
+
+/// Live park keeps the sidebar open, so instead of dismissing it releases the
+/// keyboard grab, focuses the target window (nirius resolves "current window"
+/// through niri focus), toggles it into the scratchpad, then re-grabs.
+#[allow(clippy::too_many_arguments)]
+fn schedule_park(
+    state: Rc<RefCell<ProtoState>>,
+    window: ApplicationWindow,
+    list_box: GtkBox,
+    header_box: GtkBox,
+    footer: Label,
+    seq: u64,
+    target: u64,
+    verb: &'static str,
+) {
+    window.set_keyboard_mode(KeyboardMode::None);
+    gtk4::glib::timeout_add_local_once(Duration::from_millis(60), move || {
+        let focused = crate::niri::focus_window(target);
+        gtk4::glib::timeout_add_local_once(Duration::from_millis(90), move || {
+            let msg = if focused {
+                state
+                    .borrow_mut()
+                    .live
+                    .as_mut()
+                    .map(|world| world.park_focused(seq, verb))
+                    .unwrap_or_default()
+            } else {
+                format!("focus-window {target} failed — cannot park")
+            };
+            window.set_keyboard_mode(KeyboardMode::Exclusive);
+            let mut s = state.borrow_mut();
+            s.message = msg;
+            regen_live(&mut s);
+            rebuild(&list_box, &header_box, &footer, &mut s);
+        });
+    });
+}
+
+fn build_proto_ui(app: &Application, live: bool) {
     let window = ApplicationWindow::builder()
         .application(app)
         .default_width(SIDEBAR_WIDTH)
@@ -729,19 +784,38 @@ fn build_proto_ui(app: &Application) {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    let threads = mock_threads();
-    let next_id = threads.iter().map(|t| t.id).max().unwrap_or(0);
+    let (threads, world, scope, message) = if live {
+        let world = LiveWorld::new();
+        let now = crate::state::now();
+        let threads: Vec<ProtoThread> = world
+            .threads()
+            .iter()
+            .map(|t| proto_from_live(t, now))
+            .collect();
+        // Default to the global all-areas view for now (user call, 2026-08-04);
+        // g narrows to the focused workspace's area.
+        let scope = Scope::Global;
+        let message = "live — ⏎ summon/go-to · p park · n new pi thread".to_string();
+        (threads, Some(world), scope, message)
+    } else {
+        (
+            mock_threads(),
+            None,
+            Scope::Area("work".to_string()),
+            "prototype — static mock data".to_string(),
+        )
+    };
     let state = Rc::new(RefCell::new(ProtoState {
         threads,
-        scope: Scope::Area("kanel"),
+        live: world,
+        scope,
         selected: None,
         visible: Vec::new(),
         settled_expanded: true,
         archived_expanded: false,
         confirm_archive: None,
-        sim_step: 0,
-        next_id,
-        message: "prototype — press t to simulate events".into(),
+        rename_buffer: None,
+        message,
     }));
 
     let outer = GtkBox::new(Orientation::Vertical, 0);
@@ -769,7 +843,7 @@ fn build_proto_ui(app: &Application) {
     footer.set_xalign(0.0);
     outer.append(&footer);
     let help = Label::new(Some(
-        "j/k move · 1-9 jump · ⏎ summon · s settle · p park · a archive · m read · g scope · Tab/z shelves · t simulate · q quit",
+        "j/k move · J/K reorder · 1-9 jump · ⏎ summon · s settle · p park · a archive · r rename · m read · n new · g scope · Tab/z shelves · q quit",
     ));
     help.add_css_class("proto-help");
     help.set_halign(gtk4::Align::Start);
@@ -801,13 +875,104 @@ fn build_proto_ui(app: &Application) {
         // Anything except a second `a` disarms the archive confirmation.
         let confirm = s.confirm_archive.take();
 
+        // Rename mode captures every key until commit/cancel.
+        if s.rename_buffer.is_some() {
+            match (ch, name.as_deref()) {
+                (_, Some("escape")) => {
+                    s.rename_buffer = None;
+                    s.message = "rename cancelled".into();
+                }
+                (_, Some("return")) => {
+                    let title = s
+                        .rename_buffer
+                        .take()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if title.is_empty() {
+                        s.message = "rename cancelled (empty)".into();
+                    } else if let Some(id) = s.selected {
+                        if s.live.is_some() {
+                            let msg = s.live.as_mut().unwrap().rename(id, title);
+                            s.message = msg;
+                        } else if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                            t.title = title;
+                            s.message = "renamed".into();
+                        }
+                    }
+                }
+                (_, Some("backspace")) => {
+                    s.rename_buffer.as_mut().unwrap().pop();
+                }
+                (Some(c), _) if !c.is_control() => {
+                    s.rename_buffer.as_mut().unwrap().push(c);
+                }
+                _ => dirty = false,
+            }
+            if let Some(buf) = s.rename_buffer.as_deref() {
+                s.message = format!("rename: {buf}▏  (⏎ save · Esc cancel)");
+            }
+            if dirty {
+                regen_live(&mut s);
+                rebuild(&list_for_keys, &header_for_keys, &footer_for_keys, &mut s);
+            }
+            return gtk4::glib::Propagation::Stop;
+        }
+
         match (ch, name.as_deref()) {
             (Some('q'), _) | (_, Some("escape")) => {
-                window_for_keys.close();
+                if s.live.is_some() {
+                    window_for_keys.set_visible(false);
+                } else {
+                    window_for_keys.close();
+                }
                 return gtk4::glib::Propagation::Stop;
             }
             (Some('j'), _) | (_, Some("down")) => s.move_selection(1),
             (Some('k'), _) | (_, Some("up")) => s.move_selection(-1),
+            // Shift+J/K: manual reorder — swap the selected active row with
+            // its display neighbor (selection travels with the row). The one
+            // reorder that isn't creation; activity still never moves rows.
+            (Some(c @ ('J' | 'K')), _) => {
+                let down = c == 'J';
+                let ids: Vec<u64> = s.section(Lifecycle::Live).iter().map(|t| t.id).collect();
+                let pos = s.selected.and_then(|id| ids.iter().position(|&v| v == id));
+                match pos {
+                    None => s.message = "reorder applies to active rows".into(),
+                    Some(pos) => {
+                        let neighbor = if down {
+                            ids.get(pos + 1).copied()
+                        } else {
+                            pos.checked_sub(1).and_then(|p| ids.get(p).copied())
+                        };
+                        match (s.selected, neighbor) {
+                            (Some(id), Some(nid)) => {
+                                if s.live.is_some() {
+                                    let msg = s.live.as_mut().unwrap().swap_order(id, nid);
+                                    s.message = msg;
+                                } else {
+                                    let find = |threads: &[ProtoThread], want: u64| {
+                                        threads.iter().find(|t| t.id == want).map(|t| t.created)
+                                    };
+                                    if let (Some(ca), Some(cb)) =
+                                        (find(&s.threads, id), find(&s.threads, nid))
+                                    {
+                                        for t in s.threads.iter_mut() {
+                                            if t.id == id {
+                                                t.created = cb;
+                                            } else if t.id == nid {
+                                                t.created = ca;
+                                            }
+                                        }
+                                        s.message = "reordered".into();
+                                    }
+                                }
+                            }
+                            _ => s.message = "already at the edge".into(),
+                        }
+                    }
+                }
+            }
             (Some(c), _) if c.is_ascii_digit() && c != '0' => {
                 let idx = (c as usize) - ('1' as usize);
                 if let Some(&id) = s.visible.get(idx) {
@@ -815,7 +980,12 @@ fn build_proto_ui(app: &Application) {
                 }
             }
             (_, Some("return")) => {
-                if let Some(t) = s.selected_thread_mut() {
+                if s.live.is_some() {
+                    if let Some(seq) = s.selected {
+                        schedule_summon(state_for_keys.clone(), window_for_keys.clone(), seq);
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                } else if let Some(t) = s.selected_thread_mut() {
                     if t.attention == Attention::Unread {
                         t.attention = Attention::Idle;
                     }
@@ -833,7 +1003,38 @@ fn build_proto_ui(app: &Application) {
                 }
             }
             (Some('s'), _) => {
-                if let Some(t) = s.selected_thread_mut() {
+                if s.live.is_some() {
+                    if let Some(seq) = s.selected {
+                        // Settle ⇒ park (03): hide the window when settling a
+                        // thread that still shows one. Un-settle is bit-only —
+                        // summon, not un-settle, is what brings windows back.
+                        let park_target = {
+                            let world = s.live.as_ref().unwrap();
+                            world
+                                .threads()
+                                .iter()
+                                .find(|t| t.seq == seq)
+                                .filter(|t| {
+                                    t.settled_at.is_none() && t.archived_at.is_none() && !t.parked
+                                })
+                                .and_then(|t| t.window_id)
+                        };
+                        let msg = s.live.as_mut().unwrap().toggle_settle(seq);
+                        s.message = msg;
+                        if let Some(target) = park_target {
+                            schedule_park(
+                                state_for_keys.clone(),
+                                window_for_keys.clone(),
+                                list_for_keys.clone(),
+                                header_for_keys.clone(),
+                                footer_for_keys.clone(),
+                                seq,
+                                target,
+                                "settled + parked",
+                            );
+                        }
+                    }
+                } else if let Some(t) = s.selected_thread_mut() {
                     match t.lifecycle {
                         Lifecycle::Live => {
                             t.lifecycle = Lifecycle::Settled;
@@ -853,7 +1054,48 @@ fn build_proto_ui(app: &Application) {
                 }
             }
             (Some('p'), _) => {
-                if let Some(t) = s.selected_thread_mut() {
+                if s.live.is_some() {
+                    if let Some(seq) = s.selected {
+                        enum Plan {
+                            Unpark,
+                            Dance(u64),
+                            Msg(String),
+                        }
+                        let plan = {
+                            let world = s.live.as_ref().unwrap();
+                            match world.threads().iter().find(|t| t.seq == seq) {
+                                None => Plan::Msg("no such thread".into()),
+                                Some(t) if t.parked => Plan::Unpark,
+                                Some(t) => match t.window_id {
+                                    Some(id) => Plan::Dance(id),
+                                    None => Plan::Msg("no window — nothing to park (cold)".into()),
+                                },
+                            }
+                        };
+                        match plan {
+                            Plan::Unpark => {
+                                // Unpark = summon-here; scratchpad-show --id is
+                                // exact and grab-safe, keep the sidebar open.
+                                let msg = s.live.as_mut().unwrap().summon(seq);
+                                s.message = msg;
+                            }
+                            Plan::Msg(msg) => s.message = msg,
+                            Plan::Dance(target) => {
+                                s.message = "parking…".into();
+                                schedule_park(
+                                    state_for_keys.clone(),
+                                    window_for_keys.clone(),
+                                    list_for_keys.clone(),
+                                    header_for_keys.clone(),
+                                    footer_for_keys.clone(),
+                                    seq,
+                                    target,
+                                    "parked",
+                                );
+                            }
+                        }
+                    }
+                } else if let Some(t) = s.selected_thread_mut() {
                     t.parked = !t.parked;
                     s.message = format!(
                         "park: windows {} (spatial only — row unchanged)",
@@ -863,7 +1105,27 @@ fn build_proto_ui(app: &Application) {
             }
             (Some('a'), _) => {
                 let selected = s.selected;
-                if let Some(t) = s.selected_thread_mut() {
+                if s.live.is_some() {
+                    if let Some(id) = selected {
+                        let is_archived = s
+                            .live
+                            .as_ref()
+                            .unwrap()
+                            .threads()
+                            .iter()
+                            .find(|t| t.seq == id)
+                            .is_some_and(|t| t.archived_at.is_some());
+                        if is_archived || confirm == selected {
+                            let msg = s.live.as_mut().unwrap().toggle_archive(id);
+                            s.message = msg;
+                        } else {
+                            s.confirm_archive = selected;
+                            s.message =
+                                "archive reclaims worktree + runtime — press a again to confirm"
+                                    .into();
+                        }
+                    }
+                } else if let Some(t) = s.selected_thread_mut() {
                     match t.lifecycle {
                         Lifecycle::Archived => {
                             t.lifecycle = Lifecycle::Live;
@@ -886,7 +1148,12 @@ fn build_proto_ui(app: &Application) {
                 }
             }
             (Some('m'), _) => {
-                if let Some(t) = s.selected_thread_mut() {
+                if s.live.is_some() {
+                    if let Some(id) = s.selected {
+                        let msg = s.live.as_mut().unwrap().toggle_read(id);
+                        s.message = msg;
+                    }
+                } else if let Some(t) = s.selected_thread_mut() {
                     match t.attention {
                         Attention::Idle => {
                             t.attention = Attention::Unread;
@@ -901,14 +1168,40 @@ fn build_proto_ui(app: &Application) {
                 }
             }
             (Some('g'), _) => {
-                s.scope = match s.scope {
+                s.scope = match &s.scope {
                     Scope::Area(_) => Scope::Global,
-                    Scope::Global => Scope::Area("kanel"),
+                    Scope::Global => {
+                        if s.live.is_some() {
+                            // Area = the focused workspace's name; unnamed
+                            // workspaces have no area, so scope stays global.
+                            focused_area().map(Scope::Area).unwrap_or(Scope::Global)
+                        } else {
+                            Scope::Area("work".to_string())
+                        }
+                    }
                 };
-                s.message = match s.scope {
+                s.message = match &s.scope {
                     Scope::Global => "scope: all areas (non-area workspace fallback)".into(),
                     Scope::Area(a) => format!("scope: area '{a}' (follows focused workspace)"),
                 };
+            }
+            (Some('n'), _) => {
+                if s.live.is_some() {
+                    let msg = s.live.as_ref().unwrap().new_thread();
+                    s.message = msg;
+                } else {
+                    s.message = "new thread: live mode only (t simulates instead)".into();
+                }
+            }
+            (Some('r'), _) => {
+                let current = s.selected_thread().map(|t| t.title.clone());
+                match current {
+                    Some(title) => {
+                        s.message = format!("rename: {title}▏  (⏎ save · Esc cancel)");
+                        s.rename_buffer = Some(title);
+                    }
+                    None => s.message = "nothing selected".into(),
+                }
             }
             (_, Some("tab")) => {
                 s.settled_expanded = !s.settled_expanded;
@@ -922,34 +1215,59 @@ fn build_proto_ui(app: &Application) {
                 );
             }
             (Some('z'), _) => {
+                let count = s.section(Lifecycle::Archived).len();
                 s.archived_expanded = !s.archived_expanded;
-                s.message = format!(
-                    "archived shelf {}",
-                    if s.archived_expanded {
-                        "expanded"
-                    } else {
-                        "collapsed"
-                    }
-                );
+                s.message = if count == 0 {
+                    "no archived threads in scope".into()
+                } else {
+                    format!(
+                        "archived shelf {} ({count})",
+                        if s.archived_expanded {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        }
+                    )
+                };
             }
-            (Some('t'), _) => s.simulate(),
             _ => dirty = false,
         }
 
         if dirty {
+            regen_live(&mut s);
             rebuild(&list_for_keys, &header_for_keys, &footer_for_keys, &mut s);
         }
         gtk4::glib::Propagation::Stop
     });
     window.add_controller(key_controller);
 
-    // Tick the Working durations once a second.
+    // Tick the Working durations once a second; in live mode also re-join the
+    // real sessions/windows every other tick.
     let state_for_timer = state.clone();
     let list_for_timer = list_box.clone();
     let header_for_timer = header_box.clone();
     let footer_for_timer = footer.clone();
+    let window_for_timer = window.clone();
+    let mut tick: u64 = 0;
     gtk4::glib::timeout_add_local(Duration::from_secs(1), move || {
+        tick += 1;
+        if !window_for_timer.is_visible() {
+            return gtk4::glib::ControlFlow::Continue;
+        }
         let mut s = state_for_timer.borrow_mut();
+        if s.live.is_some() {
+            if tick.is_multiple_of(2) {
+                s.live.as_mut().unwrap().refresh();
+            }
+            regen_live(&mut s);
+            rebuild(
+                &list_for_timer,
+                &header_for_timer,
+                &footer_for_timer,
+                &mut s,
+            );
+            return gtk4::glib::ControlFlow::Continue;
+        }
         let any_working = s
             .threads
             .iter()
@@ -965,19 +1283,56 @@ fn build_proto_ui(app: &Application) {
         gtk4::glib::ControlFlow::Continue
     });
 
-    window.present();
+    // Every summon (map) re-syncs: fresh world join, scope follows the focused
+    // workspace, stale confirmations dropped.
+    let state_for_map = state.clone();
+    let list_for_map = list_box.clone();
+    let header_for_map = header_box.clone();
+    let footer_for_map = footer.clone();
+    window.connect_map(move |_| {
+        let mut s = state_for_map.borrow_mut();
+        s.confirm_archive = None;
+        if s.live.is_some() {
+            s.live.as_mut().unwrap().refresh();
+            s.scope = Scope::Global;
+            regen_live(&mut s);
+        }
+        rebuild(&list_for_map, &header_for_map, &footer_for_map, &mut s);
+    });
+
+    if live {
+        // Realize the layer surface, then start hidden (daemon-style start in
+        // zmx); the first Mod+S summons it.
+        window.present();
+        window.set_visible(false);
+    } else {
+        window.present();
+    }
 }
 
-pub fn run() -> gtk4::glib::ExitCode {
-    // Single-instance: a second `demo-sidebar` forwards activation here and exits,
-    // and the guard below refuses a second window (two stacked sidebars = two
-    // exclusive zones = phantom gap).
+pub fn run(live: bool) -> gtk4::glib::ExitCode {
+    // Single-instance: re-invocations (e.g. the Mod+S bind) forward activation
+    // to the running instance, which toggles the sidebar's visibility — the
+    // window persists, only its mapping changes (the production overlay's
+    // pattern). In live mode the process is persistent (zmx-hosted, logs via
+    // `zmx history agent-switch-sidebar`) and starts hidden, daemon-style;
+    // mock mode shows immediately and exits on q/Esc.
     let app = Application::builder()
         .application_id("com.thrawny.agent-switch.sidebar-proto")
         .build();
-    app.connect_activate(|app| {
-        if app.windows().is_empty() {
-            build_proto_ui(app);
+    app.connect_activate(move |app| {
+        if let Some(window) = app.windows().first() {
+            if window.is_visible() {
+                window.set_visible(false);
+            } else {
+                window.present();
+            }
+        } else {
+            if live {
+                // Keep the process alive while the window is hidden.
+                std::mem::forget(app.hold());
+            }
+            build_proto_ui(app, live);
         }
     });
     app.run_with_args::<&str>(&[])

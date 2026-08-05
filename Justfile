@@ -52,6 +52,13 @@ demo theme="":
 demo-sidebar:
     cargo run -- demo-sidebar
 
+# PROTOTYPE: ticket-08 live sidebar daemon in zmx; Mod+S toggles it.
+# Logs: zmx history agent-switch-sidebar
+demo-sidebar-live:
+    cargo build
+    -zmx kill agent-switch-sidebar
+    zmx run agent-switch-sidebar -d ./target/debug/agent-switch demo-sidebar --live
+
 # Format code
 fmt:
     cargo fmt
