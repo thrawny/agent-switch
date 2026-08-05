@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 use crate::sidebar_proto_live::{LiveThread, LiveWorld, focused_area};
 use crate::state::{SessionState, WaitingReason};
 
-const SIDEBAR_WIDTH: i32 = 340;
+// Widened for the diagnostics pass (2026-08-05): room for the debug line and
+// bigger type while more instrumentation gets added.
+const SIDEBAR_WIDTH: i32 = 480;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Attention {
@@ -65,6 +67,8 @@ struct ProtoThread {
     working_since: Option<Instant>,
     idle_mins: u32,
     settled_mins: Option<u32>,
+    /// Diagnostics line (live mode): seq, window id, harness session id.
+    debug: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -144,6 +148,7 @@ fn mock_threads() -> Vec<ProtoThread> {
             working_since: working_offset_secs.map(|s| Instant::now() - Duration::from_secs(s)),
             idle_mins,
             settled_mins,
+            debug: String::new(),
         }
     };
 
@@ -320,6 +325,14 @@ fn proto_from_live(t: &LiveThread, now: f64) -> ProtoThread {
         working_since,
         idle_mins: ((now - t.state_updated).max(0.0) / 60.0) as u32,
         settled_mins: t.settled_at.map(|at| ((now - at).max(0.0) / 60.0) as u32),
+        debug: format!(
+            "#{} · w{} · {}",
+            t.seq,
+            t.window_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "—".into()),
+            t.harness_session_id,
+        ),
     }
 }
 
@@ -506,12 +519,27 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
     line3.append(&harness);
     card.append(&line3);
 
+    // Line 4 (live only): diagnostics — seq · window id · harness session id.
+    if !thread.debug.is_empty() {
+        let dbg = Label::new(Some(&thread.debug));
+        dbg.add_css_class("proto-debug");
+        dbg.set_halign(gtk4::Align::Start);
+        dbg.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        card.append(&dbg);
+    }
+
     card
 }
 
 fn build_slim_row(thread: &ProtoThread, index: Option<usize>, selected: bool) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 6);
     row.add_css_class("proto-slim");
+    if !thread.debug.is_empty() {
+        row.set_tooltip_text(Some(&thread.debug));
+        let seq = Label::new(Some(&format!("#{}", thread.id)));
+        seq.add_css_class("proto-debug");
+        row.append(&seq);
+    }
     if selected {
         row.add_css_class("proto-selected");
     }
@@ -670,42 +698,43 @@ window { background-color: transparent; }
     background-color: rgba(24, 25, 30, 0.97);
     border-right: 1px solid rgba(255, 255, 255, 0.12);
 }
-.proto-header { padding: 12px 14px 8px 14px; }
-label.proto-scope { color: #d4d4d4; font-size: 13px; font-weight: bold; font-family: monospace; }
-label.proto-agg-waiting { color: #ff9e3b; font-size: 11px; font-family: monospace; }
-label.proto-agg-quiet { color: #6a6f7a; font-size: 11px; font-family: monospace; }
+.proto-header { padding: 14px 16px 10px 16px; }
+label.proto-scope { color: #d4d4d4; font-size: 15px; font-weight: bold; font-family: monospace; }
+label.proto-agg-waiting { color: #ff9e3b; font-size: 13px; font-family: monospace; }
+label.proto-agg-quiet { color: #6a6f7a; font-size: 13px; font-family: monospace; }
 
-.proto-card { padding: 8px 14px; border-radius: 6px; margin: 1px 6px; }
+.proto-card { padding: 10px 16px; border-radius: 6px; margin: 2px 8px; }
 .proto-card.proto-selected, .proto-slim.proto-selected { background-color: rgba(255, 255, 255, 0.09); }
 .proto-card.proto-recede { opacity: 0.62; }
 
 label { color: #c8ccd4; }
-label.proto-repo { color: #8a8f9a; font-size: 11px; font-family: monospace; }
-label.proto-title { color: #d8dce4; font-size: 14px; }
+label.proto-repo { color: #8a8f9a; font-size: 13px; font-family: monospace; }
+label.proto-title { color: #d8dce4; font-size: 16px; }
 label.proto-title-unread { color: #ffffff; font-weight: bold; }
-label.proto-branch { color: #6a6f7a; font-size: 11px; font-family: monospace; }
-label.proto-host { color: #7aa2f7; font-size: 11px; }
-label.proto-harness { color: #8a8f9a; font-size: 12px; }
-label.proto-jump { color: #565b66; font-size: 10px; font-family: monospace; }
+label.proto-branch { color: #6a6f7a; font-size: 13px; font-family: monospace; }
+label.proto-host { color: #7aa2f7; font-size: 13px; }
+label.proto-harness { color: #8a8f9a; font-size: 14px; }
+label.proto-jump { color: #565b66; font-size: 12px; font-family: monospace; }
+label.proto-debug { color: #565b66; font-size: 11px; font-family: monospace; }
 
 /* Colorblind-safe status hues: orange=act-now, blue family=info/motion,
    magenta=failed, brightness+check=done. No red/green pairs. */
-label.proto-approval { color: #ff9e3b; font-size: 11px; font-weight: bold; }
-label.proto-input { color: #7aa2f7; font-size: 11px; font-weight: bold; }
-label.proto-working { color: #7dcfff; font-size: 11px; font-family: monospace; }
-label.proto-failed { color: #d27ce0; font-size: 11px; font-weight: bold; }
-label.proto-done { color: #ffffff; font-size: 11px; font-weight: bold; }
-label.proto-time { color: #6a6f7a; font-size: 11px; font-family: monospace; }
+label.proto-approval { color: #ff9e3b; font-size: 13px; font-weight: bold; }
+label.proto-input { color: #7aa2f7; font-size: 13px; font-weight: bold; }
+label.proto-working { color: #7dcfff; font-size: 13px; font-family: monospace; }
+label.proto-failed { color: #d27ce0; font-size: 13px; font-weight: bold; }
+label.proto-done { color: #ffffff; font-size: 13px; font-weight: bold; }
+label.proto-time { color: #6a6f7a; font-size: 13px; font-family: monospace; }
 
-.proto-shelf { padding: 10px 14px 4px 14px; }
-label.proto-shelf-title { color: #6a6f7a; font-size: 11px; font-family: monospace; }
+.proto-shelf { padding: 12px 16px 5px 16px; }
+label.proto-shelf-title { color: #6a6f7a; font-size: 13px; font-family: monospace; }
 separator.proto-shelf-rule { background-color: rgba(255, 255, 255, 0.08); min-height: 1px; }
-.proto-slim { padding: 6px 14px; margin: 0px 6px; border-radius: 6px; }
-label.proto-slim-title { color: #8a8f9a; font-size: 12px; }
+.proto-slim { padding: 7px 16px; margin: 0px 8px; border-radius: 6px; }
+label.proto-slim-title { color: #8a8f9a; font-size: 14px; }
 .proto-ghost label.proto-slim-title { color: #565b66; font-style: italic; }
 
-label.proto-footer { color: #8a8f9a; font-size: 10px; font-family: monospace; padding: 4px 14px; }
-label.proto-help { color: #565b66; font-size: 9px; font-family: monospace; padding: 0px 14px 10px 14px; }
+label.proto-footer { color: #8a8f9a; font-size: 12px; font-family: monospace; padding: 5px 16px; }
+label.proto-help { color: #565b66; font-size: 11px; font-family: monospace; padding: 0px 16px 12px 16px; }
 ";
 
 /// Live summon: the sidebar's exclusive keyboard grab makes niri treat "no
@@ -721,9 +750,11 @@ fn schedule_summon(state: Rc<RefCell<ProtoState>>, window: ApplicationWindow, se
     });
 }
 
-/// Live park keeps the sidebar open, so instead of dismissing it releases the
-/// keyboard grab, focuses the target window (nirius resolves "current window"
-/// through niri focus), toggles it into the scratchpad, then re-grabs.
+/// Fallback park (used when the matcher-based in-place park misses): keeps
+/// the sidebar open but releases the keyboard grab, focuses the target window
+/// (nirius resolves "current window" through niri focus), toggles it into the
+/// scratchpad, then returns to the workspace the user came from and re-grabs
+/// — settling a thread in another area must not strand you there.
 #[allow(clippy::too_many_arguments)]
 fn schedule_park(
     state: Rc<RefCell<ProtoState>>,
@@ -735,6 +766,10 @@ fn schedule_park(
     target: u64,
     verb: &'static str,
 ) {
+    let home_workspace = crate::niri::niri_workspaces()
+        .into_iter()
+        .find(|ws| ws.is_focused)
+        .map(|ws| ws.id);
     window.set_keyboard_mode(KeyboardMode::None);
     gtk4::glib::timeout_add_local_once(Duration::from_millis(60), move || {
         let focused = crate::niri::focus_window(target);
@@ -749,6 +784,11 @@ fn schedule_park(
             } else {
                 format!("focus-window {target} failed — cannot park")
             };
+            if let Some(ws) = home_workspace {
+                crate::niri::niri_action(niri_ipc::Action::FocusWorkspace {
+                    reference: niri_ipc::WorkspaceReferenceArg::Id(ws),
+                });
+            }
             window.set_keyboard_mode(KeyboardMode::Exclusive);
             let mut s = state.borrow_mut();
             s.message = msg;
@@ -1022,16 +1062,26 @@ fn build_proto_ui(app: &Application, live: bool) {
                         let msg = s.live.as_mut().unwrap().toggle_settle(seq);
                         s.message = msg;
                         if let Some(target) = park_target {
-                            schedule_park(
-                                state_for_keys.clone(),
-                                window_for_keys.clone(),
-                                list_for_keys.clone(),
-                                header_for_keys.clone(),
-                                footer_for_keys.clone(),
-                                seq,
-                                target,
-                                "settled + parked",
-                            );
+                            // In-place first (no focus change); the dance
+                            // only when the matcher misses.
+                            let parked = s
+                                .live
+                                .as_mut()
+                                .unwrap()
+                                .park_in_place(seq, "settled + parked");
+                            match parked {
+                                Ok(msg) => s.message = msg,
+                                Err(_) => schedule_park(
+                                    state_for_keys.clone(),
+                                    window_for_keys.clone(),
+                                    list_for_keys.clone(),
+                                    header_for_keys.clone(),
+                                    footer_for_keys.clone(),
+                                    seq,
+                                    target,
+                                    "settled + parked",
+                                ),
+                            }
                         }
                     }
                 } else if let Some(t) = s.selected_thread_mut() {
@@ -1081,17 +1131,25 @@ fn build_proto_ui(app: &Application, live: bool) {
                             }
                             Plan::Msg(msg) => s.message = msg,
                             Plan::Dance(target) => {
-                                s.message = "parking…".into();
-                                schedule_park(
-                                    state_for_keys.clone(),
-                                    window_for_keys.clone(),
-                                    list_for_keys.clone(),
-                                    header_for_keys.clone(),
-                                    footer_for_keys.clone(),
-                                    seq,
-                                    target,
-                                    "parked",
-                                );
+                                // In-place first (no focus change); the dance
+                                // only when the matcher misses.
+                                let parked = s.live.as_mut().unwrap().park_in_place(seq, "parked");
+                                match parked {
+                                    Ok(msg) => s.message = msg,
+                                    Err(_) => {
+                                        s.message = "parking (focus dance)…".into();
+                                        schedule_park(
+                                            state_for_keys.clone(),
+                                            window_for_keys.clone(),
+                                            list_for_keys.clone(),
+                                            header_for_keys.clone(),
+                                            footer_for_keys.clone(),
+                                            seq,
+                                            target,
+                                            "parked",
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1194,13 +1252,12 @@ fn build_proto_ui(app: &Application, live: bool) {
                 }
             }
             (Some('r'), _) => {
-                let current = s.selected_thread().map(|t| t.title.clone());
-                match current {
-                    Some(title) => {
-                        s.message = format!("rename: {title}▏  (⏎ save · Esc cancel)");
-                        s.rename_buffer = Some(title);
-                    }
-                    None => s.message = "nothing selected".into(),
+                // Blank form — retyping beats backspacing a long title.
+                if s.selected.is_some() {
+                    s.rename_buffer = Some(String::new());
+                    s.message = "rename: ▏  (⏎ save · Esc cancel)".into();
+                } else {
+                    s.message = "nothing selected".into();
                 }
             }
             (_, Some("tab")) => {

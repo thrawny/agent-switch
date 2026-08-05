@@ -49,6 +49,9 @@ pub struct LiveThread {
     pub last_read_at: f64,
     pub settled_at: Option<f64>,
     pub archived_at: Option<f64>,
+    /// True once the user renamed the thread (r): the title is theirs and
+    /// harness-provided session names stop updating it.
+    pub renamed: bool,
 }
 
 impl LiveThread {
@@ -81,6 +84,8 @@ struct ProtoRecord {
     last_read_at: f64,
     settled_at: Option<f64>,
     archived_at: Option<f64>,
+    #[serde(default)]
+    renamed: bool,
 }
 
 fn registry_path() -> std::path::PathBuf {
@@ -104,6 +109,19 @@ fn focus_area(area: &str) -> bool {
         });
     }
     exists
+}
+
+/// Escape regex metacharacters so a live window title becomes an exact-match
+/// pattern for nirius matchers.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if "\\.^$*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn bare_session_id(id: &str) -> &str {
@@ -228,6 +246,7 @@ impl LiveWorld {
                 last_read_at: r.last_read_at,
                 settled_at: r.settled_at,
                 archived_at: r.archived_at,
+                renamed: r.renamed,
             });
         }
     }
@@ -249,6 +268,7 @@ impl LiveWorld {
                 last_read_at: t.last_read_at,
                 settled_at: t.settled_at,
                 archived_at: t.archived_at,
+                renamed: t.renamed,
             })
             .collect();
         if let Ok(json) = serde_json::to_string_pretty(&records)
@@ -309,6 +329,20 @@ impl LiveWorld {
         sessions.sort_by(|a, b| a.state_updated.total_cmp(&b.state_updated));
 
         let now = state::now();
+        // Which live window each store session claims, and which sessions
+        // still exist at all — a binding held against a window another
+        // session claims is stale, and a thread with neither window nor
+        // session was closed outside the sidebar.
+        let claimed: HashMap<u64, String> = sessions
+            .iter()
+            .filter_map(|s| {
+                let id: u64 = s.window.niri_id.as_deref()?.parse().ok()?;
+                windows
+                    .contains_key(&id)
+                    .then(|| (id, s.session_id.clone()))
+            })
+            .collect();
+        let store_sids: HashSet<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
         // Window/parked/area facts for a candidate binding.
         let derive = |id: Option<u64>| {
             let window = id.and_then(|i| windows.get(&i));
@@ -340,6 +374,20 @@ impl LiveWorld {
                             && bare_session_id(&t.harness_session_id)
                                 == bare_session_id(&session.session_id)
                     })
+                })
+                .or_else(|| {
+                    // Window succession (2026-08-05): a new session claiming
+                    // the window of a thread whose own session is gone is the
+                    // same seat continuing (claude /clear + handoff, pi /new)
+                    // — reuse the thread instead of releasing it into an
+                    // auto-archive and minting a duplicate.
+                    let id = window_id?;
+                    if claimed.get(&id) != Some(&session.session_id) {
+                        return None;
+                    }
+                    self.threads.iter().position(|t| {
+                        t.window_id == Some(id) && !store_sids.contains(&t.harness_session_id)
+                    })
                 });
 
             let branch = session
@@ -351,17 +399,45 @@ impl LiveWorld {
             match idx {
                 Some(idx) => {
                     let t = &mut self.threads[idx];
+                    // Archive just closed this thread's window; give the
+                    // session-end hook (and ghostty's close-confirm) a grace
+                    // window before believing the lingering session again.
+                    // Past the grace, a still-alive session means the reclaim
+                    // failed — the rebind below un-archives honestly.
+                    let reclaiming = t.archived_at.is_some_and(|at| now - at < 10.0);
                     // The registry's live binding outlives producer-cache
                     // churn: Claude re-fires session-start on compaction, and
                     // the track hook re-keys sessions.json to whatever window
                     // was focused at that moment (2026-08-04 bug). Only adopt
-                    // a different window once the bound one is actually gone.
+                    // a different window once the bound one is gone — or
+                    // claimed by a different session (pi /new reuses the
+                    // window; the old thread must not squat on it).
                     let effective = match t.window_id {
-                        Some(old) if windows.contains_key(&old) => Some(old),
+                        _ if reclaiming => None,
+                        Some(old)
+                            if windows.contains_key(&old)
+                                && claimed
+                                    .get(&old)
+                                    .is_none_or(|sid| *sid == session.session_id) =>
+                        {
+                            Some(old)
+                        }
                         _ => window_id,
                     };
                     let (window, parked, area) = derive(effective);
+                    if t.window_id.is_none() && effective.is_some() {
+                        // Runtime came back (resurrection rebind) — a revived
+                        // thread is no tombstone.
+                        t.archived_at = None;
+                    }
+                    // Succession can hand the seat to a different harness
+                    // (quit claude, start pi in the same terminal) — the
+                    // thread follows the seat, so its harness and cwd do too.
+                    t.harness = session.agent;
                     t.harness_session_id = session.session_id;
+                    if session.cwd.is_some() {
+                        t.cwd = session.cwd;
+                    }
                     t.window_id = effective;
                     t.pid = window.and_then(|w| w.pid);
                     t.parked = parked;
@@ -370,6 +446,13 @@ impl LiveWorld {
                     t.state_updated = session.state_updated;
                     t.transcript_path = session.transcript_path;
                     t.branch = branch;
+                    // Harness session names (pi --name, claude) are the
+                    // default title; a manual rename owns it forever.
+                    if !t.renamed
+                        && let Some(name) = &session.session_name
+                    {
+                        t.title = name.clone();
+                    }
                     if let Some(area) = area {
                         t.area = area;
                     }
@@ -390,8 +473,12 @@ impl LiveWorld {
                     let (window, parked, area) = derive(window_id);
                     self.next_seq += 1;
                     let repo = session.cwd.as_deref().map(repo_name).unwrap_or_default();
-                    let title = window
-                        .and_then(|w| w.title.clone())
+                    // Default title precedence: harness session name (pi
+                    // --name, claude) > window title > repo name.
+                    let title = session
+                        .session_name
+                        .clone()
+                        .or_else(|| window.and_then(|w| w.title.clone()))
                         .unwrap_or_else(|| repo.clone());
                     self.threads.push(LiveThread {
                         seq: self.next_seq,
@@ -415,19 +502,47 @@ impl LiveWorld {
                         last_read_at: session.state_updated,
                         settled_at: None,
                         archived_at: None,
+                        renamed: false,
                     });
                 }
             }
         }
 
-        // Only an actually-closed niri window makes a thread cold — a session
-        // vanishing from sessions.json (compaction re-key, daemon cleanup)
-        // must not: the registry keeps the thread, the binding stays live.
+        // A thread goes cold when its window actually closes OR a session
+        // that is still alive elsewhere holds a stale claim on the window
+        // (compaction re-key). Dead-session takeovers never reach here —
+        // window succession above rebinds the thread to the new session. A
+        // session merely vanishing from sessions.json (compaction re-key)
+        // still doesn't release a live binding.
         for t in &mut self.threads {
-            if t.window_id.is_some_and(|id| !windows.contains_key(&id)) {
+            let gone = t.window_id.is_some_and(|id| !windows.contains_key(&id));
+            let taken = t.window_id.is_some_and(|id| {
+                claimed
+                    .get(&id)
+                    .is_some_and(|sid| *sid != t.harness_session_id)
+            });
+            if gone || taken {
                 t.window_id = None;
                 t.pid = None;
                 t.parked = false;
+            }
+            // Closed outside the sidebar = archive (user call, 2026-08-05):
+            // no window and no session left means the user closed it or the
+            // harness moved on — tombstone it; Enter on the shelf revives.
+            // The read-marker grace keeps a just-summoned resurrection from
+            // being re-tombstoned before its session-start lands.
+            if t.window_id.is_none()
+                && t.archived_at.is_none()
+                && !store_sids.contains(&t.harness_session_id)
+                && now - t.last_read_at > 15.0
+            {
+                info!(
+                    "auto-archive: '{}' (#{}) lost window+session outside the sidebar",
+                    t.title, t.seq
+                );
+                t.archived_at = Some(now);
+                t.settled_at.get_or_insert(now);
+                t.last_read_at = now;
             }
         }
         self.save();
@@ -527,12 +642,58 @@ impl LiveWorld {
         }
     }
 
-    /// Toggle the *currently focused* window into the nirius scratchpad. The
-    /// caller must have focused the thread's window first: scratchpad-toggle
-    /// has no --id, pid-matching is useless against single-instance ghostty
-    /// (one pid owns every window), and while the sidebar holds its exclusive
-    /// keyboard grab niri reports no focused window at all — so parking goes
-    /// through the sidebar's release-grab → focus → toggle → re-grab dance.
+    /// Park without moving the user: scratchpad-toggle has no --id, but its
+    /// matchers (--workspace-id + exact-title regex) select the window from
+    /// anywhere — no focus, no grab release, you stay in your area. Fails
+    /// (→ caller falls back to the focus dance) when the title changed
+    /// between poll and toggle (working threads animate their titles) or the
+    /// match is ambiguous.
+    pub fn park_in_place(&mut self, seq: u64, verb: &str) -> Result<String, String> {
+        let Some(t) = self.get_mut(seq) else {
+            return Err("no such thread".into());
+        };
+        let Some(id) = t.window_id else {
+            return Err("no window — nothing to park (cold)".into());
+        };
+        let window = niri::niri_windows().into_iter().find(|w| w.id == id);
+        let Some(window) = window else {
+            return Err("window vanished".into());
+        };
+        let (Some(ws), Some(title)) = (window.workspace_id, window.title) else {
+            return Err("window has no workspace/title to match on".into());
+        };
+        let pattern = format!("^{}$", regex_escape(&title));
+        run_cmd(
+            "nirius",
+            &[
+                "scratchpad-toggle",
+                "--workspace-id",
+                &ws.to_string(),
+                "--title",
+                &pattern,
+            ],
+        )
+        .map_err(|err| {
+            warn!("{verb}: in-place park missed ({err}) — falling back to focus dance");
+            err
+        })?;
+        info!(
+            "{verb}: in-place scratchpad-toggle on window {id} ('{}')",
+            t.title
+        );
+        t.parked = true;
+        let msg = format!("{verb} '{}' (in place)", t.title);
+        self.save();
+        Ok(msg)
+    }
+
+    /// Fallback when the matcher park misses: toggle the *currently focused*
+    /// window into the nirius scratchpad. The caller must have focused the
+    /// thread's window first — pid-matching is useless against
+    /// single-instance ghostty (one pid owns every window), and while the
+    /// sidebar holds its exclusive keyboard grab niri reports no focused
+    /// window at all — so this goes through the sidebar's release-grab →
+    /// focus → toggle → return home → re-grab dance.
     pub fn park_focused(&mut self, seq: u64, verb: &str) -> String {
         let Some(t) = self.get_mut(seq) else {
             return "no such thread".into();
@@ -581,11 +742,26 @@ impl LiveWorld {
         };
         let msg = if t.archived_at.is_some() {
             t.archived_at = None;
-            "unarchived — restored to live".to_string()
+            "unarchived — restored to live (cold; ⏎ resurrects)".to_string()
         } else {
             t.archived_at = Some(now);
             t.settled_at = Some(now);
-            "archived — tombstone on the z shelf (runtime/worktree untouched in proto)".to_string()
+            t.last_read_at = now;
+            // Archive is the reclaim verb (03): close the runtime too. The
+            // transcript keeps the conversation; ⏎ on the tombstone revives.
+            // CloseWindow by id is grab-safe (no focus involved); the harness
+            // exits with its terminal, session-end fires, and the sweep sees
+            // the window gone. Worktree reclaim stays out of proto scope.
+            match t.window_id.take() {
+                Some(id) => {
+                    info!("archive: closing window {id} ('{}')", t.title);
+                    t.pid = None;
+                    t.parked = false;
+                    niri::niri_action(niri_ipc::Action::CloseWindow { id: Some(id) });
+                    "archived — window closed, tombstone on the z shelf".to_string()
+                }
+                None => "archived — tombstone on the z shelf".to_string(),
+            }
         };
         self.save();
         msg
@@ -615,6 +791,7 @@ impl LiveWorld {
             return "no such thread".into();
         };
         t.title = title;
+        t.renamed = true;
         let msg = format!("renamed to '{}'", t.title);
         self.save();
         msg
