@@ -61,6 +61,10 @@ pub struct LiveThread {
     /// A generated first-prompt title has the same ownership behavior as a
     /// manual rename, but stays distinguishable for future policy changes.
     pub auto_named: bool,
+    /// Title came from the harness's own transcript (Claude's `ai-title`), so
+    /// it must never be propagated back — that would echo Claude's title into
+    /// Claude's own transcript as a `custom-title` override.
+    pub ai_titled: bool,
     /// Fingerprint of the latest prompt observed for one-shot generation.
     pub auto_title_prompt_hash: u64,
     /// Current producer explicitly supplied a harness session name.
@@ -113,6 +117,8 @@ struct ProtoRecord {
     renamed: bool,
     #[serde(default)]
     auto_named: bool,
+    #[serde(default)]
+    ai_titled: bool,
     #[serde(default)]
     auto_title_prompt_hash: u64,
 }
@@ -322,7 +328,9 @@ fn title_prompt(message: &str) -> String {
     .join("\n")
 }
 
-fn sanitize_auto_title(raw: &str) -> Option<String> {
+/// Trim a title down to a single display-sized line. Applies to titles the
+/// harness authored as well as generated ones.
+fn clamp_title(raw: &str) -> Option<String> {
     let first = raw.lines().next()?.trim();
     let title = first
         .trim_matches(|c| matches!(c, '\'' | '"' | '`'))
@@ -337,6 +345,54 @@ fn sanitize_auto_title(raw: &str) -> Option<String> {
     }
     let shortened: String = title.chars().take(47).collect();
     Some(format!("{}...", shortened.trim_end()))
+}
+
+/// A generator handed a thin prompt answers with prose instead of a title —
+/// one thread wore "I'm not sure what you're asking me to do. Thi..." because
+/// the sanitizer only truncated. Reject prose so the thread stays unnamed and
+/// retries on the next prompt rather than keeping a refusal forever.
+fn looks_like_prose(line: &str) -> bool {
+    let lowered = line
+        .trim_start_matches(['"', '\'', '`', ' '])
+        .to_lowercase();
+    const OPENERS: [&str; 12] = [
+        "i'm not sure",
+        "i am not sure",
+        "i'm unable",
+        "i cannot",
+        "i can't",
+        "i don't",
+        "i need",
+        "sorry",
+        "it's unclear",
+        "it is unclear",
+        "could you",
+        "there is no",
+    ];
+    if OPENERS.iter().any(|opener| lowered.starts_with(opener)) {
+        return true;
+    }
+    // The prompt asks for 3-8 words with no trailing punctuation; a sentence
+    // overshoots both. Length alone stays generous so a slightly wordy but
+    // genuine title still lands.
+    let words = line.split_whitespace().count();
+    words > 12 || (words > 8 && line.ends_with(['.', '?', '!']))
+}
+
+fn sanitize_auto_title(raw: &str) -> Option<String> {
+    let first = raw.lines().next()?.trim();
+    if looks_like_prose(first) {
+        return None;
+    }
+    clamp_title(raw)
+}
+
+/// A bare acknowledgement ("yes", "fix it", "send it") describes nothing, so a
+/// generator handed one either invents a topic or refuses. Wait for a prompt
+/// with enough substance to summarize.
+fn prompt_is_titleable(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    trimmed.split_whitespace().count() >= 4 && trimmed.chars().count() >= 20
 }
 
 fn prompt_hash(prompt: &str) -> u64 {
@@ -397,13 +453,37 @@ fn latest_prompt_from_jsonl(harness: &str, jsonl: &str) -> Option<String> {
     None
 }
 
-fn latest_transcript_prompt(harness: &str, path: &str) -> Option<String> {
+/// Claude derives its own conversation title and writes it into the transcript
+/// as an `ai-title` record: once per session, early, never regenerated, and
+/// re-emitted on roughly every prompt so the newest lines always carry it. It
+/// summarizes the whole conversation rather than one prompt, which makes it
+/// both cheaper and better than anything we can re-derive — and it survives
+/// sessions opened with a slash command, where `lastPrompt` is absent.
+fn harness_title_from_jsonl(harness: &str, jsonl: &str) -> Option<String> {
+    if harness != "claude" {
+        return None;
+    }
+    jsonl.lines().rev().find_map(|line| {
+        let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        if value.get("type").and_then(|v| v.as_str()) != Some("ai-title") {
+            return None;
+        }
+        clamp_title(value.get("aiTitle")?.as_str()?)
+    })
+}
+
+/// Only the harnesses that publish no title of their own need one generated.
+fn harness_generates_titles(harness: &str) -> bool {
+    matches!(harness, "pi" | "codex")
+}
+
+fn read_transcript_tail(path: &str) -> Option<String> {
     let output = Command::new("tail")
         .args(["-n", "500", path])
         .output()
         .ok()?
         .stdout;
-    latest_prompt_from_jsonl(harness, &String::from_utf8_lossy(&output))
+    Some(String::from_utf8_lossy(&output).into_owned())
 }
 
 fn run_title_process(command: &mut Command) -> Result<std::process::Output, String> {
@@ -451,20 +531,6 @@ fn generate_auto_title(
                 "--no-skills",
                 "--no-prompt-templates",
                 "--no-context-files",
-                &prompt,
-            ]);
-            command
-        }
-        "claude" => {
-            let mut command = Command::new("claude");
-            command.args([
-                "-p",
-                "--output-format",
-                "text",
-                "--model",
-                "claude-haiku-4-5",
-                "--no-session-persistence",
-                "--disable-slash-commands",
                 &prompt,
             ]);
             command
@@ -610,6 +676,7 @@ impl LiveWorld {
                 deleted_at: r.deleted_at,
                 renamed: r.renamed,
                 auto_named: r.auto_named,
+                ai_titled: r.ai_titled,
                 auto_title_prompt_hash: r.auto_title_prompt_hash,
                 harness_named: false,
             });
@@ -636,6 +703,7 @@ impl LiveWorld {
                 deleted_at: t.deleted_at,
                 renamed: t.renamed,
                 auto_named: t.auto_named,
+                ai_titled: t.ai_titled,
                 auto_title_prompt_hash: t.auto_title_prompt_hash,
             })
             .collect();
@@ -817,7 +885,32 @@ impl LiveWorld {
             .collect();
 
         for (seq, harness_session_id, harness, cwd, transcript_path, previous_hash) in candidates {
-            let Some(prompt) = latest_transcript_prompt(&harness, &transcript_path) else {
+            let Some(tail) = read_transcript_tail(&transcript_path) else {
+                continue;
+            };
+
+            // A title the harness published beats one we derive, costs no
+            // subprocess, and needs no prompt at all — so it applies even
+            // during startup, where generation deliberately holds back.
+            if let Some(title) = harness_title_from_jsonl(&harness, &tail) {
+                if let Some(thread) = self.get_mut(seq) {
+                    thread.title = title;
+                    thread.auto_named = true;
+                    thread.ai_titled = true;
+                    info!(
+                        "auto-title: '{}' (#{seq} via {harness}, <- ai-title)",
+                        thread.title
+                    );
+                }
+                continue;
+            }
+
+            // Claude publishes `ai-title` or nothing; it has no generator.
+            if !harness_generates_titles(&harness) {
+                continue;
+            }
+
+            let Some(prompt) = latest_prompt_from_jsonl(&harness, &tail) else {
                 continue;
             };
             let hash = prompt_hash(&prompt);
@@ -831,6 +924,11 @@ impl LiveWorld {
             // baseline on startup; they are named from the next prompt, not
             // retroactively from an old transcript.
             if self.initializing && previous_hash == 0 {
+                continue;
+            }
+            // The hash is recorded first so a thin prompt still advances the
+            // baseline and is skipped exactly once.
+            if !prompt_is_titleable(&prompt) {
                 continue;
             }
 
@@ -1001,8 +1099,11 @@ impl LiveWorld {
                     // Reconcile a manual rename across succession: the new
                     // conversation's transcript has never seen the title, so
                     // re-assert it. Resume-rebinds (same bare id, same
-                    // transcript) already carry it.
-                    if succeeded && (t.renamed || t.auto_named) {
+                    // transcript) already carry it. A title we read out of the
+                    // harness's own transcript is excluded — writing it back
+                    // would override Claude's `ai-title` with a `custom-title`
+                    // copy of itself.
+                    if succeeded && (t.renamed || t.auto_named) && !t.ai_titled {
                         propagate_rename(t);
                     }
                     t.branch = branch;
@@ -1078,6 +1179,7 @@ impl LiveWorld {
                         deleted_at: None,
                         renamed: false,
                         auto_named: false,
+                        ai_titled: false,
                         auto_title_prompt_hash: 0,
                         harness_named: session.session_name.is_some(),
                     });
@@ -1475,7 +1577,10 @@ pub fn focused_area() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtoRecord, latest_prompt_from_jsonl, sanitize_auto_title, stable_window_title};
+    use super::{
+        ProtoRecord, harness_generates_titles, harness_title_from_jsonl, latest_prompt_from_jsonl,
+        prompt_is_titleable, sanitize_auto_title, stable_window_title,
+    };
 
     #[test]
     fn stable_window_title_strips_codex_braille_spinner() {
@@ -1531,5 +1636,69 @@ mod tests {
             Some("Fix reconnect spinner")
         );
         assert_eq!(sanitize_auto_title("  "), None);
+    }
+
+    #[test]
+    fn auto_title_rejects_generator_prose() {
+        // The refusal that titled a real thread before this guard existed.
+        assert_eq!(
+            sanitize_auto_title(
+                "I'm not sure what you're asking me to do. This looks like a fragment."
+            ),
+            None
+        );
+        assert_eq!(sanitize_auto_title("Sorry, I need more context"), None);
+        assert_eq!(
+            sanitize_auto_title(
+                "The user appears to be acknowledging that they already sent the email earlier."
+            ),
+            None
+        );
+        // A genuine title that happens to carry punctuation still lands.
+        assert_eq!(
+            sanitize_auto_title("Fix reconnect spinner.").as_deref(),
+            Some("Fix reconnect spinner.")
+        );
+    }
+
+    #[test]
+    fn thin_prompts_do_not_reach_a_generator() {
+        for thin in ["yes", "fix it", "send it", "on the draft", "yes do it"] {
+            assert!(!prompt_is_titleable(thin), "{thin} should be skipped");
+        }
+        assert!(prompt_is_titleable(
+            "update the html template to make the link clickable"
+        ));
+    }
+
+    #[test]
+    fn claude_titles_come_from_the_transcript_not_a_generator() {
+        let jsonl = concat!(
+            r#"{"type":"ai-title","aiTitle":"Update CV with recent work"}"#,
+            "\n",
+            r#"{"type":"last-prompt","lastPrompt":"send it"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Fix messed up session titles in sidebar"}"#,
+        );
+
+        // Newest record wins, and only Claude publishes one.
+        assert_eq!(
+            harness_title_from_jsonl("claude", jsonl).as_deref(),
+            Some("Fix messed up session titles in sidebar")
+        );
+        assert_eq!(harness_title_from_jsonl("pi", jsonl), None);
+
+        assert!(!harness_generates_titles("claude"));
+        assert!(harness_generates_titles("pi"));
+        assert!(harness_generates_titles("codex"));
+    }
+
+    #[test]
+    fn slash_command_turns_have_no_prompt_to_title_from() {
+        // Claude writes `last-prompt` with no `lastPrompt` field for slash
+        // commands; ai-title is what covers those sessions.
+        let jsonl = r#"{"type":"last-prompt","leafUuid":"c8a44b6e","sessionId":"55a34e4e"}"#;
+        assert_eq!(latest_prompt_from_jsonl("claude", jsonl), None);
+        assert_eq!(harness_title_from_jsonl("claude", jsonl), None);
     }
 }
