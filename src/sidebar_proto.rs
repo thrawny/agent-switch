@@ -472,6 +472,17 @@ fn status_label(thread: &ProtoThread) -> (String, &'static str) {
     }
 }
 
+/// Where a thread lives. The workspace only earns a slot when the view spans
+/// areas and it differs from the repo name — inside one area it is the same
+/// word on every row.
+fn location_text(thread: &ProtoThread, global: bool) -> String {
+    if global && thread.area != thread.repo {
+        format!("{} · {}", thread.area, thread.repo)
+    } else {
+        thread.repo.clone()
+    }
+}
+
 fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global: bool) -> GtkBox {
     let card = GtkBox::new(Orientation::Vertical, 2);
     card.add_css_class("proto-card");
@@ -490,12 +501,7 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
         hint.add_css_class("proto-jump");
         line1.append(&hint);
     }
-    let repo_text = if global && thread.area != thread.repo {
-        format!("{} · {}", thread.area, thread.repo)
-    } else {
-        thread.repo.to_string()
-    };
-    let repo = Label::new(Some(&repo_text));
+    let repo = Label::new(Some(&location_text(thread, global)));
     repo.add_css_class("proto-repo");
     repo.set_halign(gtk4::Align::Start);
     repo.set_hexpand(true);
@@ -556,14 +562,19 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
     card
 }
 
-fn build_slim_row(thread: &ProtoThread, index: Option<usize>, selected: bool) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 6);
+fn build_slim_row(
+    thread: &ProtoThread,
+    index: Option<usize>,
+    selected: bool,
+    global: bool,
+) -> GtkBox {
+    // Two rows, in the card's grammar: context above, title below. A shelved
+    // row has no card lines to carry its origin, so workspace · repo takes
+    // the slot the card gives it.
+    let row = GtkBox::new(Orientation::Vertical, 2);
     row.add_css_class("proto-slim");
     if !thread.debug.is_empty() {
         row.set_tooltip_text(Some(&thread.debug));
-        let seq = Label::new(Some(&format!("#{}", thread.id)));
-        seq.add_css_class("proto-debug");
-        row.append(&seq);
     }
     if selected {
         row.add_css_class("proto-selected");
@@ -571,20 +582,36 @@ fn build_slim_row(thread: &ProtoThread, index: Option<usize>, selected: bool) ->
     if thread.lifecycle == Lifecycle::Archived {
         row.add_css_class("proto-ghost");
     }
+
+    // Line 1: [#seq] [jump] workspace · repo  ···  settled time
+    let line1 = GtkBox::new(Orientation::Horizontal, 6);
+    if !thread.debug.is_empty() {
+        let seq = Label::new(Some(&format!("#{}", thread.id)));
+        seq.add_css_class("proto-debug");
+        line1.append(&seq);
+    }
     if let Some(n) = index {
         let hint = Label::new(Some(&n.to_string()));
         hint.add_css_class("proto-jump");
-        row.append(&hint);
+        line1.append(&hint);
     }
+    let location = Label::new(Some(&location_text(thread, global)));
+    location.add_css_class("proto-repo");
+    location.set_halign(gtk4::Align::Start);
+    location.set_hexpand(true);
+    location.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    line1.append(&location);
+    let time = Label::new(Some(&rel_time(thread.settled_mins.unwrap_or(0))));
+    time.add_css_class("proto-time");
+    line1.append(&time);
+    row.append(&line1);
+
+    // Line 2: title
     let title = Label::new(Some(&thread.title));
     title.add_css_class("proto-slim-title");
     title.set_halign(gtk4::Align::Start);
-    title.set_hexpand(true);
     title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     row.append(&title);
-    let time = Label::new(Some(&rel_time(thread.settled_mins.unwrap_or(0))));
-    time.add_css_class("proto-time");
-    row.append(&time);
     row
 }
 
@@ -692,6 +719,7 @@ fn rebuild(list_box: &GtkBox, header_box: &GtkBox, footer: &Label, state: &mut P
                     thread,
                     jump_index(thread.id, state),
                     state.selected == Some(thread.id),
+                    global,
                 ));
             }
         }
@@ -709,6 +737,7 @@ fn rebuild(list_box: &GtkBox, header_box: &GtkBox, footer: &Label, state: &mut P
                     thread,
                     jump_index(thread.id, state),
                     state.selected == Some(thread.id),
+                    global,
                 ));
             }
         }
