@@ -700,13 +700,16 @@ fn rebuild(list_box: &GtkBox, header_box: &GtkBox, footer: &Label, state: &mut P
     };
 
     let global = state.scope == Scope::Global;
+    // The selected row is tracked so the viewport can follow it: j/k walks
+    // past the fold in a long archived shelf otherwise.
+    let mut selected_row: Option<GtkBox> = None;
     for thread in &active {
-        list_box.append(&build_card(
-            thread,
-            jump_index(thread.id, state),
-            state.selected == Some(thread.id),
-            global,
-        ));
+        let is_selected = state.selected == Some(thread.id);
+        let card = build_card(thread, jump_index(thread.id, state), is_selected, global);
+        list_box.append(&card);
+        if is_selected {
+            selected_row = Some(card);
+        }
     }
 
     if !settled.is_empty() {
@@ -717,12 +720,12 @@ fn rebuild(list_box: &GtkBox, header_box: &GtkBox, footer: &Label, state: &mut P
         ));
         if state.settled_expanded {
             for thread in &settled {
-                list_box.append(&build_slim_row(
-                    thread,
-                    jump_index(thread.id, state),
-                    state.selected == Some(thread.id),
-                    global,
-                ));
+                let is_selected = state.selected == Some(thread.id);
+                let row = build_slim_row(thread, jump_index(thread.id, state), is_selected, global);
+                list_box.append(&row);
+                if is_selected {
+                    selected_row = Some(row);
+                }
             }
         }
     }
@@ -735,17 +738,51 @@ fn rebuild(list_box: &GtkBox, header_box: &GtkBox, footer: &Label, state: &mut P
         ));
         if state.archived_expanded {
             for thread in &archived {
-                list_box.append(&build_slim_row(
-                    thread,
-                    jump_index(thread.id, state),
-                    state.selected == Some(thread.id),
-                    global,
-                ));
+                let is_selected = state.selected == Some(thread.id);
+                let row = build_slim_row(thread, jump_index(thread.id, state), is_selected, global);
+                list_box.append(&row);
+                if is_selected {
+                    selected_row = Some(row);
+                }
             }
         }
     }
 
+    if let Some(row) = selected_row {
+        scroll_into_view(list_box, &row);
+    }
+
     footer.set_text(&state.message);
+}
+
+/// Keep the selected row inside the viewport. Rows are rebuilt from scratch on
+/// every state change, so this runs after each rebuild; the scroll itself is
+/// deferred to an idle callback because a freshly appended row has no
+/// allocation until GTK's layout phase has run.
+fn scroll_into_view(list_box: &GtkBox, row: &GtkBox) {
+    let Some(scroller) = list_box
+        .ancestor(ScrolledWindow::static_type())
+        .and_downcast::<ScrolledWindow>()
+    else {
+        return;
+    };
+    let row = row.clone();
+    gtk4::glib::idle_add_local_once(move || {
+        // Bounds are viewport-relative; + the current offset puts them in the
+        // scrolled content's own coordinates.
+        let Some(bounds) = row.compute_bounds(&scroller) else {
+            return;
+        };
+        let adjustment = scroller.vadjustment();
+        let offset = adjustment.value();
+        let top = f64::from(bounds.y()) + offset;
+        let bottom = top + f64::from(bounds.height());
+        if top < offset {
+            adjustment.set_value(top);
+        } else if bottom > offset + adjustment.page_size() {
+            adjustment.set_value(bottom - adjustment.page_size());
+        }
+    });
 }
 
 const PROTO_CSS: &str = "
