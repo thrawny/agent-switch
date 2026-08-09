@@ -11,9 +11,10 @@
 // Live mode (`just demo-sidebar-live`, ticket 08's window-hosted leg): rows are real
 // agent sessions joined with niri windows via sidebar_proto_live::LiveWorld; Enter/p
 // act on the real desktop (focus, nirius scratchpad, cold resurrection via harness
-// resume), n spawns a new pi thread. By default the live sidebar stays visible and
-// reserves its width; re-running the command toggles keyboard command mode. Pass
-// --popup to restore the original transient overlay for quick A/B testing.
+// resume), n spawns a new pi thread. By default the live sidebar is a transient
+// popup: re-running the command toggles visibility. Pass --dock for the
+// persistent variant that stays mapped, reserves its width, and instead toggles
+// keyboard command mode on re-invocation.
 //
 // Keys: j/k move · Shift+J/K reorder · 1-9 jump · Enter summon · s settle · p park
 //       a archive (confirm) · d delete archived (confirm) · D delete all archived
@@ -513,7 +514,8 @@ fn build_card(thread: &ProtoThread, index: Option<usize>, selected: bool, global
         line1.append(&parked);
     }
     if thread.cold {
-        // Runtime gone (window closed / compositor restart): summon resurrects.
+        // Runtime gone (window closed / compositor restart): summon is a noop
+        // until resurrection can reproduce sandbox/direnv in the thread's area.
         let cold = Label::new(Some("❆"));
         cold.add_css_class("proto-time");
         line1.append(&cold);

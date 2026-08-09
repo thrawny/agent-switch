@@ -18,8 +18,8 @@ run-niri:
 watch:
     -zmx kill agent-switch-build
     -zmx kill agent-switch-sidebar
-    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --popup)?$'
-    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --popup)?$'
+    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --dock)?$'
+    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --dock)?$'
     if [ "$${ZMX_SESSION:-}" != "agent-switch-niri" ]; then zmx kill agent-switch-niri || true; fi
     sleep 0.2
     cargo build
@@ -56,17 +56,17 @@ demo theme="":
 demo-sidebar:
     cargo run -- demo-sidebar
 
-# PROTOTYPE: ticket-08 live sidebar daemon in zmx. Default is the persistent
-# dock; `just demo-sidebar-live popup` restores the transient overlay for A/B.
-# `just watch` runs the dock under the same build-stamp restart loop — use this
-# recipe only to switch/restart the sidebar without the full watch stack.
+# PROTOTYPE: ticket-08 live sidebar daemon in zmx. Default is the transient
+# popup; `just demo-sidebar-live dock` runs the persistent dock for A/B.
+# `just watch` runs the sidebar under the same build-stamp restart loop — use
+# this recipe only to switch/restart the sidebar without the full watch stack.
 # Logs: zmx history agent-switch-sidebar
-demo-sidebar-live mode="dock":
+demo-sidebar-live mode="popup":
     cargo build
     -zmx kill agent-switch-sidebar
-    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --popup)?$'
-    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --popup)?$'
-    zmx run agent-switch-sidebar -d watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch demo-sidebar --live {{ if mode == "popup" { "--popup" } else { "" } }}
+    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --dock)?$'
+    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --dock)?$'
+    zmx run agent-switch-sidebar -d watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch demo-sidebar --live {{ if mode == "dock" { "--dock" } else { "" } }}
 
 # Format code
 fmt:

@@ -74,9 +74,9 @@ enum Command {
         /// Show real agent sessions and act on real windows (ticket 08)
         #[arg(long)]
         live: bool,
-        /// Use the original transient overlay instead of the persistent dock
+        /// Use the persistent dock instead of the transient popup overlay
         #[arg(long)]
-        popup: bool,
+        dock: bool,
     },
 }
 
@@ -163,8 +163,8 @@ fn main() {
             let exit_code = niri::run_demo(theme.as_deref());
             std::process::exit(exit_code.into());
         }
-        Command::DemoSidebar { live, popup } => {
-            let exit_code = sidebar_proto::run(live, popup);
+        Command::DemoSidebar { live, dock } => {
+            let exit_code = sidebar_proto::run(live, !dock);
             std::process::exit(exit_code.into());
         }
     }

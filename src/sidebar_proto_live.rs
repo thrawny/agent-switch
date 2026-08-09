@@ -8,8 +8,8 @@
 // windows. Verbs act on the real desktop:
 //   summon  — always a go-to, threads never move: parked → focus its area +
 //             nirius scratchpad-show + tile there; visible → focus; cold
-//             (window gone) → resurrect in its area: ghostty + harness
-//             resume (03's cold path).
+//             (window gone) → noop (03's resurrect path is disabled: it
+//             spawned in the wrong workspace, without sandbox or direnv).
 //   park    — nirius scratchpad-toggle --pid (ticket 02's mechanism).
 //   new     — ghostty + pi in the focused workspace's nirius directory.
 // Lifecycle (settle/archive), titles and read markers persist in a sidecar —
@@ -1280,46 +1280,20 @@ impl LiveWorld {
         msg
     }
 
-    /// Cold path from ticket 03: recreate the window from the manifest via
-    /// harness resume. The session-start hook in the new window rebinds it.
+    /// Cold path from ticket 03 — **disabled** (user call, 2026-08-09).
+    ///
+    /// The ghostty spawn landed in whatever workspace was focused, breaking
+    /// the "threads never move" rule, and the resumed shell missed the
+    /// sandbox and direnv the thread was created under, so the revived window
+    /// came back subtly broken. Until resurrection can reproduce the original
+    /// environment (and land in the thread's own area), summoning a cold
+    /// thread is a noop: nothing spawns, nothing moves, no focus changes.
     fn resurrect(&mut self, seq: u64) -> String {
         let Some(t) = self.get(seq) else {
             return "no such thread".into();
         };
-        let Some(cwd) = t.cwd.clone() else {
-            return "cold thread has no cwd — cannot resurrect".into();
-        };
-        // Reopen in the thread's own area, not wherever the user happens to
-        // be: cold summon is a go-to (the window belongs to its area), so
-        // focus that workspace first and let the spawn land there.
-        focus_area(&t.area);
-        let resume: Vec<String> = match t.harness.as_str() {
-            "pi" => match &t.transcript_path {
-                Some(path) => vec!["pi".into(), "--session".into(), path.clone()],
-                None => return "pi thread has no transcript_path".into(),
-            },
-            "claude" => vec![
-                "claude".into(),
-                "--resume".into(),
-                bare_session_id(&t.harness_session_id).to_string(),
-            ],
-            "codex" => vec![
-                "codex".into(),
-                "resume".into(),
-                bare_session_id(&t.harness_session_id).to_string(),
-            ],
-            other => return format!("no resume recipe for harness '{other}'"),
-        };
-        let mut args = vec![format!("--working-directory={cwd}"), "-e".to_string()];
-        args.extend(resume.iter().cloned());
-        info!("resurrect: ghostty {}", args.join(" "));
-        match spawn_detached("ghostty", &args) {
-            Ok(()) => format!("resurrecting: ghostty -e {}", resume.join(" ")),
-            Err(err) => {
-                warn!("resurrect: {err}");
-                format!("resurrect failed: {err}")
-            }
-        }
+        info!("resurrect disabled: '{}' (#{}) stays cold", t.title, t.seq);
+        "cold thread — resurrect is disabled (resume it in a terminal)".into()
     }
 
     /// Park without moving the user: scratchpad-toggle has no --id, but its
@@ -1422,7 +1396,7 @@ impl LiveWorld {
         };
         let msg = if t.archived_at.is_some() {
             t.archived_at = None;
-            "unarchived — restored to live (cold; ⏎ resurrects)".to_string()
+            "unarchived — restored to live (still cold)".to_string()
         } else {
             t.archived_at = Some(now);
             t.settled_at = Some(now);
