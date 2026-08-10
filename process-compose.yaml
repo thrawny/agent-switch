@@ -1,0 +1,64 @@
+version: "0.5"
+
+processes:
+  host-check:
+    description: Refuse to launch the Wayland/niri stack inside an agent sandbox
+    command: >-
+      sh -c 'if [ "${SANDBOX}" = "1" ]; then
+      echo "agent-switch watch requires host Wayland/niri access; SANDBOX=1 is unsupported" >&2;
+      exit 1;
+      fi'
+    availability:
+      restart: exit_on_failure
+
+  initial-build:
+    description: Build once before starting any runtime process
+    command: cargo build && touch target/debug/agent-switch-built.stamp
+    availability:
+      restart: exit_on_failure
+    depends_on:
+      host-check:
+        condition: process_completed_successfully
+
+  build-watch:
+    description: Rebuild on source changes and publish only successful builds
+    command: >-
+      watchexec --postpone -w src -w Cargo.toml -e rs --debounce 5s
+      --on-busy-update queue --
+      'cargo build && touch target/debug/agent-switch-built.stamp'
+    depends_on:
+      initial-build:
+        condition: process_completed_successfully
+
+  niri:
+    description: Restart the niri daemon after each successful build
+    command: >-
+      watchexec --restart --debounce 250ms
+      -w target/debug/agent-switch-built.stamp --
+      ./target/debug/agent-switch serve --niri
+    environment:
+      - RUST_LOG=debug
+    depends_on:
+      initial-build:
+        condition: process_completed_successfully
+
+  sidebar:
+    description: Restart the popup sidebar after each successful build
+    command: >-
+      watchexec --restart --debounce 250ms
+      -w target/debug/agent-switch-built.stamp --
+      ./target/debug/agent-switch demo-sidebar --live
+    depends_on:
+      initial-build:
+        condition: process_completed_successfully
+
+  sidebar-dock:
+    description: Optional persistent dock variant of the live sidebar
+    command: >-
+      watchexec --restart --debounce 250ms
+      -w target/debug/agent-switch-built.stamp --
+      ./target/debug/agent-switch demo-sidebar --live --dock
+    disabled: true
+    depends_on:
+      initial-build:
+        condition: process_completed_successfully

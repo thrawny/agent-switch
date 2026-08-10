@@ -26,6 +26,7 @@
             packages =
               with pkgs;
               lib.optionals stdenv.isLinux [
+                process-compose
                 pkg-config
                 gtk4
                 gtk4-layer-shell

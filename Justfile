@@ -1,10 +1,13 @@
 # agent-switch task runner
 
-_build_stamp := "target/debug/agent-switch-built.stamp"
+_pc_runtime_dir := env("XDG_RUNTIME_DIR", "/tmp") + "/agent-switch"
+_pc_socket := _pc_runtime_dir + "/process-compose.sock"
+_pc_log := _pc_runtime_dir + "/process-compose.log"
+export PC_SOCKET_PATH := _pc_socket
 
 # Default recipe
 default:
-    @just --list
+    @echo "Run 'just --list' to see available recipes."
 
 # Build
 build:
@@ -14,20 +17,54 @@ build:
 run-niri:
     cargo run -- serve --niri
 
-# Watch daemon + sidebar with build-gated restart (old processes stay alive on compile errors)
-watch:
-    -zmx kill agent-switch-build
-    -zmx kill agent-switch-sidebar
-    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --dock)?$'
-    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --dock)?$'
-    if [ "$${ZMX_SESSION:-}" != "agent-switch-niri" ]; then zmx kill agent-switch-niri || true; fi
-    sleep 0.2
-    cargo build
-    touch {{ _build_stamp }}
-    zmx run agent-switch-build -d watchexec --postpone -w src -w Cargo.toml -e rs --debounce 5s --on-busy-update queue -- 'cargo build && touch {{ _build_stamp }}'
-    zmx run agent-switch-sidebar -d watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch demo-sidebar --live
-    sleep 0.2
-    if [ "$${ZMX_SESSION:-}" = "agent-switch-niri" ]; then env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve --niri; else zmx attach agent-switch-niri env RUST_LOG=debug watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch serve --niri; fi
+# Fail before touching a host-owned stack from inside an agent sandbox.
+[private]
+_require-host:
+    @if [ "${SANDBOX:-0}" = "1" ]; then echo "agent-switch watch requires host Wayland/niri access; SANDBOX=1 is unsupported" >&2; exit 1; fi
+
+# Start the Process Compose supervisor in the background if it is not running.
+watch-start: _require-host
+    #!/usr/bin/env bash
+    set -euo pipefail
+    socket="{{ _pc_socket }}"
+    mkdir -p "{{ _pc_runtime_dir }}"
+    if [[ -S "$socket" ]]; then
+        if process-compose process list >/dev/null 2>&1; then
+            exit 0
+        fi
+        rm -f "$socket"
+    fi
+    process-compose \
+        --ordered-shutdown \
+        --log-file "{{ _pc_log }}" \
+        up --config process-compose.yaml --detached
+
+# Start the detached build-gated stack if needed.
+watch: watch-start
+
+# Stop the complete stack and all of its process groups.
+watch-stop: _require-host
+    #!/usr/bin/env bash
+    set -euo pipefail
+    socket="{{ _pc_socket }}"
+    if [[ ! -S "$socket" ]]; then
+        exit 0
+    fi
+    if process-compose process list >/dev/null 2>&1; then
+        process-compose down
+    fi
+    rm -f "$socket"
+
+# Restart the stack and open its TUI.
+watch-restart: watch-stop watch
+
+# Show process state without opening the TUI. This read-only command is sandbox-safe.
+watch-status:
+    process-compose process list
+
+# Follow recent logs from every process. This read-only command is sandbox-safe.
+logs:
+    process-compose process logs --namespace default --tail 200 --follow
 
 # Install to ~/.cargo/bin
 install:
@@ -56,17 +93,18 @@ demo theme="":
 demo-sidebar:
     cargo run -- demo-sidebar
 
-# PROTOTYPE: ticket-08 live sidebar daemon in zmx. Default is the transient
-# popup; `just demo-sidebar-live dock` runs the persistent dock for A/B.
-# `just watch` runs the sidebar under the same build-stamp restart loop — use
-# this recipe only to switch/restart the sidebar without the full watch stack.
-# Logs: zmx history agent-switch-sidebar
-demo-sidebar-live mode="popup":
-    cargo build
-    -zmx kill agent-switch-sidebar
-    -pkill -f '^watchexec .* -- ./target/debug/agent-switch demo-sidebar --live( --dock)?$'
-    -pkill -f '^(\./|/)[^ ]*/agent-switch demo-sidebar --live( --dock)?$'
-    zmx run agent-switch-sidebar -d watchexec --restart --debounce 250ms -w {{ _build_stamp }} -- ./target/debug/agent-switch demo-sidebar --live {{ if mode == "dock" { "--dock" } else { "" } }}
+# PROTOTYPE: switch the supervised live sidebar between popup and dock modes.
+demo-sidebar-live mode="popup": watch-start
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pc=(process-compose process)
+    if [[ "{{ mode }}" == "dock" ]]; then
+        "${pc[@]}" stop sidebar || true
+        "${pc[@]}" start sidebar-dock
+    else
+        "${pc[@]}" stop sidebar-dock || true
+        "${pc[@]}" start sidebar
+    fi
 
 # Format code
 fmt:

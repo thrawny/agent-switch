@@ -5,27 +5,33 @@ Track and switch between AI coding agent sessions (Claude, Codex, Pi, OpenCode) 
 ## 1) How to execute tasks
 
 - Prefer `just` recipes over raw commands.
-- Primary dev loop: `just watch` (runs niri daemon in zmx).
+- Primary dev loop: `just watch` (starts the detached Process Compose stack if needed).
+- The watch stack requires host Wayland/niri access and must fail immediately when `SANDBOX=1`.
 
 ## 2) After code changes
 
 - Do NOT run `cargo build` directly. Instead, ensure the watcher is running — it rebuilds automatically on file changes.
 - Run `just check` after every code change (runs fmt, clippy, test).
-- To check build output / runtime logs from the watcher:
-  - `zmx list --short`
-  - `zmx history agent-switch-build | tail -n 200` (build watcher)
-  - `zmx history agent-switch-niri | tail -n 200` (niri daemon)
+- To inspect or control the watcher:
+  - `just watch-status`
+  - `just logs`
+  - `just watch-stop`
+- Lifecycle and sidebar-switching recipes require the host. Read-only status/log
+  recipes are safe in a sandbox and may inspect the host-owned stack.
 
 ## Task Runner
 
 ```bash
-just              # List all recipes
+just --list       # List all recipes
 just build        # Build with release profile
 just install      # Install to ~/.cargo/bin
 just test         # Run tests
 just clippy       # Lint
 just fmt           # Format
-just watch        # Watch + run niri GTK daemon (zmx session)
+just watch        # Start the detached Process Compose dev stack
+just watch-stop   # Stop the complete dev stack
+just watch-status # Show supervised process state
+just logs         # Follow all supervised process logs
 just demo         # Run overlay demo with mock data
 ```
 
@@ -138,4 +144,10 @@ Pi uses a TypeScript extension (`agent-switch.ts`) rather than shell hooks. The 
 
 ## Dev Shell
 
-`flake.nix` provides a dev shell with the GTK4/layer-shell system dependencies. Activated automatically via `.envrc`.
+`flake.nix` provides a dev shell with Process Compose and the GTK4/layer-shell system dependencies. Activated automatically via `.envrc`.
+
+The repository-local `process-compose.yaml` owns the build watcher, niri daemon, and popup/dock sidebar process groups. Do not wrap this stack in zmx or add fallback `pkill` cleanup; Process Compose is the sole lifecycle owner.
+
+`.envrc` exports the repository stack's `PC_SOCKET_PATH`, so ordinary commands
+such as `process-compose process list`, `process-compose process logs niri`, and
+`process-compose attach` find the detached supervisor without socket flags.
