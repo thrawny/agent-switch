@@ -186,8 +186,8 @@ fn process_daemon_message(
             enqueued_at: Instant::now(),
         }),
         DaemonMessage::Track(event) => {
-            let focused_id = *focused_window.lock().unwrap();
-            daemon::handle_track_event(&event, focused_id);
+            let focused_id = focused_window.lock().unwrap().map(|id| id.to_string());
+            daemon::handle_track_event(&event, focused_id.as_deref());
             let mut cache = cache.lock().unwrap();
             cache.reload_agent_sessions();
             Some(NiriMessage::Daemon {

@@ -1,19 +1,22 @@
+use crate::compositor;
 use log::warn;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STALE_SESSION_MAX_AGE_SECS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowId {
+    /// Compositor window handle: niri's numeric id or a Hyprland `0x…`
+    /// address. The serde name stays `niri_id` for compatibility with
+    /// sessions.json files and hook payloads written before Hyprland support.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub niri_id: Option<String>,
 }
@@ -71,47 +74,6 @@ pub enum StateError {
         source: serde_json::Error,
     },
     Serialize(serde_json::Error),
-}
-
-#[derive(Debug)]
-struct WindowProbeError {
-    backend: &'static str,
-    detail: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct NiriWindowInfo;
-
-impl WindowProbeError {
-    fn command_error(backend: &'static str, source: io::Error) -> Self {
-        Self {
-            backend,
-            detail: source.to_string(),
-        }
-    }
-
-    fn command_failed(backend: &'static str, output: &std::process::Output) -> Self {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!("command exited with status {}", output.status)
-        } else {
-            format!("command exited with status {}: {}", output.status, stderr)
-        };
-        Self { backend, detail }
-    }
-
-    fn parse_error(backend: &'static str, source: serde_json::Error) -> Self {
-        Self {
-            backend,
-            detail: format!("failed to parse backend output: {}", source),
-        }
-    }
-}
-
-impl fmt::Display for WindowProbeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} probe failed: {}", self.backend, self.detail)
-    }
 }
 
 impl StateError {
@@ -241,15 +203,18 @@ pub fn find_by_session_id_mut<'a>(
 
 /// Remove stale sessions (windows that no longer exist)
 pub fn cleanup_stale(store: &mut SessionStore) {
-    let live_niri_windows = store_uses_niri_windows(store).then(get_live_niri_windows);
+    let compositor = compositor::get();
+    let live_windows = store_uses_windows(store).then(|| compositor.live_window_ids());
 
-    if let Some(Err(err)) = &live_niri_windows {
-        warn!("Skipping niri stale cleanup: {}", err);
+    if let Some(Err(err)) = &live_windows {
+        // A failed probe is not evidence that the windows are gone, so the
+        // binding sweep is skipped entirely rather than run against nothing.
+        warn!("Skipping {} stale cleanup: {}", compositor.name(), err);
     }
 
     cleanup_stale_with_window_snapshots(
         store,
-        live_niri_windows
+        live_windows
             .as_ref()
             .and_then(|result| result.as_ref().ok()),
     );
@@ -260,7 +225,7 @@ pub fn cleanup_stale(store: &mut SessionStore) {
         .retain(|_, session| session.state_updated > cutoff);
 }
 
-fn store_uses_niri_windows(store: &SessionStore) -> bool {
+fn store_uses_windows(store: &SessionStore) -> bool {
     store
         .sessions
         .values()
@@ -269,45 +234,20 @@ fn store_uses_niri_windows(store: &SessionStore) -> bool {
 
 fn cleanup_stale_with_window_snapshots(
     store: &mut SessionStore,
-    live_niri_windows: Option<&HashMap<String, NiriWindowInfo>>,
+    live_windows: Option<&HashSet<String>>,
 ) {
     store
         .sessions
-        .retain(|_, session| retain_window_binding(&mut session.window, &live_niri_windows));
+        .retain(|_, session| retain_window_binding(&mut session.window, &live_windows));
 }
 
-fn get_live_niri_windows() -> std::result::Result<HashMap<String, NiriWindowInfo>, WindowProbeError>
-{
-    let mut windows = HashMap::new();
-    let output = Command::new("niri")
-        .args(["msg", "-j", "windows"])
-        .output()
-        .map_err(|err| WindowProbeError::command_error("niri", err))?;
-    if !output.status.success() {
-        return Err(WindowProbeError::command_failed("niri", &output));
-    }
-
-    let parsed_windows = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
-        .map_err(|err| WindowProbeError::parse_error("niri", err))?;
-    for window in parsed_windows {
-        if let Some(id) = window.get("id").and_then(|v| v.as_u64()) {
-            windows.insert(id.to_string(), NiriWindowInfo);
-        }
-    }
-
-    Ok(windows)
-}
-
-fn retain_window_binding(
-    window: &mut WindowId,
-    live_niri_windows: &Option<&HashMap<String, NiriWindowInfo>>,
-) -> bool {
-    let drop_niri = matches!(
-        (window.niri_id.as_ref(), live_niri_windows),
-        (Some(id), Some(valid)) if !valid.contains_key(id)
+fn retain_window_binding(window: &mut WindowId, live_windows: &Option<&HashSet<String>>) -> bool {
+    let drop_binding = matches!(
+        (window.niri_id.as_ref(), live_windows),
+        (Some(id), Some(valid)) if !valid.contains(id)
     );
 
-    if drop_niri {
+    if drop_binding {
         window.niri_id = None;
     }
 
@@ -429,10 +369,8 @@ mod tests {
         dir.join("sessions.json")
     }
 
-    fn niri_windows(ids: &[&str]) -> HashMap<String, NiriWindowInfo> {
-        ids.iter()
-            .map(|id| (id.to_string(), NiriWindowInfo::default()))
-            .collect()
+    fn live_windows(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
     }
 
     #[test]
@@ -453,16 +391,16 @@ mod tests {
             },
         );
 
-        let valid_niri = niri_windows(&[]);
-        cleanup_stale_with_window_snapshots(&mut store, Some(&valid_niri));
+        let valid_windows = live_windows(&[]);
+        cleanup_stale_with_window_snapshots(&mut store, Some(&valid_windows));
 
         assert!(store.sessions.is_empty());
     }
 
     #[test]
-    fn store_uses_niri_windows_checks_sessions() {
+    fn store_uses_windows_checks_sessions() {
         let mut store = SessionStore::default();
-        assert!(!store_uses_niri_windows(&store));
+        assert!(!store_uses_windows(&store));
 
         store.sessions.insert(
             "42".to_string(),
@@ -480,7 +418,7 @@ mod tests {
                 },
             },
         );
-        assert!(store_uses_niri_windows(&store));
+        assert!(store_uses_windows(&store));
     }
 
     #[test]

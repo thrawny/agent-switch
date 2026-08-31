@@ -1,3 +1,4 @@
+mod compositor;
 mod config;
 mod daemon;
 mod niri;
@@ -8,23 +9,6 @@ mod themes;
 mod track;
 
 use clap::{Parser, Subcommand};
-
-fn focused_niri_window_id() -> Result<String, String> {
-    let output = std::process::Command::new("niri")
-        .args(["msg", "--json", "focused-window"])
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())?;
-    value
-        .get("id")
-        .and_then(|id| id.as_u64())
-        .map(|id| id.to_string())
-        .ok_or_else(|| "focused window JSON did not contain numeric id".to_string())
-}
 
 #[derive(Parser)]
 #[command(
@@ -51,7 +35,7 @@ enum Command {
     },
     /// List all sessions as JSON
     List,
-    /// Print the session for the focused niri window as JSON
+    /// Print the session for the focused window as JSON
     Focused,
     /// Remove stale sessions
     Cleanup,
@@ -115,10 +99,11 @@ fn main() {
             }
         }
         Command::Focused => {
-            let focused_id = match focused_niri_window_id() {
+            let comp = compositor::get();
+            let focused_id = match comp.focused_window_id() {
                 Ok(id) => id,
                 Err(err) => {
-                    eprintln!("Failed to get focused niri window: {err}");
+                    eprintln!("Failed to get focused {} window: {err}", comp.name());
                     std::process::exit(1);
                 }
             };

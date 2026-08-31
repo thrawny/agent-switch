@@ -357,9 +357,7 @@ fn proto_from_live(t: &LiveThread, now: f64) -> ProtoThread {
         debug: format!(
             "#{} · w{} · {}",
             t.seq,
-            t.window_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "—".into()),
+            t.window_id.clone().unwrap_or_else(|| "—".into()),
             t.harness_session_id,
         ),
     }
@@ -851,8 +849,8 @@ where
     }
 }
 
-/// Live summon: the sidebar's exclusive keyboard grab makes niri treat "no
-/// window" as focused, so focus changes only stick once the grab is gone.
+/// Live summon: the sidebar's exclusive keyboard grab makes the compositor
+/// treat "no window" as focused, so focus changes only stick once it is gone.
 /// Release command mode, let that layer-shell commit, then run the verb. The
 /// dock stays mapped and continues reserving its width.
 fn schedule_summon(
@@ -875,11 +873,11 @@ fn schedule_summon(
     });
 }
 
-/// Fallback park (used when the matcher-based in-place park misses): keeps
-/// the sidebar open but releases the keyboard grab, focuses the target window
-/// (nirius resolves "current window" through niri focus), toggles it into the
-/// scratchpad, then returns to the workspace the user came from and re-grabs
-/// — settling a thread in another area must not strand you there.
+/// Fallback park (used when the in-place park misses): keeps the sidebar open
+/// but releases the keyboard grab, focuses the target window (the park verb
+/// resolves "current window" through compositor focus), parks it, then returns
+/// to the workspace the user came from and re-grabs — settling a thread in
+/// another area must not strand you there.
 #[allow(clippy::too_many_arguments)]
 fn schedule_park(
     state: Rc<RefCell<ProtoState>>,
@@ -888,16 +886,18 @@ fn schedule_park(
     header_box: GtkBox,
     footer: Label,
     seq: u64,
-    target: u64,
+    target: String,
     verb: &'static str,
 ) {
-    let home_workspace = crate::niri::niri_workspaces()
+    let compositor = crate::compositor::get();
+    let home_workspace = compositor
+        .workspaces()
         .into_iter()
-        .find(|ws| ws.is_focused)
+        .find(|ws| ws.focused)
         .map(|ws| ws.id);
     set_interactive(&window, false);
     gtk4::glib::timeout_add_local_once(Duration::from_millis(60), move || {
-        let focused = crate::niri::focus_window(target);
+        let focused = compositor.focus_window(&target);
         gtk4::glib::timeout_add_local_once(Duration::from_millis(90), move || {
             let msg = if focused {
                 state
@@ -910,9 +910,7 @@ fn schedule_park(
                 format!("focus-window {target} failed — cannot park")
             };
             if let Some(ws) = home_workspace {
-                crate::niri::niri_action(niri_ipc::Action::FocusWorkspace {
-                    reference: niri_ipc::WorkspaceReferenceArg::Id(ws),
-                });
+                compositor.focus_workspace_by_id(&ws);
             }
             set_interactive(&window, true);
             let mut s = state.borrow_mut();
@@ -1205,7 +1203,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
                                 .filter(|t| {
                                     t.settled_at.is_none() && t.archived_at.is_none() && !t.parked
                                 })
-                                .and_then(|t| t.window_id)
+                                .and_then(|t| t.window_id.clone())
                         };
                         let msg = s.live.as_mut().unwrap().toggle_settle(seq);
                         s.message = msg;
@@ -1256,7 +1254,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
                     if let Some(seq) = s.selected {
                         enum Plan {
                             Unpark,
-                            Dance(u64),
+                            Dance(String),
                             Msg(String),
                         }
                         let plan = {
@@ -1264,7 +1262,7 @@ fn build_proto_ui(app: &Application, live: bool, popup: bool) {
                             match world.threads().iter().find(|t| t.seq == seq) {
                                 None => Plan::Msg("no such thread".into()),
                                 Some(t) if t.parked => Plan::Unpark,
-                                Some(t) => match t.window_id {
+                                Some(t) => match t.window_id.clone() {
                                     Some(id) => Plan::Dance(id),
                                     None => Plan::Msg("no window — nothing to park (cold)".into()),
                                 },

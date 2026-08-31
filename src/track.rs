@@ -1,7 +1,7 @@
+use crate::compositor;
 use crate::daemon;
 use serde::Deserialize;
 use std::io::{self, Read};
-use std::process::Command;
 use std::str::FromStr;
 
 #[derive(Debug, Deserialize)]
@@ -12,29 +12,10 @@ struct HookInput {
     cwd: Option<String>,
     transcript_path: Option<String>,
     notification_type: Option<String>,
+    /// Compositor window handle, if the hook already knows it. Named
+    /// `niri_id` for wire compatibility with existing hook payloads; it
+    /// carries a Hyprland address just as happily.
     niri_id: Option<String>,
-}
-
-fn get_niri_window_id() -> Option<String> {
-    let output = Command::new("niri")
-        .args(["msg", "-j", "windows"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let windows = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout).ok()?;
-    windows
-        .into_iter()
-        .find(|window| {
-            window
-                .get("is_focused")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-        })
-        .and_then(|window| window.get("id").and_then(|value| value.as_u64()))
-        .map(|id| id.to_string())
 }
 
 /// Append the caller's PPID to the session ID so that forked Claude agents
@@ -192,7 +173,9 @@ pub fn handle_event(
         cwd: hook.cwd,
         transcript_path: hook.transcript_path,
         notification_type: hook.notification_type,
-        niri_id: hook.niri_id.or_else(get_niri_window_id),
+        niri_id: hook
+            .niri_id
+            .or_else(|| compositor::get().focused_window_id().ok()),
     };
 
     match daemon::send_track_request(&msg) {

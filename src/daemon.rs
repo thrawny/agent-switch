@@ -668,7 +668,11 @@ pub fn run_headless() {
     }
 }
 
-fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, state_path: &Path) {
+fn handle_track_event_at_path(
+    event: &TrackEvent,
+    focused_window_id: Option<&str>,
+    state_path: &Path,
+) {
     let Some(agent) = event.agent.as_deref() else {
         error!(
             "Rejecting track event {} for session={}: missing agent",
@@ -677,21 +681,20 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
         return;
     };
     let session_id = &event.session_id;
-    let explicit_niri_id = event
-        .niri_id
-        .as_deref()
-        .and_then(|id| id.parse::<u64>().ok());
-    let focused_niri_id = explicit_niri_id.or(match event.event {
+    // Window handles are opaque compositor strings (niri numbers them,
+    // Hyprland addresses them), so the payload value is taken as-is.
+    let explicit_window_id = event.niri_id.as_deref().filter(|id| !id.is_empty());
+    let bound_window_id = explicit_window_id.or(match event.event {
         TrackEventKind::SessionStart => None,
-        _ => focused_niri_id,
+        _ => focused_window_id,
     });
 
     if let Err(err) = state::with_locked_store_at_path(state_path, |store| {
-        let (window_key, window_id) = match focused_niri_id {
-            Some(niri) => (
-                niri.to_string(),
+        let (window_key, window_id) = match bound_window_id {
+            Some(handle) => (
+                handle.to_string(),
                 state::WindowId {
-                    niri_id: Some(niri.to_string()),
+                    niri_id: Some(handle.to_string()),
                 },
             ),
             None => {
@@ -789,7 +792,7 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
                     session.state = state::SessionState::Responding;
                     session.state_updated = state::now();
                     clear_waiting_reason(session);
-                    update_session_window_binding(session, focused_niri_id);
+                    update_session_window_binding(session, bound_window_id);
                 } else {
                     let session = state::Session {
                         agent: agent.to_string(),
@@ -842,8 +845,8 @@ fn handle_track_event_at_path(event: &TrackEvent, focused_niri_id: Option<u64>, 
     }
 }
 
-pub(crate) fn handle_track_event(event: &TrackEvent, focused_niri_id: Option<u64>) {
-    handle_track_event_at_path(event, focused_niri_id, &state::state_file());
+pub(crate) fn handle_track_event(event: &TrackEvent, focused_window_id: Option<&str>) {
+    handle_track_event_at_path(event, focused_window_id, &state::state_file());
 }
 
 fn remove_other_session_bindings(
@@ -857,18 +860,17 @@ fn remove_other_session_bindings(
     });
 }
 
-fn update_session_window_binding(session: &mut state::Session, niri_id: Option<u64>) {
-    if let Some(niri_id) = niri_id {
-        let niri_id = niri_id.to_string();
+fn update_session_window_binding(session: &mut state::Session, window_id: Option<&str>) {
+    if let Some(window_id) = window_id {
         match session.window.niri_id.as_deref() {
-            Some(existing) if existing != niri_id => {
+            Some(existing) if existing != window_id => {
                 debug!(
                     "Ignoring niri rebinding for session {}: keeping {} over {}",
-                    session.session_id, existing, niri_id
+                    session.session_id, existing, window_id
                 );
             }
             None => {
-                session.window.niri_id = Some(niri_id);
+                session.window.niri_id = Some(window_id.to_string());
             }
             _ => {}
         }
@@ -1242,7 +1244,7 @@ mod tests {
             },
         };
 
-        update_session_window_binding(&mut session, Some(56));
+        update_session_window_binding(&mut session, Some("56"));
 
         assert_eq!(session.window.niri_id.as_deref(), Some("122"));
     }
@@ -1261,7 +1263,7 @@ mod tests {
             window: state::WindowId { niri_id: None },
         };
 
-        update_session_window_binding(&mut session, Some(56));
+        update_session_window_binding(&mut session, Some("56"));
 
         assert_eq!(session.window.niri_id.as_deref(), Some("56"));
     }
@@ -1347,7 +1349,7 @@ mod tests {
                 notification_type: None,
                 niri_id: None,
             },
-            Some(19),
+            Some("19"),
             &state_path,
         );
 
@@ -1366,7 +1368,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("47".to_string()),
             },
-            Some(19),
+            Some("19"),
             &state_path,
         );
 
@@ -1396,7 +1398,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("47".to_string()),
             },
-            Some(47),
+            Some("47"),
             &state_path,
         );
 
@@ -1411,7 +1413,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("56".to_string()),
             },
-            Some(56),
+            Some("56"),
             &state_path,
         );
 
@@ -1484,7 +1486,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("47".to_string()),
             },
-            Some(19),
+            Some("19"),
             &state_path,
         );
 
@@ -1499,7 +1501,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("56".to_string()),
             },
-            Some(56),
+            Some("56"),
             &state_path,
         );
 
@@ -1514,7 +1516,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("56".to_string()),
             },
-            Some(56),
+            Some("56"),
             &state_path,
         );
 
@@ -1547,7 +1549,7 @@ mod tests {
                 notification_type: None,
                 niri_id: None,
             },
-            Some(19),
+            Some("19"),
             &state_path,
         );
 
@@ -1562,7 +1564,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("47".to_string()),
             },
-            Some(47),
+            Some("47"),
             &state_path,
         );
 
@@ -1594,7 +1596,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("47".to_string()),
             },
-            Some(47),
+            Some("47"),
             &state_path,
         );
 
@@ -1866,7 +1868,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("42".to_string()),
             },
-            Some(42),
+            Some("42"),
             &state_path,
         );
 
@@ -1882,7 +1884,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("42".to_string()),
             },
-            Some(42),
+            Some("42"),
             &state_path,
         );
 
@@ -1925,7 +1927,7 @@ mod tests {
                 notification_type: None,
                 niri_id: Some("43".to_string()),
             },
-            Some(43),
+            Some("43"),
             &state_path,
         );
 

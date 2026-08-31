@@ -1,17 +1,19 @@
 // PROTOTYPE — throwaway code, not production. Delete freely.
 //
 // Live backend for the ticket-06 sidebar prototype, built for ticket 08's
-// window-hosted leg: does the sidebar + registry-shaped threads + niri verbs
-// compose spatially? Threads are minted in-memory per ticket 04's manifest
-// shape (registry identity, harness + harness_session_id + cwd + transcript,
-// runtime = niri window) by joining real agent-switch sessions with live niri
-// windows. Verbs act on the real desktop:
+// window-hosted leg: does the sidebar + registry-shaped threads + compositor
+// verbs compose spatially? Threads are minted in-memory per ticket 04's
+// manifest shape (registry identity, harness + harness_session_id + cwd +
+// transcript, runtime = compositor window) by joining real agent-switch
+// sessions with live windows from `compositor::get()` (niri or Hyprland).
+// Verbs act on the real desktop:
 //   summon  — always a go-to, threads never move: parked → focus its area +
-//             nirius scratchpad-show + tile there; visible → focus; cold
-//             (window gone) → noop (03's resurrect path is disabled: it
-//             spawned in the wrong workspace, without sandbox or direnv).
-//   park    — nirius scratchpad-toggle --pid (ticket 02's mechanism).
-//   new     — ghostty + pi in the focused workspace's nirius directory.
+//             unpark there; visible → focus; cold (window gone) → noop (03's
+//             resurrect path is disabled: it spawned in the wrong workspace,
+//             without sandbox or direnv).
+//   park    — hide the window out of the layout (ticket 02's mechanism;
+//             nirius scratchpad on niri, a special workspace on Hyprland).
+//   new     — ghostty + pi in the focused workspace's project directory.
 // Lifecycle (settle/archive), titles and read markers persist in a sidecar —
 // `sidebar-proto-registry.json` next to sessions.json (PROTOTYPE — wipe me) —
 // so archived tombstones and renames survive sidebar restarts. It is a crude
@@ -27,8 +29,9 @@ use wait_timeout::ChildExt;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::compositor::{self, CompWindow};
+use crate::daemon;
 use crate::state::{self, SessionState, WaitingReason};
-use crate::{daemon, niri};
 
 pub struct LiveThread {
     pub seq: u64,
@@ -43,7 +46,8 @@ pub struct LiveThread {
     pub title: String,
     pub repo: String,
     pub branch: String,
-    pub window_id: Option<u64>,
+    /// Compositor window handle (niri id / Hyprland address), None when cold.
+    pub window_id: Option<String>,
     pub pid: Option<i32>,
     pub parked: bool,
     pub state: SessionState,
@@ -177,29 +181,16 @@ fn focus_area(area: &str) -> bool {
     if area == "other" {
         return false;
     }
-    let exists = niri::niri_workspaces()
+    let compositor = compositor::get();
+    let exists = compositor
+        .workspaces()
         .into_iter()
         .any(|ws| ws.name.as_deref() == Some(area));
     if exists {
         info!("focusing area '{area}'");
-        niri::niri_action(niri_ipc::Action::FocusWorkspace {
-            reference: niri_ipc::WorkspaceReferenceArg::Name(area.to_string()),
-        });
+        compositor.focus_workspace_by_name(area);
     }
     exists
-}
-
-/// Escape regex metacharacters so a live window title becomes an exact-match
-/// pattern for nirius matchers.
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for c in s.chars() {
-        if "\\.^$*+?()[]{}|".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn bare_session_id(id: &str) -> &str {
@@ -260,24 +251,6 @@ fn propagate_rename(t: &LiveThread) -> Option<&'static str> {
         }
         _ => None,
     }
-}
-
-fn scratchpad_window_ids() -> HashSet<u64> {
-    let output = Command::new("nirius").arg("list-scratchpad").output();
-    let Ok(output) = output else {
-        return HashSet::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("id: ")?
-                .split(',')
-                .next()?
-                .trim()
-                .parse()
-                .ok()
-        })
-        .collect()
 }
 
 fn git_branch(cwd: &str) -> String {
@@ -598,25 +571,6 @@ fn spawn_detached(program: &str, args: &[String]) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("{program}: {err}"))
-}
-
-/// Run a command to completion, folding a non-zero exit into an Err carrying
-/// the command line + stderr (so verb failures surface in the footer AND the
-/// zmx log).
-fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| format!("{program}: {err}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "`{program} {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
 }
 
 impl LiveWorld {
@@ -945,7 +899,7 @@ impl LiveWorld {
         }
     }
 
-    /// Re-join sessions.json + niri windows/workspaces + nirius scratchpad
+    /// Re-join sessions.json + compositor windows/workspaces + parked set
     /// into the in-memory registry. Identity (seq) is stable across refreshes;
     /// a session that reappears under a new ppid suffix (resume) rebinds to
     /// its cold thread instead of minting a new one.
@@ -957,20 +911,24 @@ impl LiveWorld {
         };
         // A terminal can disappear without SessionEnd (Codex currently has
         // no such hook wired, and abrupt closes can skip hooks regardless).
-        // Treat producer entries bound to windows niri no longer knows as
-        // stale before deciding whether a cold thread should tombstone.
+        // Treat producer entries bound to windows the compositor no longer
+        // knows as stale before deciding whether a cold thread should
+        // tombstone.
         state::cleanup_stale(&mut store);
         daemon::refresh_transcript_derived_states(&mut store);
 
-        let windows: HashMap<u64, niri_ipc::Window> = niri::niri_windows()
+        let compositor = compositor::get();
+        let windows: HashMap<String, CompWindow> = compositor
+            .windows()
             .into_iter()
-            .map(|w| (w.id, w))
+            .map(|w| (w.id.clone(), w))
             .collect();
-        let workspace_names: HashMap<u64, Option<String>> = niri::niri_workspaces()
+        let workspace_names: HashMap<String, Option<String>> = compositor
+            .workspaces()
             .into_iter()
             .map(|ws| (ws.id, ws.name))
             .collect();
-        let scratch = scratchpad_window_ids();
+        let parked_ids = compositor.parked_window_ids();
 
         // Oldest activity first so the initial mint approximates creation order
         // (sessions.json has no created_at — a real registry would).
@@ -982,32 +940,35 @@ impl LiveWorld {
         // still exist at all — a binding held against a window another
         // session claims is stale, and a thread with neither window nor
         // session was closed outside the sidebar.
-        let claimed: HashMap<u64, String> = sessions
+        let claimed: HashMap<String, String> = sessions
             .iter()
             .filter_map(|s| {
-                let id: u64 = s.window.niri_id.as_deref()?.parse().ok()?;
+                let id = s.window.niri_id.as_deref()?;
                 windows
-                    .contains_key(&id)
-                    .then(|| (id, s.session_id.clone()))
+                    .contains_key(id)
+                    .then(|| (id.to_string(), s.session_id.clone()))
             })
             .collect();
         let store_sids: HashSet<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
         // Window/parked/area facts for a candidate binding.
-        let derive = |id: Option<u64>| {
-            let window = id.and_then(|i| windows.get(&i));
-            let parked = id.map(|i| scratch.contains(&i)).unwrap_or(false);
+        let derive = |id: Option<&str>| {
+            // Cloned rather than borrowed: a closure taking `Option<&str>`
+            // would tie the borrow of `windows` to the handle argument, and
+            // callers move that handle straight into the thread afterwards.
+            let window = id.and_then(|i| windows.get(i)).cloned();
+            let parked = id.is_some_and(|i| parked_ids.contains(i));
             let area = window
+                .as_ref()
                 .filter(|_| !parked)
-                .and_then(|w| w.workspace_id)
-                .and_then(|ws| workspace_names.get(&ws).cloned().flatten());
+                .and_then(|w| w.workspace_id.as_deref())
+                .and_then(|ws| workspace_names.get(ws).cloned().flatten());
             (window, parked, area)
         };
         for session in sessions {
-            let window_id: Option<u64> = session
+            let window_id: Option<String> = session
                 .window
                 .niri_id
-                .as_deref()
-                .and_then(|id| id.parse().ok())
+                .clone()
                 .filter(|id| windows.contains_key(id));
 
             let idx = self
@@ -1030,12 +991,13 @@ impl LiveWorld {
                     // same seat continuing (claude /clear + handoff, pi /new)
                     // — reuse the thread instead of releasing it into an
                     // auto-archive and minting a duplicate.
-                    let id = window_id?;
-                    if claimed.get(&id) != Some(&session.session_id) {
+                    let id = window_id.as_deref()?;
+                    if claimed.get(id) != Some(&session.session_id) {
                         return None;
                     }
                     self.threads.iter().position(|t| {
-                        t.window_id == Some(id) && !store_sids.contains(&t.harness_session_id)
+                        t.window_id.as_deref() == Some(id)
+                            && !store_sids.contains(&t.harness_session_id)
                     })
                 });
 
@@ -1061,19 +1023,19 @@ impl LiveWorld {
                     // a different window once the bound one is gone — or
                     // claimed by a different session (pi /new reuses the
                     // window; the old thread must not squat on it).
-                    let effective = match t.window_id {
+                    let effective = match t.window_id.as_deref() {
                         _ if reclaiming => None,
                         Some(old)
-                            if windows.contains_key(&old)
+                            if windows.contains_key(old)
                                 && claimed
-                                    .get(&old)
+                                    .get(old)
                                     .is_none_or(|sid| *sid == session.session_id) =>
                         {
-                            Some(old)
+                            Some(old.to_string())
                         }
                         _ => window_id,
                     };
-                    let (window, parked, area) = derive(effective);
+                    let (window, parked, area) = derive(effective.as_deref());
                     if t.window_id.is_none() && effective.is_some() {
                         // Runtime came back (resurrection rebind) — a revived
                         // thread is no tombstone.
@@ -1090,7 +1052,7 @@ impl LiveWorld {
                         t.cwd = session.cwd;
                     }
                     t.window_id = effective;
-                    t.pid = window.and_then(|w| w.pid);
+                    t.pid = window.as_ref().and_then(|w| w.pid);
                     t.parked = parked;
                     t.state = session.state;
                     t.waiting_reason = session.waiting_reason;
@@ -1134,12 +1096,12 @@ impl LiveWorld {
                     }
                     // Being in the window IS reading it — "jumped to it"
                     // counts however you got there (sidebar, alt-tab, mouse).
-                    if window.is_some_and(|w| w.is_focused) {
+                    if window.as_ref().is_some_and(|w| w.focused) {
                         t.last_read_at = now;
                     }
                 }
                 None => {
-                    let (window, parked, area) = derive(window_id);
+                    let (window, parked, area) = derive(window_id.as_deref());
                     self.next_seq += 1;
                     let repo = session.cwd.as_deref().map(repo_name).unwrap_or_default();
                     // Default title precedence: harness session name (pi
@@ -1149,6 +1111,7 @@ impl LiveWorld {
                         .clone()
                         .or_else(|| {
                             window
+                                .as_ref()
                                 .and_then(|w| w.title.as_deref())
                                 .map(stable_window_title)
                                 .filter(|title| !title.is_empty())
@@ -1166,7 +1129,7 @@ impl LiveWorld {
                         repo,
                         branch,
                         window_id,
-                        pid: window.and_then(|w| w.pid),
+                        pid: window.as_ref().and_then(|w| w.pid),
                         parked,
                         state: session.state,
                         waiting_reason: session.waiting_reason,
@@ -1194,10 +1157,13 @@ impl LiveWorld {
         // session merely vanishing from sessions.json (compaction re-key)
         // still doesn't release a live binding.
         for t in &mut self.threads {
-            let gone = t.window_id.is_some_and(|id| !windows.contains_key(&id));
-            let taken = t.window_id.is_some_and(|id| {
+            let gone = t
+                .window_id
+                .as_deref()
+                .is_some_and(|id| !windows.contains_key(id));
+            let taken = t.window_id.as_deref().is_some_and(|id| {
                 claimed
-                    .get(&id)
+                    .get(id)
                     .is_some_and(|sid| *sid != t.harness_session_id)
             });
             if gone || taken {
@@ -1238,13 +1204,15 @@ impl LiveWorld {
         // Summoning a tombstone revives it (03's unarchive-first, folded in).
         t.archived_at = None;
 
-        let msg = match (t.window_id, t.parked) {
+        let compositor = compositor::get();
+        let msg = match (t.window_id.clone(), t.parked) {
             (Some(id), true) => {
                 // Threads never move (user call, 2026-08-04): unpark = go to
-                // the thread's area, then show + tile there (02's recipe —
-                // tiling also evicts nirius scratchpad membership). "other"
-                // threads have no home yet, so they unpark wherever you are;
-                // a named area whose workspace is gone noops instead.
+                // the thread's area, then bring the window back there (niri:
+                // nirius scratchpad-show + tile; Hyprland: move it out of the
+                // park special workspace). "other" threads have no home yet,
+                // so they unpark wherever you are; a named area whose
+                // workspace is gone noops instead.
                 let went = focus_area(&t.area);
                 if !went && t.area != "other" {
                     return format!("area '{}' has no workspace — not unparking", t.area);
@@ -1253,11 +1221,10 @@ impl LiveWorld {
                     "summon: unparking window {id} ('{}') in '{}'",
                     t.title, t.area
                 );
-                if let Err(err) = run_cmd("nirius", &["scratchpad-show", "--id", &id.to_string()]) {
+                if let Err(err) = compositor.summon_parked_window(&id) {
                     warn!("summon: {err}");
                     return err;
                 }
-                niri::niri_action(niri_ipc::Action::MoveWindowToTiling { id: Some(id) });
                 t.parked = false;
                 if went {
                     format!("summoned '{}' in area '{}'", t.title, t.area)
@@ -1267,7 +1234,7 @@ impl LiveWorld {
             }
             (Some(id), false) => {
                 info!("summon: focusing window {id} ('{}')", t.title);
-                if niri::focus_window(id) {
+                if compositor.focus_window(&id) {
                     format!("went to '{}'", t.title)
                 } else {
                     warn!("summon: focus-window {id} not handled");
@@ -1296,70 +1263,51 @@ impl LiveWorld {
         "cold thread — resurrect is disabled (resume it in a terminal)".into()
     }
 
-    /// Park without moving the user: scratchpad-toggle has no --id, but its
-    /// matchers (--workspace-id + exact-title regex) select the window from
-    /// anywhere — no focus, no grab release, you stay in your area. Fails
-    /// (→ caller falls back to the focus dance) when the title changed
-    /// between poll and toggle (working threads animate their titles) or the
-    /// match is ambiguous.
+    /// Park without moving the user: no focus change, no grab release, you
+    /// stay in your area. May fail (→ caller falls back to the focus dance) —
+    /// on niri the matcher misses when the title changed between poll and
+    /// toggle (working threads animate their titles) or is ambiguous;
+    /// Hyprland addresses the window directly, so it does not miss.
     pub fn park_in_place(&mut self, seq: u64, verb: &str) -> Result<String, String> {
+        let compositor = compositor::get();
         let Some(t) = self.get_mut(seq) else {
             return Err("no such thread".into());
         };
-        let Some(id) = t.window_id else {
+        let Some(id) = t.window_id.as_deref() else {
             return Err("no window — nothing to park (cold)".into());
         };
-        let window = niri::niri_windows().into_iter().find(|w| w.id == id);
+        let window = compositor.windows().into_iter().find(|w| w.id == id);
         let Some(window) = window else {
             return Err("window vanished".into());
         };
-        let (Some(ws), Some(title)) = (window.workspace_id, window.title) else {
-            return Err("window has no workspace/title to match on".into());
-        };
-        let pattern = format!("^{}$", regex_escape(&title));
-        run_cmd(
-            "nirius",
-            &[
-                "scratchpad-toggle",
-                "--workspace-id",
-                &ws.to_string(),
-                "--title",
-                &pattern,
-            ],
-        )
-        .map_err(|err| {
+        compositor.park_window_in_place(&window).map_err(|err| {
             warn!("{verb}: in-place park missed ({err}) — falling back to focus dance");
             err
         })?;
-        info!(
-            "{verb}: in-place scratchpad-toggle on window {id} ('{}')",
-            t.title
-        );
+        info!("{verb}: in-place park of window {id} ('{}')", t.title);
         t.parked = true;
         let msg = format!("{verb} '{}' (in place)", t.title);
         self.save();
         Ok(msg)
     }
 
-    /// Fallback when the matcher park misses: toggle the *currently focused*
-    /// window into the nirius scratchpad. The caller must have focused the
-    /// thread's window first — pid-matching is useless against
-    /// single-instance ghostty (one pid owns every window), and while the
-    /// sidebar holds its exclusive keyboard grab niri reports no focused
-    /// window at all — so this goes through the sidebar's release-grab →
-    /// focus → toggle → return home → re-grab dance.
+    /// Fallback when the in-place park misses: park the *currently focused*
+    /// window. The caller must have focused the thread's window first —
+    /// pid-matching is useless against single-instance ghostty (one pid owns
+    /// every window), and while the sidebar holds its exclusive keyboard grab
+    /// the compositor reports no focused window at all — so this goes through
+    /// the sidebar's release-grab → focus → park → return home → re-grab
+    /// dance.
     pub fn park_focused(&mut self, seq: u64, verb: &str) -> String {
+        let compositor = compositor::get();
         let Some(t) = self.get_mut(seq) else {
             return "no such thread".into();
         };
-        info!(
-            "{verb}: scratchpad-toggle on focused window ('{}')",
-            t.title
-        );
-        match run_cmd("nirius", &["scratchpad-toggle"]) {
+        info!("{verb}: parking the focused window ('{}')", t.title);
+        match compositor.park_focused_window() {
             Ok(()) => {
                 t.parked = true;
-                format!("{verb} '{}' (nirius scratchpad)", t.title)
+                format!("{verb} '{}' (parked)", t.title)
             }
             Err(err) => {
                 warn!("{verb}: {err}");
@@ -1411,7 +1359,7 @@ impl LiveWorld {
                     info!("archive: closing window {id} ('{}')", t.title);
                     t.pid = None;
                     t.parked = false;
-                    niri::niri_action(niri_ipc::Action::CloseWindow { id: Some(id) });
+                    compositor::get().close_window(&id);
                     "archived — window closed, tombstone on the z shelf".to_string()
                 }
                 None => "archived — tombstone on the z shelf".to_string(),
@@ -1515,15 +1463,10 @@ impl LiveWorld {
     }
 
     /// Minimal creation scaffolding (creation flow design is its own ticket):
-    /// spawn ghostty + pi in the focused workspace's nirius directory.
+    /// spawn ghostty + pi in the focused workspace's project directory.
     pub fn new_thread(&self) -> String {
-        let dir = Command::new("nirius")
-            .arg("get-workspace-directory")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|d| !d.is_empty())
+        let dir = compositor::get()
+            .project_dir_for_focused()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().display().to_string());
         let args = vec![
             format!("--working-directory={dir}"),
@@ -1543,9 +1486,10 @@ impl LiveWorld {
 
 /// Name of the focused workspace, if it has one — the sidebar's area scope.
 pub fn focused_area() -> Option<String> {
-    niri::niri_workspaces()
+    compositor::get()
+        .workspaces()
         .into_iter()
-        .find(|ws| ws.is_focused)
+        .find(|ws| ws.focused)
         .and_then(|ws| ws.name)
 }
 
